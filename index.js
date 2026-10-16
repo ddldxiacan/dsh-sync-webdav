@@ -647,24 +647,55 @@ export function summaryFromCompare(json) {
   return msgs.slice(0, COMPARE_MAX_MESSAGES)
 }
 
+/** 算出重定向的下一跳；地址非法返回 null。抽成纯函数便于离线自测。 */
+export function nextRedirectUrl(base, location) {
+  try { return new URL(String(location), new URL(String(base))).toString() } catch (e) { return null }
+}
+
 /** 默认网络通道：node:https，15 秒超时，失败收敛成 { status:null, error }，绝不抛异常。
- *  必须带 User-Agent —— 不带时 GitHub 会 403。 */
-export function defaultHttpsGet(url) {
+ *  必须带 User-Agent —— 不带时 GitHub 会 403。
+ *
+ *  必须自己跟随重定向：仓库改名后，GitHub 对旧 owner/repo 路径下的**所有** API 端点
+ *  返回 301 + Location 指向新仓库（实测 /tags、/commits、/compare 全如此），而 node:https
+ *  不会自动跟随（curl -L / git / pnpm 都会，所以安装照常，只有 API 层会静默失败）。
+ *  不处理就会以「GitHub API 返回 HTTP 301」这种与升级毫无关联的错阻断版本检查。
+ *
+ *  为什么这件事对升级模块是必需的：老用户装的是改名前的版本，其 package.json 里的
+ *  repository.url 仍是旧仓库名，自省得到的 slug 也就是旧名 —— 全靠这里跟随 301 自愈。
+ */
+export function defaultHttpsGet(url, opts) {
+  const o = opts || {}
+  const maxRedirects = Number.isFinite(o.maxRedirects) ? o.maxRedirects : 5
+  const request = o.request || https.request // 可注入，便于离线验证重定向链
   return new Promise((resolve) => {
-    let u
-    try { u = new URL(url) } catch (e) { return resolve({ status: null, body: '', error: '无效的 URL: ' + url }) }
-    const req = https.request(u, {
-      method: 'GET',
-      headers: { 'User-Agent': GITHUB_UA, Accept: 'application/vnd.github+json' },
-      timeout: 15000,
-    }, (res) => {
-      const chunks = []
-      res.on('data', (c) => chunks.push(c))
-      res.on('end', () => resolve({ status: res.statusCode, body: Buffer.concat(chunks).toString('utf8'), error: null }))
-    })
-    req.on('timeout', () => req.destroy(new Error('请求超时')))
-    req.on('error', (e) => resolve({ status: null, body: '', error: e && e.message ? e.message : String(e) }))
-    req.end()
+    const go = (target, hop) => {
+      let u
+      try { u = new URL(target) } catch (e) { return resolve({ status: null, body: '', error: '无效的 URL: ' + target }) }
+      const req = request(u, {
+        method: 'GET',
+        headers: { 'User-Agent': GITHUB_UA, Accept: 'application/vnd.github+json' },
+        timeout: 15000,
+      }, (res) => {
+        const code = res.statusCode
+        const loc = res.headers ? res.headers.location : null
+        if (code >= 300 && code < 400 && loc) {
+          res.resume() // 放掉重定向响应体，否则连接不释放
+          if (hop >= maxRedirects) {
+            return resolve({ status: code, body: '', error: '重定向次数超过 ' + maxRedirects + ' 次：' + target })
+          }
+          const next = nextRedirectUrl(target, loc)
+          if (!next) return resolve({ status: code, body: '', error: '无效的重定向地址：' + loc })
+          return go(next, hop + 1)
+        }
+        const chunks = []
+        res.on('data', (c) => chunks.push(c))
+        res.on('end', () => resolve({ status: code, body: Buffer.concat(chunks).toString('utf8'), error: null }))
+      })
+      req.on('timeout', () => req.destroy(new Error('请求超时')))
+      req.on('error', (e) => resolve({ status: null, body: '', error: e && e.message ? e.message : String(e) }))
+      req.end()
+    }
+    go(url, 0)
   })
 }
 

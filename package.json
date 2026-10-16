@@ -1,6 +1,6 @@
 {
   "name": "dsh-sync-webdav",
-  "version": "0.2.0",
+  "version": "0.2.1",
   "description": "DSH WebDAV 配置同步插件：把 ~/.dsh 加密备份到 WebDAV，支持跨机器恢复与快照回滚",
   "type": "module",
   "license": "MIT",
@@ -14,7 +14,7 @@
   ],
   "repository": {
     "type": "git",
-    "url": "git+https://github.com/ddldxiacan/dsh-sync-release.git"
+    "url": "git+https://github.com/ddldxiacan/dsh-sync-webdav.git"
   },
   "files": [
     "index.js",

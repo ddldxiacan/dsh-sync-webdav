@@ -19,6 +19,7 @@ import {
   parseSemver, cmpSemver, semverGt, latestTagOf, shaOfDependency, summaryFromCompare,
   queryFlag, nonTargetFieldsIntact, selfPackageName, selfRepoSlug, selfVersion,
   performVersionCheck, parseRepoSlug, githubHttpsOnlyEnv,
+  defaultHttpsGet, nextRedirectUrl,
 } from './index.js'
 
 let pass = 0, fail = 0
@@ -482,7 +483,14 @@ check('depKind: registry 版本号', depKind('^0.4.6') === 'registry' && depKind
   check('源码中不得硬编码旧包名字面量 dsh-sync-webdav', !/dsh-sync-webdav/.test(src))
   check('selfPackageName 与自身 package.json 的 name 一致', selfPackageName() === selfPkg.name, String(selfPackageName()))
   check('selfVersion 与自身 package.json 的 version 一致', selfVersion() === selfPkg.version, String(selfVersion()))
-  check('selfRepoSlug 从自身 repository.url 推出 owner/repo', selfRepoSlug() === 'ddldxiacan/dsh-sync-release', String(selfRepoSlug()))
+  {
+    // 不写死仓库名（GitHub 仓库改名后此断言若硬编码会误报）：从 package.json 的 repository.url 反推
+    const own = JSON.parse(readFileSync(new URL('./package.json', import.meta.url), 'utf8'))
+    const pkgUrl = ((own.repository || {}).url || '').replace(/\.git$/, '')
+    const m = /github\.com[/:]([^/]+)\/([^/.#]+)$/i.exec(pkgUrl)
+    const expected = m ? m[1] + '/' + m[2] : null
+    check('selfRepoSlug 从自身 repository.url 推出 owner/repo', selfRepoSlug() === expected, String(selfRepoSlug()) + ' 期望 ' + expected)
+  }
 }
 
 // 7.7 performVersionCheck：sha 为主判据、注入网络、缓存与 force
@@ -709,6 +717,81 @@ check('depKind: registry 版本号', depKind('^0.4.6') === 'registry' && depKind
   } finally {
     try { rmSync(root, { recursive: true, force: true }) } catch (e) { /* ignore */ }
   }
+}
+
+// ---------------------------------------------------------------------------
+// 重定向跟随：仓库改名后 GitHub 对旧 owner/repo 路径下的所有 API 端点返回
+// 301 + Location。node:https 不自动跟随（curl -L / git / pnpm 都会），不处理就会
+// 以「GitHub API 返回 HTTP 301」这种与升级无关的错阻断版本检查。以下全部离线。
+// ---------------------------------------------------------------------------
+{
+  // 造一个假的 https.request：按 URL 路径查表返回响应，记录实际请求过的 URL
+  const makeRequest = (table) => (u, opts, cb) => {
+    const res = {
+      statusCode: (table[u.toString()] || {}).status,
+      headers: { location: (table[u.toString()] || {}).location },
+      resume() { res.__resumed = true },
+      on(ev, fn) {
+        if (ev !== 'data' && ev !== 'end') return res
+        setImmediate(() => {
+          const b = (table[u.toString()] || {}).body
+          if (ev === 'data' && b !== undefined) fn(Buffer.from(b))
+          if (ev === 'end') fn()
+        })
+        return res
+      },
+    }
+    const req = { on() { return req }, end() { setImmediate(() => cb(res)) }, destroy() {} }
+    return req
+  }
+
+  // nextRedirectUrl：相对 / 绝对 / 非法
+  check('nextRedirectUrl: 解析相对 Location', nextRedirectUrl('https://api.github.com/repos/a/b/tags', '/repositories/123/tags') === 'https://api.github.com/repositories/123/tags')
+  check('nextRedirectUrl: 解析绝对 Location', nextRedirectUrl('https://api.github.com/x', 'https://api.github.com/y') === 'https://api.github.com/y')
+  check('nextRedirectUrl: 非法 Location 返回 null', nextRedirectUrl('https://api.github.com/x', 'http://[::bad') === null)
+
+  // 301 → 200：必须跟随
+  const OLD = 'https://api.github.com/repos/ddldxiacan/dsh-sync-release/tags'
+  const NEW = 'https://api.github.com/repositories/1422027923/tags'
+  const r1 = await defaultHttpsGet(OLD, {
+    request: makeRequest({
+      [OLD]: { status: 301, location: NEW },
+      [NEW]: { status: 200, body: '[{"name":"v0.2.0"}]' },
+    }),
+  })
+  check('301 被跟随并拿到 200 响应体', r1.status === 200 && r1.body === '[{"name":"v0.2.0"}]', r1)
+  check('301 不算错误', r1.error === null, r1.error)
+
+  // 连续多跳
+  const A = 'https://api.github.com/a', B = 'https://api.github.com/b', C = 'https://api.github.com/c'
+  const r2 = await defaultHttpsGet(A, {
+    request: makeRequest({ [A]: { status: 301, location: '/b' }, [B]: { status: 302, location: '/c' }, [C]: { status: 200, body: 'ok' } }),
+  })
+  check('多跳重定向也能跟到底', r2.status === 200 && r2.body === 'ok', r2)
+
+  // 超过上限：收敛成错误，不无限循环
+  const r3 = await defaultHttpsGet('https://api.github.com/loop', {
+    request: makeRequest({ 'https://api.github.com/loop': { status: 301, location: '/loop' } }),
+    maxRedirects: 3,
+  })
+  check('重定向成环时按上限收敛并报错', r3.status === 301 && /重定向次数超过 3 次/.test(String(r3.error)), r3)
+
+  // Location 非法：不得抛异常
+  const r4 = await defaultHttpsGet('https://api.github.com/bad', {
+    request: makeRequest({ 'https://api.github.com/bad': { status: 301, location: 'http://[::bad' } }),
+  })
+  check('非法 Location 收敛成错误且不抛异常', r4.status === 301 && /无效的重定向地址/.test(String(r4.error)), r4)
+
+  // 正常 200：不受影响
+  const r5 = await defaultHttpsGet('https://api.github.com/ok', { request: makeRequest({ 'https://api.github.com/ok': { status: 200, body: '{"sha":"abc"}' } }) })
+  check('无重定向时行为不变', r5.status === 200 && r5.body === '{"sha":"abc"}', r5)
+
+  // 不带 User-Agent 会被 GitHub 403 —— 必须始终带上
+  let sawUA = null
+  await defaultHttpsGet('https://api.github.com/ua', {
+    request: (u, opts, cb) => { sawUA = opts.headers['User-Agent']; return makeRequest({ 'https://api.github.com/ua': { status: 200, body: '{}' } })(u, opts, cb) },
+  })
+  check('请求始终带 User-Agent（否则 GitHub 403）', !!sawUA, sawUA)
 }
 
 console.log('\n==== ' + pass + ' passed, ' + fail + ' failed ====')

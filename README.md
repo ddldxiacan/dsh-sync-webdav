@@ -38,13 +38,13 @@ dsh-sync 把这件事变成两个按钮：**备份**（加密上传）和**恢�
 2. 输入口令 → 点「备份」
 
 **在 B 机**
-1. **先装上本插件**（`github:ddldxiacan/dsh-sync-release`，或本地路径），重启 DSH
+1. **先装上本插件**（`github:ddldxiacan/dsh-sync-webdav`，或本地路径），重启 DSH
 2. 在设置卡片填入**同一套** WebDAV 配置
 3. 输入**同一个口令** → 选备份 → 点「恢复」
 4. 恢复完成后，卡片会提示「插件依赖未安装」→ 点「**重装插件**」
 5. 重启 DSH
 
-第 4 步会自动处理 A 机的本地路径依赖：A 机若用 `link:E:\…\dsh-sync-release` 这种写法装了本插件，这个绝对路径在 B 机**并不存在**，直接 `pnpm install` 会失败。插件在**备份时**就把这类依赖的仓库地址采集进备份包，恢复时自动改写为 `github:ddldxiacan/dsh-sync-release` 之类的可移植 spec 再安装。
+第 4 步会自动处理 A 机的本地路径依赖：A 机若用 `link:E:\…\dsh-sync-release` 这种写法装了本插件，这个绝对路径在 B 机**并不存在**，直接 `pnpm install` 会失败。插件在**备份时**就把这类依赖的仓库地址采集进备份包，恢复时自动改写为 `github:ddldxiacan/dsh-sync-webdav` 之类的可移植 spec 再安装。
 
 > 恢复流程**不会**自动跑 pnpm install——重装由你点按钮触发，因为安装可能耗时数分钟且会改动 `package.json`。
 
@@ -84,7 +84,7 @@ dsh-sync 把这件事变成两个按钮：**备份**（加密上传）和**恢�
 
 **v0.2.0 起包名从 `dsh-sync-plugin` 改为 `dsh-sync-webdav`**，原因是前者在 npm 上属于别人的项目。改包名意味着它在本机 profile 里是**另一个依赖**，所以：
 
-1. 先装新名（`github:ddldxiacan/dsh-sync-release#v0.2.0`）
+1. 先装新名（`github:ddldxiacan/dsh-sync-webdav#v0.2.0`）
 2. **再卸掉旧名**，否则同一个 `id: dsh-sync` 会注册两次导致启动报错：
 
 ```powershell
@@ -142,13 +142,13 @@ git push origin main --tags
 在 DSH 的**插件管理**界面填入仓库地址安装：
 
 ```
-github:ddldxiacan/dsh-sync-release
+github:ddldxiacan/dsh-sync-webdav
 ```
 
 或使用 CLI：
 
 ```powershell
-dsh plugin --profile desktop install github:ddldxiacan/dsh-sync-release
+dsh plugin --profile desktop install github:ddldxiacan/dsh-sync-webdav
 ```
 
 DSH 会通过 pnpm 拉取本仓库，读取 `package.json` 里的 `dsh.bundle.patch`，自动把 `dsh-sync` 注册进 profile 的 `cordis.patch.yml`，**无需手工改配置**。
@@ -236,3 +236,5 @@ node tools-selftest.mjs
 2. **恢复与回滚只覆盖不删除**：回滚不会清除「快照之后新增的文件」。这是为保护 `dsh-runtimes/` 等排除项而做的取舍。
 3. Windows 保留设备名（`CON`/`NUL`/`COM1` 等）未被路径校验拦截——它们只会解析到 `~/.dsh` 内部，不构成逃逸，属已评估的低危残余。
 4. 插件本身**不处理 `app.asar` 补丁**。第三方模型推理档位修复需在新机器上单独重放，见 `reasoning-effort-fix/README.md`。
+5. **版本检查走未认证 GitHub API，限额 60 次/小时（按 IP）**。每次检查约花 2~3 个请求，检查结果在进程内缓存 10 分钟；限额耗尽时界面会显示「GitHub API 限流（HTTP 403），请稍后重试」，稍等即可，不影响备份/恢复等其它功能。
+6. **仓库改名自动跟随**：若本仓库日后再次改名，GitHub 会对旧地址返回 301。`git`/`pnpm` 会自动跟随（安装不受影响），插件的网络层也已实现 301 跟随（v0.2.1 起），老版本的升级检查不会因此失效。
