@@ -1,0 +1,55 @@
+{
+  "name": "dsh-sync-plugin",
+  "version": "0.1.0",
+  "description": "DSH WebDAV 配置同步插件：把 ~/.dsh 加密备份到 WebDAV，支持跨机器恢复与快照回滚",
+  "type": "module",
+  "license": "MIT",
+  "keywords": [
+    "dsh",
+    "deepseek-harness",
+    "dsh-plugin",
+    "webdav",
+    "sync",
+    "backup"
+  ],
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/ddldxiacan/dsh-sync-release.git"
+  },
+  "files": [
+    "index.js",
+    "client.js",
+    "cordis.patch.yml",
+    "tools-selftest.mjs",
+    "README.md",
+    "LICENSE"
+  ],
+  "exports": {
+    ".": "./index.js",
+    "./client": "./client.js",
+    "./cordis.patch.yml": "./cordis.patch.yml",
+    "./package.json": "./package.json"
+  },
+  "dsh": {
+    "engines": {
+      "dsh": ">=0.2.0-rc.2"
+    },
+    "bundle": {
+      "patch": "./cordis.patch.yml"
+    },
+    "client": {
+      "platform": "web",
+      "immediately": true,
+      "inject": [
+        "@deepseek-ai/dsh-client-ui-settings"
+      ]
+    }
+  },
+  "scripts": {
+    "test": "node tools-selftest.mjs"
+  },
+  "meta": {
+    "title": "WebDAV 配置同步",
+    "description": "把 ~/.dsh 整体配置加密备份到 WebDAV，支持跨机器恢复与本地快照回滚"
+  }
+}

@@ -1,0 +1,21 @@
+# 依赖与构建产物（本插件零依赖，此段为通用防护）
+node_modules/
+*.log
+
+# 本地自测与运行产物
+.selftest-tmp/
+tmp/
+dist/
+
+# 备份与凭据：绝不入库
+*.bundle
+dsh-sync.json
+.env
+.env.*
+
+# 编辑器 / 系统
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
+desktop.ini
