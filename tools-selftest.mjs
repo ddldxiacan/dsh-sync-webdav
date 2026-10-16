@@ -16,6 +16,9 @@ import {
   repoSpecFromUrl, depKind, collectInstallMeta, extractPayloadMeta,
   writeLastRestore, readLastRestore, planProfileInstall, findPnpmPath,
   createTestHarness,
+  parseSemver, cmpSemver, semverGt, latestTagOf, shaOfDependency, summaryFromCompare,
+  queryFlag, nonTargetFieldsIntact, selfPackageName, selfRepoSlug, selfVersion,
+  performVersionCheck, parseRepoSlug, githubHttpsOnlyEnv,
 } from './index.js'
 
 let pass = 0, fail = 0
@@ -248,28 +251,28 @@ check('depKind: registry 版本号', depKind('^0.4.6') === 'registry' && depKind
   const root = join(tmpdir(), 'dsh-sync-ci-' + Date.now())
   const prof = join(root, 'profiles', 'desktop')
   try {
-    mkdirSync(join(prof, 'node_modules', 'dsh-sync-plugin'), { recursive: true })
+    mkdirSync(join(prof, 'node_modules', 'dsh-sync-webdav'), { recursive: true })
     writeFileSync(join(prof, 'package.json'), JSON.stringify({
       dependencies: {
-        'dsh-sync-plugin': 'link:E:/somewhere/dsh-sync-release',
+        'dsh-sync-webdav': 'link:E:/somewhere/dsh-sync-release',
         'dsh-claude-style': '^0.15.0',
         '@liustack/modlens': '3.27.1',
       },
     }), 'utf8')
-    writeFileSync(join(prof, 'node_modules', 'dsh-sync-plugin', 'package.json'),
-      JSON.stringify({ name: 'dsh-sync-plugin', repository: { url: 'git+https://github.com/ddldxiacan/dsh-sync-release.git' } }), 'utf8')
+    writeFileSync(join(prof, 'node_modules', 'dsh-sync-webdav', 'package.json'),
+      JSON.stringify({ name: 'dsh-sync-webdav', repository: { url: 'git+https://github.com/ddldxiacan/dsh-sync-release.git' } }), 'utf8')
     const meta = collectInstallMeta(root, 'desktop')
     check('collectInstallMeta: 只挑出 link 依赖', Object.keys(meta.linkMap).length === 1 && Object.keys(meta.unmapped).length === 0)
-    check('collectInstallMeta: link→github spec', meta.linkMap['dsh-sync-plugin'].spec === 'github:ddldxiacan/dsh-sync-release')
+    check('collectInstallMeta: link→github spec', meta.linkMap['dsh-sync-webdav'].spec === 'github:ddldxiacan/dsh-sync-release')
     check('collectInstallMeta: 保留原始 from 与 reason',
-      meta.linkMap['dsh-sync-plugin'].from === 'link:E:/somewhere/dsh-sync-release' &&
-      meta.linkMap['dsh-sync-plugin'].reason === 'repository.url')
+      meta.linkMap['dsh-sync-webdav'].from === 'link:E:/somewhere/dsh-sync-release' &&
+      meta.linkMap['dsh-sync-webdav'].reason === 'repository.url')
     check('collectInstallMeta: profile 名与时间戳', meta.profile === 'desktop' && typeof meta.createdAt === 'string')
 
     // node_modules 缺失时归入 unmapped，而不是猜一个 spec
     rmSync(join(prof, 'node_modules'), { recursive: true, force: true })
     const meta2 = collectInstallMeta(root, 'desktop')
-    check('collectInstallMeta: 装不了时进 unmapped', Object.keys(meta2.linkMap).length === 0 && meta2.unmapped['dsh-sync-plugin'] === 'link:E:/somewhere/dsh-sync-release')
+    check('collectInstallMeta: 装不了时进 unmapped', Object.keys(meta2.linkMap).length === 0 && meta2.unmapped['dsh-sync-webdav'] === 'link:E:/somewhere/dsh-sync-release')
   } finally {
     try { rmSync(root, { recursive: true, force: true }) } catch (e) { /* ignore */ }
   }
@@ -281,14 +284,14 @@ check('depKind: registry 版本号', depKind('^0.4.6') === 'registry' && depKind
   const rootB = root + '-b'
   const prof = join(root, 'profiles', 'desktop')
   try {
-    mkdirSync(join(prof, 'node_modules', 'dsh-sync-plugin'), { recursive: true })
+    mkdirSync(join(prof, 'node_modules', 'dsh-sync-webdav'), { recursive: true })
     writeFileSync(join(prof, 'package.json'), JSON.stringify({
       name: 'desktop-profile',
-      dependencies: { 'dsh-sync-plugin': 'link:E:/A-only/dsh-sync-release' },
+      dependencies: { 'dsh-sync-webdav': 'link:E:/A-only/dsh-sync-release' },
     }), 'utf8')
-    writeFileSync(join(prof, 'node_modules', 'dsh-sync-plugin', 'package.json'),
-      JSON.stringify({ name: 'dsh-sync-plugin', repository: { url: 'git+https://github.com/ddldxiacan/dsh-sync-release.git' } }), 'utf8')
-    writeFileSync(join(prof, 'pnpm-lock.yaml'), 'lockfileVersion: 9\nimporters:\n  .:\n    dependencies:\n      dsh-sync-plugin:\n        specifier: link:E:/A-only/dsh-sync-release\n', 'utf8')
+    writeFileSync(join(prof, 'node_modules', 'dsh-sync-webdav', 'package.json'),
+      JSON.stringify({ name: 'dsh-sync-webdav', repository: { url: 'git+https://github.com/ddldxiacan/dsh-sync-release.git' } }), 'utf8')
+    writeFileSync(join(prof, 'pnpm-lock.yaml'), 'lockfileVersion: 9\nimporters:\n  .:\n    dependencies:\n      dsh-sync-webdav:\n        specifier: link:E:/A-only/dsh-sync-release\n', 'utf8')
 
     // A 机：备份（带 meta）
     const payload = buildPayload(root, collectFiles(root), collectInstallMeta(root, 'desktop'))
@@ -300,39 +303,39 @@ check('depKind: registry 版本号', depKind('^0.4.6') === 'registry' && depKind
     const meta = extractPayloadMeta(decryptBundle(bundle, 'pw'))
     extractPayload(decryptBundle(bundle, 'pw'), rootB)
     writeLastRestore(rootB, { at: new Date().toISOString(), bundle: 'x', profile: meta.profile, linkMap: meta.linkMap })
-    check('E2E: B 机恢复后没有 node_modules', !existsSync(join(rootB, 'profiles', 'desktop', 'node_modules', 'dsh-sync-plugin', 'package.json')))
+    check('E2E: B 机恢复后没有 node_modules', !existsSync(join(rootB, 'profiles', 'desktop', 'node_modules', 'dsh-sync-webdav', 'package.json')))
 
     // 用 B 机的目录实例化 host，跑 /plugins 与 /plugins/install
     const h = createTestHarness({ root: rootB, profile: 'desktop' })
     const rep = await h.handlePlugins()
     check('E2E: /plugins 报出 profile 与缺失项', rep.ok === true && rep.profile === 'desktop' && rep.missing.length === 1 && rep.needsInstall === true)
     check('E2E: /plugins 给出改写建议', rep.deps[0].rewrite === 'github:ddldxiacan/dsh-sync-release' && rep.deps[0].installed === false)
-    check('E2E: 记录的 linkMap 生效', rep.mapped['dsh-sync-plugin'].spec === 'github:ddldxiacan/dsh-sync-release')
-    check('client 契约: missing 是包名数组', Array.isArray(rep.missing) && rep.missing[0] === 'dsh-sync-plugin')
+    check('E2E: 记录的 linkMap 生效', rep.mapped['dsh-sync-webdav'].spec === 'github:ddldxiacan/dsh-sync-release')
+    check('client 契约: missing 是包名数组', Array.isArray(rep.missing) && rep.missing[0] === 'dsh-sync-webdav')
 
     let captured = null
     const fakeRunner = (opt) => {
       captured = opt
       // 模拟真实 pnpm：重建 node_modules，并把锁文件里的 link specifier 同步成仓库地址
-      mkdirSync(join(opt.cwd, 'node_modules', 'dsh-sync-plugin'), { recursive: true })
-      writeFileSync(join(opt.cwd, 'node_modules', 'dsh-sync-plugin', 'package.json'), '{"name":"dsh-sync-plugin"}', 'utf8')
-      writeFileSync(join(opt.cwd, 'pnpm-lock.yaml'), 'lockfileVersion: 9\nimporters:\n  .:\n    dependencies:\n      dsh-sync-plugin:\n        specifier: github:ddldxiacan/dsh-sync-release\n', 'utf8')
+      mkdirSync(join(opt.cwd, 'node_modules', 'dsh-sync-webdav'), { recursive: true })
+      writeFileSync(join(opt.cwd, 'node_modules', 'dsh-sync-webdav', 'package.json'), '{"name":"dsh-sync-webdav"}', 'utf8')
+      writeFileSync(join(opt.cwd, 'pnpm-lock.yaml'), 'lockfileVersion: 9\nimporters:\n  .:\n    dependencies:\n      dsh-sync-webdav:\n        specifier: github:ddldxiacan/dsh-sync-release\n', 'utf8')
       return { status: 0, stdout: 'Done in 2m6.7s', stderr: '' }
     }
     const res = await h.handlePluginInstall({}, fakeRunner, 'C:/fake/pnpm.mjs')
     check('E2E: 安装成功且返回结构完整', res.ok === true && res.exitCode === 0 && typeof res.durationMs === 'number')
-    check('client 契约: installed 是包名数组', Array.isArray(res.installed) && res.installed.includes('dsh-sync-plugin'))
-    check('client 契约: rewritten 是 包名→声明 映射', res.rewritten['dsh-sync-plugin'] === 'github:ddldxiacan/dsh-sync-release')
+    check('client 契约: installed 是包名数组', Array.isArray(res.installed) && res.installed.includes('dsh-sync-webdav'))
+    check('client 契约: rewritten 是 包名→声明 映射', res.rewritten['dsh-sync-webdav'] === 'github:ddldxiacan/dsh-sync-release')
     check('client 契约: removed 是包名数组', Array.isArray(res.removed) && res.removed.length === 0)
     check('E2E: 命令行为 pnpm install（不带 lockfile 相关 flag）',
       captured.args.length === 2 && captured.args[0] === 'C:/fake/pnpm.mjs' && captured.args[1] === 'install')
     check('E2E: cwd 与 ELECTRON_RUN_AS_NODE 正确', captured.cwd === join(rootB, 'profiles', 'desktop') && captured.env.ELECTRON_RUN_AS_NODE === '1')
     check('E2E: 超时为 15 分钟', captured.timeout === 15 * 60 * 1000)
     const pkgAfter = JSON.parse(readFileSync(join(rootB, 'profiles', 'desktop', 'package.json'), 'utf8'))
-    check('E2E: package.json 里 link: 已改写为仓库地址', pkgAfter.dependencies['dsh-sync-plugin'] === 'github:ddldxiacan/dsh-sync-release')
+    check('E2E: package.json 里 link: 已改写为仓库地址', pkgAfter.dependencies['dsh-sync-webdav'] === 'github:ddldxiacan/dsh-sync-release')
     check('E2E: 改写前已备份 package.json',
       readdirSync(join(rootB, 'profiles', 'desktop')).some((n) => n.startsWith('package.json.bak-dsh-sync-')) &&
-      JSON.parse(readFileSync(join(rootB, 'profiles', 'desktop', 'package.json'), 'utf8')).dependencies['dsh-sync-plugin'].startsWith('github:'))
+      JSON.parse(readFileSync(join(rootB, 'profiles', 'desktop', 'package.json'), 'utf8')).dependencies['dsh-sync-webdav'].startsWith('github:'))
     check('E2E: 回报锁文件已同步', res.lockSynced === true)
     const rep2 = await h.handlePlugins()
     check('E2E: 安装后插件已就位、needsInstall 转 false', rep2.deps[0].installed === true && rep2.missing.length === 0 && rep2.needsInstall === false)
@@ -399,6 +402,313 @@ check('depKind: registry 版本号', depKind('^0.4.6') === 'registry' && depKind
   check('异步 runner: 定时器先完成', raced === 'timer-first')
   const out = await child
   check('异步 runner: 透传退出码与 stdout', out.status === 0 && /child-output/.test(out.stdout))
+}
+
+// ============================================================
+// 7. 版本检查 / 自我升级
+// 全部注入替身 + 临时 profile，绝不联网、绝不碰真实 profile
+// ============================================================
+
+// 7.1 semver：数值比较 + 预发布段
+{
+  const a = parseSemver('v1.2.3')
+  check('parseSemver: 解析 v 前缀与三段号', !!a && a.nums[0] === 1 && a.nums[1] === 2 && a.nums[2] === 3 && a.pre === null)
+  check('parseSemver: 分支名/HEAD 解析失败（不得当版本号参与比较）',
+    parseSemver('main') === null && parseSemver('HEAD') === null && parseSemver('') === null && parseSemver(undefined) === null)
+  check('cmpSemver: 按数值比较（0.10.0 > 0.9.0，字符串比较会判反）', cmpSemver('0.10.0', '0.9.0') === 1 && cmpSemver('0.9.0', '0.10.0') === -1)
+  check('cmpSemver: 相等返回 0', cmpSemver('1.0.0', 'v1.0.0') === 0)
+  check('semverGt: 正式版 > 同号预发布版', semverGt('1.0.0', '1.0.0-rc.1') === true && semverGt('1.0.0-rc.1', '1.0.0') === false)
+  check('cmpSemver: 不可解析返回 null 而非抛异常', cmpSemver('x', '1.0.0') === null && semverGt('nope', '1.0.0') === false)
+}
+
+// 7.2 最高 tag 选取：不依赖数组顺序
+{
+  const shuffled = [{ name: 'v0.9.0' }, { name: 'v0.10.0' }, { name: 'v0.2.1' }, { name: 'main' }, { name: 'v1' }]
+  const best = latestTagOf(shuffled)
+  check('latestTagOf: 乱序数组里取最高版本', !!best && best.name === 'v0.10.0', best && best.name)
+  check('latestTagOf: 无 v* tag 返回 null', latestTagOf([{ name: 'nightly' }]) === null && latestTagOf([]) === null && latestTagOf(null) === null)
+}
+
+// 7.3 从锁文件取 sha：同一 specifier 的多种锁文件形态
+{
+  const sha = 'b50378397f3c4f7a801c64df60381e59cf802340'
+  const codeload = [
+    'lockfileVersion: 9', 'importers:', '  .:', '    dependencies:',
+    '      dsh-sync-webdav:', '        specifier: github:ddldxiacan/dsh-sync-release#v0.1.0',
+    '        version: https://codeload.github.com/ddldxiacan/dsh-sync-release/tar.gz/' + sha, '',
+  ].join('\n')
+  const gitShape = [
+    'lockfileVersion: 9', 'importers:', '  .:', '    dependencies:',
+    '      dsh-sync-webdav:', '        specifier: github:ddldxiacan/dsh-sync-release',
+    '        resolution: {commit: ' + sha + ', repo: ddldxiacan/dsh-sync-release, type: git}', '',
+  ].join('\n')
+  check('shaOfDependency: codeload tarball 形态取到 tarball 里的 sha', shaOfDependency(codeload, 'dsh-sync-webdav') === sha)
+  check('shaOfDependency: git resolution.commit 形态取到 commit sha', shaOfDependency(gitShape, 'dsh-sync-webdav') === sha)
+  check('shaOfDependency: 目标依赖不存在时返回 null', shaOfDependency(codeload, 'no-such-pkg') === null)
+  const other = codeload.replace(/^(\s+dsh-sync-webdav:)$/m, '      other-pkg:') + '\n      dsh-sync-webdav:\n        specifier: link:E:/x\n'
+  check('shaOfDependency: 不误取其它依赖的 sha（同文件内先出现的 sha 不算）', shaOfDependency(other, 'dsh-sync-webdav') === null)
+}
+
+// 7.4 compare → changelog：最多 8 条，超出补统计行
+{
+  const many = { total_commits: 12, commits: Array.from({ length: 15 }, (_, i) => ({ commit: { message: 'c' + i + '\n\n详情正文' } })) }
+  const got = summaryFromCompare(many)
+  check('summaryFromCompare: 总条数不超过 8', got.length === 8, 'len=' + got.length)
+  check('summaryFromCompare: 超出的提交数补成末行', got[7] === '还有 5 个提交', got[7])
+  check('summaryFromCompare: 多条正文只取首行', got[0] === 'c0' && !got.some((s) => /详情正文/.test(s)))
+  const few = summaryFromCompare({ total_commits: 2, commits: [{ commit: { message: 'fix a' } }, { commit: { message: 'fix b' } }] })
+  check('summaryFromCompare: 未超出时不加统计行', few.length === 2 && few[1] === 'fix b')
+  check('summaryFromCompare: 空响应退化为 []', summaryFromCompare(null).length === 0 && summaryFromCompare({}).length === 0)
+}
+
+// 7.5 小工具：queryFlag / parseRepoSlug / 只改目标键的校验
+{
+  check('queryFlag: 识别 ?force=1 且忽略 false 值',
+    queryFlag('/dsh-sync/version?force=1', 'force') === true && queryFlag('/dsh-sync/version?force=true', 'force') === true &&
+    queryFlag('/dsh-sync/version?force=0', 'force') === false && queryFlag('/dsh-sync/version', 'force') === false && queryFlag(undefined, 'force') === false)
+  const slug = parseRepoSlug('git+https://github.com/ddldxiacan/dsh-sync-release.git')
+  check('parseRepoSlug: 从 repository.url 得到 owner/repo', slug === 'ddldxiacan/dsh-sync-release', String(slug))
+  const before = { dependencies: { a: 'github:x/y#v1', b: '^2.0.0' }, dsh: { profile: { bundles: ['a', 'b'] } } }
+  const after = JSON.parse(JSON.stringify(before)); after.dependencies.a = 'github:x/y#v2'
+  check('nonTargetFieldsIntact: 只改目标依赖 → true', nonTargetFieldsIntact(before, after, 'a') === true)
+  const bad = JSON.parse(JSON.stringify(before)); bad.dependencies.a = 'github:x/y#v2'; bad.dsh.profile.bundles.push('c')
+  check('nonTargetFieldsIntact: bundles 被改动 → false', nonTargetFieldsIntact(before, bad, 'a') === false)
+}
+
+// 7.6 自身元信息全部来自 package.json —— 改名后不得依赖任何硬编码包名
+{
+  const src = readFileSync(new URL('./index.js', import.meta.url), 'utf8')
+  const selfPkg = JSON.parse(readFileSync(new URL('./package.json', import.meta.url), 'utf8'))
+  check('源码中不得硬编码旧包名字面量 dsh-sync-webdav', !/dsh-sync-webdav/.test(src))
+  check('selfPackageName 与自身 package.json 的 name 一致', selfPackageName() === selfPkg.name, String(selfPackageName()))
+  check('selfVersion 与自身 package.json 的 version 一致', selfVersion() === selfPkg.version, String(selfVersion()))
+  check('selfRepoSlug 从自身 repository.url 推出 owner/repo', selfRepoSlug() === 'ddldxiacan/dsh-sync-release', String(selfRepoSlug()))
+}
+
+// 7.7 performVersionCheck：sha 为主判据、注入网络、缓存与 force
+{
+  const shaLocal = 'a'.repeat(40)
+  const shaRemote = 'b'.repeat(40)
+  const mkGet = (map, counter) => async (url) => {
+    if (counter) counter.push(url)
+    for (const [k, v] of Object.entries(map)) if (url.includes(k)) return v
+    return { status: 404, body: '', error: null }
+  }
+  const okMap = {
+    '/tags': { status: 200, body: JSON.stringify([{ name: 'v0.1.0' }]), error: null },
+    '/commits/main': { status: 200, body: JSON.stringify({ sha: shaRemote }), error: null },
+    '/compare/': { status: 200, body: JSON.stringify({ total_commits: 2, commits: [{ commit: { message: 'feat: x' } }, { commit: { message: 'fix: y' } }] }), error: null },
+  }
+  const r1 = await performVersionCheck('0.1.0', 'ddldxiacan/dsh-sync-release', { httpsGet: mkGet(okMap), cache: new Map(), localSha: shaLocal })
+  check('版本检查: 版本号相同但 sha 不同 → hasUpdate true（仅比较 semver 会漏判）', r1.hasUpdate === true)
+  check('版本检查: latest 取最高 tag 原样（不改写格式）', r1.latest === 'v0.1.0', String(r1.latest))
+  check('版本检查: changelog 来自 compare 的提交首行', r1.changelog.length === 2 && r1.changelog[0] === 'feat: x')
+
+  const r2 = await performVersionCheck('0.1.0', 'ddldxiacan/dsh-sync-release', { httpsGet: mkGet(okMap), cache: new Map(), localSha: shaRemote })
+  check('版本检查: sha 相同 → hasUpdate false', r2.hasUpdate === false)
+
+  // 缓存：第二次不得再发请求
+  const calls = []
+  const cache = new Map()
+  await performVersionCheck('0.1.0', 'ddldxiacan/dsh-sync-release', { httpsGet: mkGet(okMap, calls), cache, localSha: shaLocal })
+  const n1 = calls.length
+  const r3 = await performVersionCheck('0.1.0', 'ddldxiacan/dsh-sync-release', { httpsGet: mkGet(okMap, calls), cache, localSha: shaLocal })
+  check('版本检查: 10 分钟内命中缓存（不再发请求）', calls.length === n1 && r3.checked === false, 'calls=' + n1 + '→' + calls.length)
+  const r4 = await performVersionCheck('0.1.0', 'ddldxiacan/dsh-sync-release', { httpsGet: mkGet(okMap, calls), cache, localSha: shaLocal, force: true })
+  check('版本检查: force 绕过缓存重新请求', calls.length > n1 && r4.checked === true)
+
+  // 网络失败：收敛成 error，绝不抛
+  const offline = await performVersionCheck('0.1.0', 'ddldxiacan/dsh-sync-release', {
+    httpsGet: async () => ({ status: null, body: '', error: 'getaddrinfo ENOTFOUND api.github.com' }), cache: new Map(), localSha: shaLocal,
+  })
+  check('版本检查: 断网时返回 error 且不抛异常', offline.hasUpdate === false && /ENOTFOUND/.test(String(offline.error)), String(offline.error))
+
+  const rate = await performVersionCheck('0.1.0', 'ddldxiacan/dsh-sync-release', {
+    httpsGet: async () => ({ status: 403, body: '', error: null }), cache: new Map(), localSha: shaLocal,
+  })
+  check('版本检查: GitHub 限流(403)给出可读错误', /限流/.test(String(rate.error)) && rate.hasUpdate === false, String(rate.error))
+
+  // 无 tag 时 latest 退化为 7 位 sha
+  const noTags = await performVersionCheck('0.1.0', 'ddldxiacan/dsh-sync-release', {
+    httpsGet: mkGet({ '/tags': { status: 200, body: '[]', error: null }, '/commits/main': { status: 200, body: JSON.stringify({ sha: shaRemote }), error: null } }),
+    cache: new Map(), localSha: shaLocal,
+  })
+  check('版本检查: 无 tag 时 latest 退化为 7 位远端 sha', noTags.latest === shaRemote.slice(0, 7), String(noTags.latest))
+}
+
+// 7.8 端点契约：字段名/类型固定，失败也是 ok:false + error（不抛）
+{
+  const root = join(tmpdir(), 'dsh-sync-ver-' + Date.now())
+  const NAME = selfPackageName()
+  const SLUG = selfRepoSlug()
+  const shaLocal = 'a'.repeat(40)
+  try {
+    const prof = join(root, 'profiles', 'desktop')
+    mkdirSync(join(prof, 'node_modules', NAME), { recursive: true })
+    writeFileSync(join(prof, 'package.json'), JSON.stringify({
+      dependencies: { [NAME]: 'github:' + SLUG + '#v0.1.0', 'dsh-claude-style': '^0.15.0' },
+      dsh: { profile: { bundles: [NAME, 'dsh-claude-style'] } },
+    }), 'utf8')
+    writeFileSync(join(prof, 'node_modules', NAME, 'package.json'), JSON.stringify({ name: NAME, version: '0.1.0' }), 'utf8')
+    writeFileSync(join(prof, 'pnpm-lock.yaml'), 'lockfileVersion: 9\nimporters:\n  .:\n    dependencies:\n      ' + NAME + ':\n        specifier: github:' + SLUG + '#v0.1.0\n        resolution: {commit: ' + shaLocal + ', type: git}\n', 'utf8')
+    const h = createTestHarness({ root, profile: 'desktop' })
+
+    const fakeCheck = { hasUpdate: true, latest: 'v0.2.0', latestTag: 'v0.2.0', remoteSha: 'b'.repeat(40), changelog: ['feat: 新功能'], checkedAt: new Date().toISOString(), checked: true, error: null }
+    let sawForce = null
+    const v = await h.handleVersion({}, { url: '/dsh-sync/version?force=1' }, { check: async (cur, slug, o2) => { sawForce = o2.force; return { ...fakeCheck } } })
+    const fields = ['ok', 'current', 'mode', 'kind', 'spec', 'repo', 'hasUpdate', 'latest', 'changelog', 'checkedAt', 'checked', 'error']
+    check('GET /version: 契约字段齐全且 ok=true', v.ok === true && fields.every((f) => f in v), Object.keys(v).join(','))
+    check('GET /version: 已安装态被如实报告', v.mode === 'managed' && v.kind === 'git' && v.spec === 'github:' + SLUG + '#v0.1.0' && v.repo === SLUG)
+    check('GET /version: hasUpdate/latest/changelog 透传', v.hasUpdate === true && v.latest === 'v0.2.0' && v.changelog[0] === 'feat: 新功能')
+    check('GET /version: 本地锁文件 sha 被取到并传给检查（sha 判据的数据源）', sawForce === true)
+    const vNoForce = await h.handleVersion({}, { url: '/dsh-sync/version' }, { check: async (cur, slug, o2) => { sawForce = o2.force; return { ...fakeCheck } } })
+    check('GET /version: 不带 ?force 时不走强制路径', sawForce === false && vNoForce.ok === true)
+
+    // registry 安装：报错但不得声称有更新
+    const root2 = root + '-reg'
+    const prof2 = join(root2, 'profiles', 'desktop')
+    mkdirSync(prof2, { recursive: true })
+    writeFileSync(join(prof2, 'package.json'), JSON.stringify({ dependencies: { [NAME]: '^0.12.8' } }), 'utf8')
+    const h2 = createTestHarness({ root: root2, profile: 'desktop' })
+    const v2 = await h2.handleVersion({}, { url: '/dsh-sync/version' }, { check: async () => ({ ...fakeCheck }) })
+    check('GET /version: registry 安装报可读错误', /npm|其他作者/.test(String(v2.error)), String(v2.error))
+    check('GET /version: registry 安装不得声称有更新', v2.hasUpdate === false)
+
+    // 检查函数抛异常：端点仍返回结构化结果
+    const v3 = await h.handleVersion({}, { url: '/dsh-sync/version' }, { check: async () => { throw new Error('boom') } })
+    check('GET /version: 检查抛异常被吞掉并回报', v3.ok === true && /boom/.test(String(v3.error)))
+  } finally {
+    try { rmSync(root, { recursive: true, force: true }) } catch (e) { /* ignore */ }
+    try { rmSync(root + '-reg', { recursive: true, force: true }) } catch (e) { /* ignore */ }
+  }
+}
+
+// 7.9 POST /upgrade：开发态 / registry 一律拒绝
+{
+  const NAME = selfPackageName()
+  const root = join(tmpdir(), 'dsh-sync-upg-dev-' + Date.now())
+  try {
+    const prof = join(root, 'profiles', 'desktop')
+    mkdirSync(prof, { recursive: true })
+    writeFileSync(join(prof, 'package.json'), JSON.stringify({ dependencies: { [NAME]: 'link:E:/src/dsh-sync-release' } }), 'utf8')
+    const h = createTestHarness({ root, profile: 'desktop' })
+    let called = 0
+    const u = await h.handleUpgrade({}, {}, { install: async () => { called++; return { ok: true, log: '' } }, check: async () => { called++; return {} } })
+    check('POST /upgrade: 开发态拒绝升级', u.ok === false)
+    check('POST /upgrade: 开发态提示改用 git pull（原文）', u.error === '开发态安装（link:）：本机指向源码目录，请用 git pull 更新', String(u.error))
+    check('POST /upgrade: 开发态拒绝时不跑任何安装/检查', called === 0 && u.needRestart === undefined)
+
+    const root3 = root + '-reg'
+    const prof3 = join(root3, 'profiles', 'desktop')
+    mkdirSync(prof3, { recursive: true })
+    writeFileSync(join(prof3, 'package.json'), JSON.stringify({ dependencies: { [NAME]: '^0.12.8' } }), 'utf8')
+    const h3 = createTestHarness({ root: root3, profile: 'desktop' })
+    const u3 = await h3.handleUpgrade({}, {}, { install: async () => ({ ok: true, log: '' }) })
+    check('POST /upgrade: registry 安装拒绝（npm 同名包属于他人）', u3.ok === false && /其他作者/.test(String(u3.error)), String(u3.error))
+  } finally {
+    try { rmSync(root, { recursive: true, force: true }) } catch (e) { /* ignore */ }
+    try { rmSync(root + '-reg', { recursive: true, force: true }) } catch (e) { /* ignore */ }
+  }
+}
+
+// 7.10 POST /upgrade：正常路径 —— 只改一个键 + 备份 + 复用 runProfileInstall
+{
+  const NAME = selfPackageName()
+  const SLUG = selfRepoSlug()
+  const root = join(tmpdir(), 'dsh-sync-upg-ok-' + Date.now())
+  try {
+    const prof = join(root, 'profiles', 'desktop')
+    const oldSpec = 'github:' + SLUG + '#v0.1.0'
+    const newSpec = 'github:' + SLUG + '#v0.2.0'
+    mkdirSync(join(prof, 'node_modules', NAME), { recursive: true })
+    const pkg0 = {
+      dependencies: { [NAME]: oldSpec, 'dsh-claude-style': '^0.15.0', '@liustack/modlens': '3.27.1' },
+      dsh: { profile: { bundles: [NAME, 'dsh-claude-style', '@liustack/modlens'] } },
+    }
+    writeFileSync(join(prof, 'package.json'), JSON.stringify(pkg0, null, 2) + '\n', 'utf8')
+    writeFileSync(join(prof, 'node_modules', NAME, 'package.json'), JSON.stringify({ name: NAME, version: '0.1.0' }), 'utf8')
+    const h = createTestHarness({ root, profile: 'desktop' })
+    const fakeCheck = { hasUpdate: true, latest: 'v0.2.0', latestTag: 'v0.2.0', remoteSha: 'b'.repeat(40), changelog: [], checkedAt: new Date().toISOString(), checked: true, error: null }
+    let installArgs = null
+    const u = await h.handleUpgrade({}, {}, {
+      check: async () => ({ ...fakeCheck }),
+      install: async (runner, pnpmPath) => { installArgs = { runner, pnpmPath }; return { ok: true, exitCode: 0, log: 'Done in 7.4s' } },
+    })
+    check('POST /upgrade: 成功路径 ok=true 且 upgraded=true', u.ok === true && u.upgraded === true, JSON.stringify({ ok: u.ok, err: u.error }))
+    check('POST /upgrade: 新 spec 是 github:<slug>#<tag> 且与旧 spec 不同', u.spec === newSpec && u.spec !== oldSpec, String(u.spec))
+    check('POST /upgrade: from/to 如实回报', u.from === '0.1.0' && u.to === 'v0.2.0', u.from + '→' + u.to)
+    check('POST /upgrade: needRestart 恒为 true 且带回下次安装也要用的 before', u.needRestart === true && u.before.spec === oldSpec && u.before.version === '0.1.0')
+    check('POST /upgrade: durationMs/exitCode/log 是数字与字符串', typeof u.durationMs === 'number' && u.exitCode === 0 && /Done in/.test(u.log))
+    const after = JSON.parse(readFileSync(join(prof, 'package.json'), 'utf8'))
+    check('POST /upgrade: 只改写了目标依赖这一个键', after.dependencies[NAME] === newSpec)
+    check('POST /upgrade: 其它依赖与 dsh.profile.bundles 逐字节未变',
+      JSON.stringify({ ...after, dependencies: { ...after.dependencies, [NAME]: oldSpec } }) === JSON.stringify(pkg0))
+    check('POST /upgrade: 改写了真实 profile package.json 已生成备份', typeof u.backup === 'string' && existsSync(u.backup) && JSON.parse(readFileSync(u.backup, 'utf8')).dependencies[NAME] === oldSpec)
+    check('POST /upgrade: 复用了既有安装路径（未自己拼 pnpm 命令）', installArgs !== null && installArgs.runner === undefined)
+
+    // 已在目标 ref：不得白跑一次安装
+    let ran = 0
+    const u2 = await h.handleUpgrade({}, {}, { check: async () => ({ ...fakeCheck, latest: 'v0.2.0' }), install: async () => { ran++; return { ok: true, log: '' } } })
+    check('POST /upgrade: spec 未变时回报「已是最新」且不跑安装', u2.ok === true && u2.upgraded === false && ran === 0, JSON.stringify({ ok: u2.ok, upgraded: u2.upgraded, ran }))
+
+    // 无更新
+    const u3 = await h.handleUpgrade({}, {}, { check: async () => ({ hasUpdate: false, latest: null, error: null }), install: async () => { ran++; return { ok: true, log: '' } } })
+    check('POST /upgrade: 无更新时不安装', u3.ok === true && u3.upgraded === false && ran === 0)
+
+    // 安装失败：ok=false，但 spec 已落地（如实回报，不谎报成功）
+    const u4 = await h.handleUpgrade({}, {}, { check: async () => ({ ...fakeCheck, latest: 'v0.3.0', latestTag: 'v0.3.0' }), install: async () => ({ ok: false, error: 'pnpm install 退出码 1', log: 'ERR' }) })
+    check('POST /upgrade: 安装失败时 ok=false 且带日志', u4.ok === false && /退出码 1/.test(u4.error) && /ERR/.test(String(u4.log)))
+
+    // 安装后 package.json 未落地目标 spec：必须报错而不是谎报成功
+    const u5 = await h.handleUpgrade({}, {}, {
+      check: async () => ({ ...fakeCheck, latest: 'v0.4.0', latestTag: 'v0.4.0' }),
+      install: async () => {
+        // 模拟「pnpm 声称成功、但 profile 里仍是旧 spec」
+        writeFileSync(join(prof, 'package.json'), JSON.stringify({ ...pkg0, dependencies: { ...pkg0.dependencies, [NAME]: oldSpec } }, null, 2) + '\n', 'utf8')
+        return { ok: true, log: 'ok' }
+      },
+    })
+    check('POST /upgrade: 安装后校验失败时报错（不谎报成功）', u5.ok === false && /安装后校验失败/.test(String(u5.error)), String(u5.error))
+  } finally {
+    try { rmSync(root, { recursive: true, force: true }) } catch (e) { /* ignore */ }
+  }
+}
+
+// 7.11 升级安装：把 git 的 SSH 回退强行拉回 HTTPS
+{
+  const base = { PATH: 'C:\\WINDOWS', ELECTRON_RUN_AS_NODE: '1' }
+  const env = githubHttpsOnlyEnv(base)
+  check('githubHttpsOnlyEnv: GIT_CONFIG_VALUE_0 把 git@github.com: 重写到 HTTPS', env.GIT_CONFIG_VALUE_0 === 'git@github.com:', String(env.GIT_CONFIG_VALUE_0))
+  check('githubHttpsOnlyEnv: 两条重写规则都指向 https://github.com/',
+    env.GIT_CONFIG_COUNT === '2' &&
+    env.GIT_CONFIG_KEY_0 === 'url.https://github.com/.insteadOf' && env.GIT_CONFIG_KEY_1 === 'url.https://github.com/.insteadOf' &&
+    env.GIT_CONFIG_VALUE_1 === 'ssh://git@github.com/')
+  check('githubHttpsOnlyEnv: 保留原有 env 且不改动入参对象',
+    env.PATH === base.PATH && env.ELECTRON_RUN_AS_NODE === '1' && !('GIT_CONFIG_COUNT' in base))
+
+  // 注入不得污染全进程 env（GIT_CONFIG_COUNT 会被子进程继承，泄漏会影响用户其它 git 操作）
+  const before = process.env.GIT_CONFIG_COUNT
+  const env2 = githubHttpsOnlyEnv({ ...process.env, ELECTRON_RUN_AS_NODE: '1' })
+  check('githubHttpsOnlyEnv: 注入后 process.env 不被污染',
+    process.env.GIT_CONFIG_COUNT === before && env2.GIT_CONFIG_COUNT === '2' && env2 !== process.env)
+
+  // 走真实安装路径：断言注入只发生在升级那一次调用
+  const root = join(tmpdir(), 'dsh-sync-gitenv-' + Date.now())
+  try {
+    const prof = join(root, 'profiles', 'desktop')
+    mkdirSync(prof, { recursive: true })
+    writeFileSync(join(prof, 'package.json'), JSON.stringify({ dependencies: {} }), 'utf8')
+    const h = createTestHarness({ root, profile: 'desktop' })
+    const seen = []
+    const runner = async (opt) => { seen.push(opt.env); return { status: 0, stdout: 'ok', stderr: '' } }
+    await h.runProfileInstall(runner, 'C:/fake/pnpm.mjs', { githubHttpsOnly: true })
+    await h.runProfileInstall(runner, 'C:/fake/pnpm.mjs')
+    check('升级安装: 子进程 env 带上了 HTTPS 强制', seen[0] && seen[0].GIT_CONFIG_VALUE_0 === 'git@github.com:' && seen[0].GIT_CONFIG_COUNT === '2')
+    check('普通插件安装: 不带 HTTPS 强制（不污染无关安装）', seen[1] && seen[1].GIT_CONFIG_COUNT === undefined)
+    check('两次安装后 process.env 均未被污染', process.env.GIT_CONFIG_COUNT === before && process.env.GIT_CONFIG_KEY_0 === undefined)
+  } finally {
+    try { rmSync(root, { recursive: true, force: true }) } catch (e) { /* ignore */ }
+  }
 }
 
 console.log('\n==== ' + pass + ' passed, ' + fail + ' failed ====')

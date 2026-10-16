@@ -2,5 +2,5 @@
 # name 必须与 package.json 的 name 一致，否则 bundle 层解析不到该模块。
 - insert:
     - id: dsh-sync
-      name: 'dsh-sync-plugin'
+      name: 'dsh-sync-webdav'
       config: {}

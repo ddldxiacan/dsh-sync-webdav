@@ -4,6 +4,9 @@
  * 注册进宿主已声明的 slot `settings.section`（kind: list, scope: root），
  * 在设置面板里占一个独立页「配置同步（WebDAV）」。
  *
+ * loader id 必须等于 package.json 的 name（dsh-sync-webdav）；HTTP 路径前缀、
+ * 配置文件名、快照目录名仍沿用 `dsh-sync`，改名不影响接口与磁盘布局。
+ *
  * 与 Host 半区（index.js）通过 HTTP 端点通信，契约冻结：
  *   GET  /dsh-sync/status                          -> { configured, remote:{reachable,backups[],latest?}, lastLocalSnapshot?, error? }
  *   POST /dsh-sync/config   {url,username,password,remoteDir} -> { ok:true } | { ok:false, error }
@@ -12,7 +15,15 @@
  *   POST /dsh-sync/rollback {snapshot}              -> { ok:true, restored }              | { ok:false, error }
  *   GET  /dsh-sync/plugins                          -> { ok:true, profile, deps[], missing[], needsInstall, pnpm }
  *   POST /dsh-sync/plugins/install {}               -> { ok:true, installed[], rewritten{}, removed[], durationMs, log } | { ok:false, error, log }
+ *   GET  /dsh-sync/version[?force=1]                -> { ok:true, current, mode:'dev'|'managed', kind, spec, repo, hasUpdate,
+ *                                                        latest, changelog[], checkedAt, checked, currentSha, latestSha, error }
+ *   POST /dsh-sync/upgrade  {}                      -> { ok:true, from, to, upgraded, spec, exitCode, durationMs, needRestart,
+ *                                                        before, backup, log, error } | { ok:false, error, log? }
  * 所有响应 HTTP 200，按 `ok` 字段判断成败；错误统一在 `error` 字段。
+ *
+ * version 端点两条语义约定（宿主以 git commit sha 比较为主，不靠 semver）：
+ *   - `hasUpdate` 是唯一权威判据，客户端不自行比较版本大小；
+ *   - `latest` 不保证是 semver：有 tag 时如 "v0.2.0"，无 tag 时是远端短 sha，一律原样渲染。
  * /plugins 失败时是 { ok:false, error }（HTTP 仍 200），必须看返回体的 ok，不能依赖 res.ok。
  *
  * 约束：无 npm 依赖、无构建步骤、ESM 形态的 IIFE 包；不 require 任何
@@ -22,7 +33,7 @@
  */
 
 window.__ModuleLoader__.load({
-  id: 'dsh-sync-plugin',
+  id: 'dsh-sync-webdav',
   factory(require) {
     const React = require('react');
     const h = React.createElement;
@@ -66,6 +77,54 @@ window.__ModuleLoader__.load({
       const p = (x) => String(x).padStart(2, '0');
       return d.getFullYear() + '-' + p(d.getMonth() + 1) + '-' + p(d.getDate()) +
         ' ' + p(d.getHours()) + ':' + p(d.getMinutes());
+    }
+
+    /** 相对时间：刚刚 / N 分钟前 / N 小时前 / N 天前；过久或不可解析时退回绝对时间。 */
+    function formatRelTime(value, now) {
+      if (!value) return '';
+      const t = new Date(value).getTime();
+      if (isNaN(t)) return '';
+      const gap = (typeof now === 'number' ? now : Date.now()) - t;
+      if (gap < 60 * 1000) return '刚刚';
+      const min = Math.floor(gap / 60000);
+      if (min < 60) return min + ' 分钟前';
+      const hours = Math.floor(min / 60);
+      if (hours < 24) return hours + ' 小时前';
+      const days = Math.floor(hours / 24);
+      if (days < 30) return days + ' 天前';
+      return formatTime(value);
+    }
+
+    /** 短 sha 展示：40 位 hex 截 7 位，已是短 sha 的原样。 */
+    function shortSha(value) {
+      const s = String(value == null ? '' : value).trim();
+      return s.length > 7 ? s.slice(0, 7) : s;
+    }
+
+    /**
+     * 版本端点响应的归一化。只接受契约内的形状（ok:true + 字符串 current + 枚举 mode），
+     * 其余一律当作「读不到版本状态」——与插件依赖卡片同样静默降级，不影响其它卡片。
+     * currentSha / latestSha 可能为 null，必须容错。
+     */
+    function normalizeVersion(payload) {
+      const d = (payload && typeof payload === 'object') ? payload : null;
+      if (!d || d.ok !== true) return null;
+      if (typeof d.current !== 'string' || !d.current) return null;
+      if (d.mode !== 'dev' && d.mode !== 'managed') return null;
+      return {
+        current: d.current,
+        mode: d.mode,
+        kind: typeof d.kind === 'string' ? d.kind : 'unknown',
+        spec: typeof d.spec === 'string' ? d.spec : '',
+        repo: (typeof d.repo === 'string' && d.repo) ? d.repo : null,
+        hasUpdate: d.hasUpdate === true,
+        latest: (typeof d.latest === 'string' && d.latest) ? d.latest : null,
+        changelog: Array.isArray(d.changelog) ? d.changelog.filter((x) => typeof x === 'string') : [],
+        checkedAt: (typeof d.checkedAt === 'string' && d.checkedAt) ? d.checkedAt : null,
+        currentSha: (typeof d.currentSha === 'string' && d.currentSha) ? d.currentSha : null,
+        latestSha: (typeof d.latestSha === 'string' && d.latestSha) ? d.latestSha : null,
+        error: (typeof d.error === 'string' && d.error) ? d.error : null,
+      };
     }
 
     /**
@@ -132,7 +191,7 @@ window.__ModuleLoader__.load({
     /** GET /dsh-sync/status —— 成功时返回 status 对象本身（它不以 ok 字段为载体）。 */
     const fetchStatus = () => request('/status');
 
-    /** 7 个端点的语义化包装：统一返回 { ok, ... }，ok 时附带 data。 */
+    /** 9 个端点的语义化包装：统一返回 { ok, ... }，ok 时附带 data。 */
     const api = {
       status: fetchStatus,
       config: (body) => request('/config', { method: 'POST', body }),
@@ -142,6 +201,9 @@ window.__ModuleLoader__.load({
       // 这两个端点的业务失败也是 HTTP 200，成败要看返回体里的 ok 字段
       plugins: () => request('/plugins'),
       pluginsInstall: (body) => request('/plugins/install', { method: 'POST', body }),
+      // force=1 跳过宿主 10 分钟检查缓存
+      version: (force) => request('/version' + (force ? '?force=1' : '')),
+      upgrade: (body) => request('/upgrade', { method: 'POST', body }),
     };
 
     // ============================================================
@@ -278,8 +340,12 @@ window.__ModuleLoader__.load({
       const [status, setStatus] = useState(null);
       // 插件依赖状态：null = 尚未取到或端点不可用（静默降级，不弹错）
       const [plugins, setPlugins] = useState(null);
+      // 版本状态：null = 尚未取到或端点不可用（同样静默降级）
+      const [version, setVersion] = useState(null);
+      // 升级结果：null = 尚未升级过；{ to, log }
+      const [upgraded, setUpgraded] = useState(null);
       const [loading, setLoading] = useState(true);
-      const [busy, setBusy] = useState('');           // '' | 'config' | 'backup' | 'restore' | 'rollback' | 'install' | 'refresh'
+      const [busy, setBusy] = useState('');           // '' | 'config' | 'backup' | 'restore' | 'rollback' | 'install' | 'refresh' | 'version' | 'upgrade'
       const [msg, setMsg] = useState(null);           // { kind, text }
       const [offline, setOffline] = useState(false);
       const [confirm, setConfirm] = useState(null);   // { title, body, confirmLabel, run }
@@ -343,9 +409,24 @@ window.__ModuleLoader__.load({
         return data;
       }, []);
 
+      /**
+       * GET /dsh-sync/version —— 版本状态。与 refreshPlugins 同样静默降级：
+       * 失败只置空状态，不写 msg、不置 offline，其它卡片照常可用。
+       * silent=true 用于挂载时的自动检查：不占用 busy，避免限制用户操作。
+       */
+      const refreshVersion = useCallback(async (force, silent) => {
+        if (!silent) setBusy((b) => b || 'version');
+        const res = await api.version(!!force);
+        if (!mountedRef.current) return;
+        if (!silent) setBusy((b) => (b === 'version' ? '' : b));
+        setVersion((res.ok ? normalizeVersion(res.data) : null));
+      }, []);
+
       // 加载时拉一次状态与插件依赖
       useEffect(() => { refresh(); }, [refresh]);
       useEffect(() => { refreshPlugins(); }, [refreshPlugins]);
+      // 打开设置页自动检查更新（不带 force，命中宿主缓存即可）
+      useEffect(() => { refreshVersion(false, true); }, [refreshVersion]);
 
       /** POST /dsh-sync/config —— 保存并测试连接 */
       const onSaveConfig = async () => {
@@ -486,6 +567,53 @@ window.__ModuleLoader__.load({
         setMsg({ kind: 'error', text: pickError(data, '安装失败'), log: (data && data.log) || '' });
       };
 
+      /** 升级入口：先弹确认（会重装插件，且重启后才生效） */
+      const askUpgrade = (info) => {
+        if (!info) return;
+        setConfirm({
+          title: '确认升级插件',
+          body: h(React.Fragment, null,
+            h('div', null, '当前版本 → 目标版本：'),
+            h('div', { className: PREFIX + '-item-name' }, info.current + ' → ' + (info.latest || shortSha(info.latestSha))),
+            h('div', null, '升级会重装插件，完成后需要重启 DeepSeek Harness。'),
+            info.repo ? h('div', { className: PREFIX + '-hint' }, '来源：' + info.repo) : null,
+          ),
+          confirmLabel: '升级',
+          run: () => doUpgrade(),
+        });
+      };
+
+      /** POST /dsh-sync/upgrade —— 失败也可能带 log（延续 /plugins/install 的处理方式） */
+      const doUpgrade = async () => {
+        if (busy) return;
+        setBusy('upgrade');
+        setMsg(null);
+        setUpgraded(null);
+        const res = await api.upgrade({});
+        if (!mountedRef.current) return;
+        setBusy('');
+        setConfirm(null);
+        const data = (res.ok && res.data && typeof res.data === 'object') ? res.data : res;
+        if (data && data.ok) {
+          setOffline(false);
+          if (data.upgraded === false) {
+            setMsg({ kind: 'error', text: pickError(data, '未执行升级'), log: data.log || '' });
+          } else {
+            setUpgraded({ to: data.to || '', log: data.log || '' });
+            if (data.error) setMsg({ kind: 'error', text: data.error });
+          }
+          await refreshVersion(true, true);
+          return;
+        }
+        if (res.offline) {
+          setOffline(true);
+          setMsg({ kind: 'error', text: NOT_READY });
+          return;
+        }
+        setOffline(false);
+        setMsg({ kind: 'error', text: pickError(data, '升级失败'), log: (data && data.log) || '' });
+      };
+
       const backups = (status && status.remote && Array.isArray(status.remote.backups)) ? status.remote.backups : [];
       const configured = !!(status && status.configured);
       const reachable = !!(status && status.remote && status.remote.reachable);
@@ -500,6 +628,58 @@ window.__ModuleLoader__.load({
       const needsInstall = !!(plugins && plugins.needsInstall);
       const pnpmAvailable = !!(plugins && plugins.pnpm && plugins.pnpm.available);
       const lastRestore = (plugins && plugins.lastRestore) ? plugins.lastRestore : null;
+
+      // 版本卡片：hasUpdate 是宿主给的权威判据，这里一律不自行比较版本大小
+      const registryBlocked = !!(version && version.kind === 'registry');
+      // latest 不保证是 semver（无 tag 时是远端短 sha），一律原样渲染，仅作空值兜底
+      const latestText = version && (version.latest || shortSha(version.latestSha));
+      // 两边 sha 都有且相等 -> 同一提交，展示 commit 短号
+      const sameCommit = !!(version && version.currentSha && version.latestSha &&
+        shortSha(version.currentSha) === shortSha(version.latestSha));
+
+      // ---- 版本升级卡片的分支体（放在「插件依赖」之后、消息区之前）----
+      let versionBody;
+      if (!version) {
+        versionBody = h('div', { className: PREFIX + '-hint' }, '读不到版本状态，不影响其余功能。');
+      } else if (version.error) {
+        // 检查没成功就一律不给结论、不给升级入口，正文只留上方的失败提示 + 重试
+        versionBody = null;
+      } else if (version.mode === 'dev') {
+        versionBody = h('div', { className: PREFIX + '-hint' },
+          '开发态安装（link:），不受版本升级管理；更新请在该目录执行 git pull');
+      } else if (registryBlocked) {
+        versionBody = h('div', { className: PREFIX + '-warn' },
+          h('div', { className: PREFIX + '-warn-title' }, '当前为 registry 安装，但该包名在 npm 上属于其他作者的项目'),
+          h('div', null, '出于安全考虑不自动升级；请改用 github: 方式安装。'),
+          version.spec ? h('div', { className: PREFIX + '-item-name' }, version.spec) : null,
+        );
+      } else if (version.hasUpdate) {
+        versionBody = h(React.Fragment, null,
+          h('div', { className: PREFIX + '-row' },
+            h('span', { className: PREFIX + '-badge ' + PREFIX + '-bad' }, '发现新版本 ' + (latestText || '')),
+          ),
+          version.changelog.length
+            ? h('div', { className: PREFIX + '-list' },
+                version.changelog.map((line, i) => h('div', { className: PREFIX + '-hint', key: i }, line)),
+              )
+            : null,
+          h('div', { className: PREFIX + '-row' },
+            h(Button, { variant: 'primary', disabled: anyBusy, onClick: () => askUpgrade(version) },
+              busy === 'upgrade' ? '升级中…' : '立即升级'),
+          ),
+        );
+      } else {
+        versionBody = h(React.Fragment, null,
+          h('div', { className: PREFIX + '-hint' },
+            sameCommit
+              ? '已是最新（commit ' + shortSha(version.latestSha) + '）'
+              : '已是最新版本' + (latestText ? '（' + latestText + '）' : '')),
+          h('div', { className: PREFIX + '-row' },
+            h(Button, { small: true, disabled: anyBusy, onClick: () => refreshVersion(true, false) },
+              busy === 'version' ? '检查中…' : '检查更新'),
+          ),
+        );
+      }
 
       return h('div', { className: PREFIX + '-root' },
         h('style', null, CSS),
@@ -641,6 +821,41 @@ window.__ModuleLoader__.load({
                         h('span', { className: PREFIX + '-item-name' }, 'dsh plugin install')),
                 )
               : h('div', { className: PREFIX + '-hint' }, '插件依赖完整（' + pluginDeps.length + ' 个）'),
+        ),
+
+        // ---- 版本升级 ----
+        h('div', { className: PREFIX + '-card' },
+          h('div', { className: PREFIX + '-card-title' },
+            h('span', null, '版本升级'),
+            h('span', { style: { flex: 1 } }),
+            h('span', { className: PREFIX + '-badge ' + PREFIX + '-ok' }, 'v' + (version ? version.current : '—')),
+          ),
+          version && version.error
+            ? h('div', { className: PREFIX + '-warn' },
+                h('div', { className: PREFIX + '-warn-title' }, '检查更新失败'),
+                h('div', null, version.error),
+                h('div', { className: PREFIX + '-row' },
+                  h(Button, { small: true, disabled: anyBusy, onClick: () => refreshVersion(true, false) },
+                    busy === 'version' ? '检查中…' : '重试'),
+                ),
+              )
+            : null,
+          versionBody,
+          upgraded
+            ? h(React.Fragment, null,
+                h('div', { className: PREFIX + '-hint' },
+                  '已升级到 v' + upgraded.to + '，重启 DeepSeek Harness 后生效'),
+                upgraded.log
+                  ? h('details', { className: PREFIX + '-log' },
+                      h('summary', null, '升级日志（点击展开）'),
+                      h('pre', { className: PREFIX + '-log-pre' }, upgraded.log),
+                    )
+                  : null,
+              )
+            : null,
+          version && version.checkedAt
+            ? h('div', { className: PREFIX + '-hint' }, '上次检查：' + formatRelTime(version.checkedAt))
+            : null,
         ),
 
         msg ? h(Message, { kind: msg.kind }, msg.text) : null,

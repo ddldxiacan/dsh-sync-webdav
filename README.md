@@ -25,6 +25,7 @@ dsh-sync 把这件事变成两个按钮：**备份**（加密上传）和**恢�
 | 恢复 | 选一个备份（或「恢复最新」）→ 确认 → 自动先做本地快照 → 解密覆盖 |
 | 回滚 | 从本地快照列表还原 |
 | 插件重装 | 恢复后检测到插件依赖缺失 → 点「重装插件」→ 自动改写 `link:` 依赖并执行 pnpm install |
+| 版本升级 | 打开设置页自动检查新版本；有新版时一键升级本插件自身（升级前自动备份，失败可回滚） |
 
 **触发方式：纯手动。** 插件不做任何定时或后台自动同步。
 
@@ -48,6 +49,69 @@ dsh-sync 把这件事变成两个按钮：**备份**（加密上传）和**恢�
 > 恢复流程**不会**自动跑 pnpm install——重装由你点按钮触发，因为安装可能耗时数分钟且会改动 `package.json`。
 
 > B 机前置条件：**Git 必须在 `PATH` 中**（`link:` 依赖改写后的 `github:` spec 需要 git 解析），且能访问 registry。实测 7 个插件冷安装约 2 分钟。
+
+## 版本升级
+
+插件自带升级模块，安装过的用户不必重装即可跟进新版本。
+
+**打开设置页时自动检查一次**（结果在宿主内缓存 10 分钟），卡片上直接显示当前版本与是否有新版。也可随时点「检查更新」强制刷新。
+
+| 当前安装方式 | 升级行为 |
+|---|---|
+| `github:` / `registry:`（受管安装） | 显示「发现新版本」+ 更新摘要 + 「立即升级」按钮 |
+| `link:` / `file:`（开发态） | 显示「开发态安装，不受版本升级管理；更新请在该目录执行 `git pull`」，**不提供**升级按钮 |
+
+点「立即升级」后：先把 `package.json` 备份为 `package.json.bak-dsh-sync-<时间戳>`，再把依赖声明改写为**带 tag 的确定性 spec**（`github:<owner>/<repo>#vX.Y.Z`），然后执行 `pnpm install` 并重启 DSH 生效。**升级过程只改写这一个依赖键**，profile 里其它插件依赖与 `dsh.profile.bundles` 原样不动。
+
+### 判定「有没有新版本」用 commit sha，不是版本号
+
+这一点与直觉相反，但对本插件是必须的：**发新提交可以不改 `package.json` 的 `version`**（本仓库的 `4da85ef` 与 `b503783` 两个提交版本号都是 `0.1.0`）。实测若只比 semver，判定会 100% 失效。
+
+因此：
+
+- **本地已装 sha**：从 profile 的 `pnpm-lock.yaml` 中提取（用「任意 40 位 hex」匹配——同一条 `github:` specifier 会产出 codeload / `git+ssh` / `git+https` 三种锁文件形态，字段名不统一）
+- **远端最新 sha**：`git ls-remote <repo> HEAD` 或 GitHub API `commits/main`
+- 两者不等即为「有更新」；`latest` 字段优先取最高的 `v*` tag，无 tag 时退化为 sha 前 7 位
+
+> 注意：`node_modules/<包名>/` 里的文件**不含** sha，不能从那里读本地版本。
+
+### 两个安全取舍
+
+1. **registry 安装不自动升级。** `dsh-sync-plugin` 这个包名在 npm 上**属于另一位作者的另一个项目**（`dpskk2/dsh-sync-plugin`）。若检测到当前是 registry 安装，插件会拒绝自动升级并提示改用 `github:` 方式——否则会把别人的项目装到你机器上。（本插件的包名已改为 `dsh-sync-webdav` 以避开该冲突。）
+2. **升级通道强制走 HTTPS。** pnpm 解析 `github:` 依赖时，HTTPS 走不通会**静默回退到 SSH**；在没配 SSH key 的机器上会以难懂的鉴权错误告终。本插件在升级时显式固定 HTTPS 通道。
+
+### 从旧版本（`dsh-sync-plugin`）升级
+
+**v0.2.0 起包名从 `dsh-sync-plugin` 改为 `dsh-sync-webdav`**，原因是前者在 npm 上属于别人的项目。改包名意味着它在本机 profile 里是**另一个依赖**，所以：
+
+1. 先装新名（`github:ddldxiacan/dsh-sync-release#v0.2.0`）
+2. **再卸掉旧名**，否则同一个 `id: dsh-sync` 会注册两次导致启动报错：
+
+```powershell
+dsh plugin --profile desktop remove dsh-sync-plugin
+```
+
+3. 重启 DSH
+
+升级到 v0.2.0 之后，后续版本就都能在设置页里一键升级了。
+
+## 发版流程（维护者）
+
+```powershell
+# 1. 改完代码，跑自测（必须全绿）
+node tools-selftest.mjs
+
+# 2. bump 版本号（package.json 的 version）
+# 3. 提交并打标签 —— tag 是升级模块的版本锚点，必须打
+git add -A
+git commit -m "feat: ..."
+git tag -a v0.2.0 -m "v0.2.0: ..."
+git push origin main --tags
+```
+
+**打 tag 是发版的必要步骤**：升级功能以 `v*` tag 作为「最新版本」的来源，并把它作为安装锚点（`github:<owner>/<repo>#vX.Y.Z`）。只提交不打 tag，已安装用户的「检查更新」会退化为按 commit sha 比较——仍能发现更新，但看不到版本号。
+
+若要让安装路径也解析出具体提交，pnpm 会把 `#vX.Y.Z` 钉到该 tag 指向的 sha 并记进锁文件（实测确认）。
 
 ## 同步范围与排除规则
 
@@ -109,7 +173,7 @@ dsh plugin --profile desktop install "E:\完整路径\dsh-sync-release"
 
 ```
 dsh-sync-release/
-├── package.json        # name: dsh-sync-plugin，声明 dsh.bundle.patch 与 dsh.client
+├── package.json        # name: dsh-sync-webdav，声明 dsh.bundle.patch 与 dsh.client
 ├── cordis.patch.yml    # 注册 dsh-sync 服务（name 与 package.json 一致）
 ├── index.js            # Host 半区：打包/加密/WebDAV/恢复/回滚/插件重装 + 7 个 HTTP 端点
 ├── client.js           # Client 半区：设置页卡片
@@ -118,13 +182,13 @@ dsh-sync-release/
 
 ### 手动安装（不使用插件管理器时）
 
-1. 把本目录整个复制到 `<profile>/node_modules/dsh-sync-plugin/`
+1. 把本目录整个复制到 `<profile>/node_modules/dsh-sync-webdav/`
 2. 在 `<profile>/cordis.patch.yml` 追加：
 
 ```yaml
 - insert:
     - id: dsh-sync
-      name: 'dsh-sync-plugin'
+      name: 'dsh-sync-webdav'
       config: {}
 ```
 

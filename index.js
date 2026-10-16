@@ -32,6 +32,7 @@ import { homedir } from 'node:os'
 import { dirname, isAbsolute, join } from 'node:path'
 import http from 'node:http'
 import https from 'node:https'
+import { fileURLToPath } from 'node:url'
 
 const MAGIC = Buffer.from('DSHSYNC1', 'utf8')
 const MAX_FILE_BYTES = 10 * 1024 * 1024
@@ -360,7 +361,7 @@ export async function listRemoteBackups(cfg) {
 // 插件配置（package.json / cordis.patch.yml / pnpm-lock.yaml）而拿不到插件代码。
 // DSH 加载 profile 时对每个 bundle 都是 try/catch（告警跳过，不崩），也绝不自动
 // 跑 pnpm install —— 于是插件静默消失。更糟的是 A 机的 package.json 里可能有
-// `"dsh-sync-plugin": "link:E:/..."` 这种绝对路径依赖，在 B 机上根本不存在，
+// `"<包名>": "link:E:/..."` 这种绝对路径依赖，在 B 机上根本不存在，
 // 直接 pnpm install 必然失败。故此处：把 link:/file: 依赖改写成其仓库地址后再装。
 // ============================================================
 
@@ -416,6 +417,349 @@ export function depKind(spec) {
 /** 覆盖式写 JSON 文件，保留 2 空格缩进与末尾换行（与 pnpm 风格一致） */
 function writeJsonFile(file, obj) {
   writeFileSync(file, JSON.stringify(obj, null, 2) + '\n', 'utf8')
+}
+
+// ============================================================
+// 版本检查（只读远端；不改任何文件）
+//
+// 为何以 git commit sha 为主判据、而不是 semver：实测本仓库两个提交
+// （4da85ef / b503783）的 package.json version 都是 0.1.0 —— 发布新提交
+// 完全不必改版本号，只看 semverGt 会 100% 漏判。semver 只在拿不到 sha 时兜底。
+// ============================================================
+
+const VERSION_CACHE_TTL_MS = 10 * 60 * 1000
+const GITHUB_API = 'https://api.github.com'
+const GITHUB_UA = 'dsh-sync'
+const COMPARE_MAX_MESSAGES = 8
+
+/** registry 安装一律拒绝：实测 npm 上的同名包属于另一个作者（不同 owner 的同名项目），
+ *  按 `name@version` 自动升级会装成别人的代码。包名从 package.json 读，不写死。 */
+export function registryRejectError(pkgName) {
+  return '检测到 registry 安装（' + pkgName + ' 在 npm 上属于其他作者的项目），出于安全考虑不自动升级；请改用 github: 方式安装'
+}
+
+/** 解析 semver：返回 { nums:[major,minor,patch], pre:string[]|null }，非法返回 null。
+ *  只接受 SemVer 允许的字符集，因此分支名（main/HEAD）必然解析失败 —— 这是有意的：
+ *  远端 tag 列表里混入非 semver 名字时不得被当成版本号参与比较。 */
+export function parseSemver(v) {
+  const m = /^v?(\d+)\.(\d+)\.(\d+)(?:-([0-9A-Za-z.-]+))?(?:\+[0-9A-Za-z.-]+)?$/.exec(String(v === undefined || v === null ? '' : v).trim())
+  if (!m) return null
+  return { nums: [Number(m[1]), Number(m[2]), Number(m[3])], pre: m[4] ? m[4].split('.') : null }
+}
+
+function cmpPre(a, b) {
+  if (a === null && b === null) return 0
+  if (a === null) return 1      // 有预发布段 < 无预发布段（1.0.0-alpha < 1.0.0）
+  if (b === null) return -1
+  const n = Math.max(a.length, b.length)
+  for (let i = 0; i < n; i++) {
+    const x = a[i]
+    const y = b[i]
+    if (x === undefined) return -1
+    if (y === undefined) return 1
+    const xn = /^\d+$/.test(x)
+    const yn = /^\d+$/.test(y)
+    if (xn && yn) {
+      if (Number(x) !== Number(y)) return Number(x) > Number(y) ? 1 : -1
+    } else if (xn !== yn) {
+      return xn ? -1 : 1        // 数字标识符优先级低于字母标识符
+    } else if (x !== y) {
+      return x > y ? 1 : -1
+    }
+  }
+  return 0
+}
+
+/** semver 比较：a > b → 1，a < b → -1，相等 → 0；任一不可解析 → null。
+ *  必须按数值比较，字符串比较会把 '0.10.0' 判成小于 '0.9.0'。 */
+export function cmpSemver(a, b) {
+  const x = parseSemver(a)
+  const y = parseSemver(b)
+  if (!x || !y) return null
+  for (let i = 0; i < 3; i++) {
+    if (x.nums[i] !== y.nums[i]) return x.nums[i] > y.nums[i] ? 1 : -1
+  }
+  return cmpPre(x.pre, y.pre)
+}
+
+/** a 是否严格高于 b（任一不可解析 → false） */
+export function semverGt(a, b) {
+  return cmpSemver(a, b) === 1
+}
+
+/** 从 GitHub /tags 的返回里挑最高版本 tag；只比较 semver，不依赖数组顺序
+ *  （GitHub 按创建时间倒序返回，与版本高低无关）。无 v* tag → null */
+export function latestTagOf(tags) {
+  let best = null
+  let bestVer = null
+  for (const t of Array.isArray(tags) ? tags : []) {
+    const name = String((t && t.name !== undefined ? t.name : t) || '')
+    if (!/^v\d/.test(name)) continue
+    if (!parseSemver(name)) continue
+    if (bestVer === null || cmpSemver(name, bestVer) > 0) { bestVer = name; best = t }
+  }
+  return best
+}
+
+/** 在锁文件文本里定位 `name:` 依赖条目，返回其后第一条 40 位 hex 提交 sha。
+ *  不做字段名解析是刻意的：同一个 `github:` specifier 实测会产出三种锁文件形态
+ *  （codeload 的 version/tarball、git 形态的 resolution.commit），字段名不统一；
+ *  缩进深度也随 importer 不同而不同，故按「所属条目 + 后续若干行」定位。
+ *  node_modules/<pkg>/ 下的文件不含 sha（实测 7 个文件全无），不能作为来源。 */
+export function shaOfDependency(text, pkgName) {
+  const lines = String(text || '').split('\n')
+  const nameRe = new RegExp('^\\s*' + String(pkgName).replace(/[.*+?^${}()|[\]\\/]/g, '\\$&') + ':\\s*$')
+  for (let i = 0; i < lines.length; i++) {
+    if (!nameRe.test(lines[i])) continue
+    const total = /^\s*specifier:/.test(String(lines[i + 1] || '')) ? 4 : 14
+    const end = Math.min(lines.length, i + 1 + total)
+    for (let j = i + 1; j < end; j++) {
+      const m = /([0-9a-f]{40})/.exec(lines[j])
+      if (m) return m[1]
+    }
+  }
+  return null
+}
+
+/** 从 profile 的 pnpm-lock.yaml 取自身依赖被锁定的 commit sha；
+ *  兜底看 node_modules/.pnpm/lock.yaml（内容一致）。取不到返回 null。 */
+export function localShaFromLock(profileDir, pkgName) {
+  for (const f of [join(profileDir, 'pnpm-lock.yaml'), join(profileDir, 'node_modules', '.pnpm', 'lock.yaml')]) {
+    let text
+    try { text = readFileSync(f, 'utf8') } catch (e) { continue }
+    const hit = shaOfDependency(text, pkgName)
+    if (hit) return hit
+  }
+  return null
+}
+
+/** 本插件自身的包目录：用 import.meta.url 定位，绝不用 process.cwd() */
+export function selfPackageDir() {
+  try { return dirname(fileURLToPath(import.meta.url)) } catch (e) { return null }
+}
+
+/** 读自身 package.json（随包发布，必然存在）；读不到返回 null */
+export function readSelfPackage() {
+  const dir = selfPackageDir()
+  if (!dir) return null
+  try {
+    const pkg = JSON.parse(readFileSync(join(dir, 'package.json'), 'utf8'))
+    return { dir, file: join(dir, 'package.json'), pkg }
+  } catch (e) { return null }
+}
+
+/** 自身版本（读不到时给 0.0.0，避免上游拿到 undefined） */
+export function selfVersion() {
+  const s = readSelfPackage()
+  return (s && s.pkg && s.pkg.version) ? String(s.pkg.version) : '0.0.0'
+}
+
+/** 自身包名 —— 绝不硬编码：包名可能随时改动以避开 npm 同名占用。
+ *  读不到时返回 null（调用方报错退出），而不是猜一个名字 —— 猜错会把
+ *  「指向别的包」的 spec 写进 profile。profile 依赖键名同样按此匹配。 */
+export function selfPackageName() {
+  const s = readSelfPackage()
+  const n = s && s.pkg && s.pkg.name
+  return (typeof n === 'string' && n) ? n : null
+}
+
+/** 解析自身 package.json 的 repository.url → 'owner/repo'（用既有的 repoSpecFromUrl，避免两处判断分叉）；
+ *  解析不出返回 null。repository 也可能是裸字符串。 */
+export function parseRepoSlug(url) {
+  const spec = repoSpecFromUrl(url)
+  return spec ? spec.replace(/^[a-z]+:/i, '') : null
+}
+
+/**
+ * 给一次「装 github: 依赖」的子进程注入 git URL 重写：SSH → HTTPS。
+ *
+ * 为什么必须做：pnpm 解析 github: 依赖时会 shell out 到 git；HTTPS 走不通时
+ * （企业网/代理/防火墙）git 会静默回退到 git@github.com: 的 SSH 形式，在没配
+ * SSH key 的机器上就报鉴权错——这个错和「升级失败」毫无关联，是装给别人用时
+ * 的首要故障模式。用 insteadOf 把 SSH 形式强行拉回 HTTPS 才是对的手段
+ * （~/.npmrc 里的 proxy 会覆盖我们传的 HTTP(S)_PROXY，代理变量解决不了）。
+ *
+ * 作用域：只挂在这一次安装的子进程 env 上，绝不写进 process.env ——
+ * GIT_CONFIG_COUNT 会被子进程继承，泄漏出去会污染用户其它 git 操作。
+ */
+export function githubHttpsOnlyEnv(base) {
+  return {
+    ...base,
+    GIT_CONFIG_COUNT: '2',
+    GIT_CONFIG_KEY_0: 'url.https://github.com/.insteadOf',
+    GIT_CONFIG_VALUE_0: 'git@github.com:',
+    GIT_CONFIG_KEY_1: 'url.https://github.com/.insteadOf',
+    GIT_CONFIG_VALUE_1: 'ssh://git@github.com/',
+  }
+}
+
+/** 读 URL 上的布尔查询开关（如 ?force=1 / ?force=true）。 */
+export function queryFlag(url, name) {
+  try {
+    const u = new URL(String(url || ''), 'http://localhost')
+    const v = u.searchParams.get(name)
+    return v !== null && /^(1|true|yes|on)$/i.test(v)
+  } catch (e) { return false }
+}
+
+/**
+ * 校验「只改了目标依赖」：除 dependencies[target] 外的所有字段必须与原对象逐字节一致。
+ * 这是安全红线的最后一道闸 —— dsh.profile.bundles 等字段一旦被改动就会拒绝落盘。
+ */
+export function nonTargetFieldsIntact(before, after, target) {
+  const strip = (o) => {
+    const c = JSON.parse(JSON.stringify(o || {}))
+    if (c.dependencies && typeof c.dependencies === 'object') {
+      delete c.dependencies[target]
+      if (!Object.keys(c.dependencies).length) delete c.dependencies
+    }
+    return JSON.stringify(c)
+  }
+  return strip(before) === strip(after)
+}
+
+/** 自身仓库 slug（owner/repo），取自自身 package.json 的 repository.url */
+export function selfRepoSlug() {
+  const s = readSelfPackage()
+  const r = s && s.pkg && s.pkg.repository
+  const url = (r && (r.url || (typeof r === 'string' ? r : null))) || null
+  return parseRepoSlug(url)
+}
+
+/** GitHub compare 响应 → changelog 行：commits[].commit.message 的首行。
+ *  整个数组最多 8 条（含末尾的统计行）—— total_commits 超过可显示条数时，
+ *  末行补「还有 N 个提交」，N 是尚未显示的数量。 */
+export function summaryFromCompare(json) {
+  const c = json && typeof json === 'object' ? json : {}
+  const msgs = []
+  for (const item of Array.isArray(c.commits) ? c.commits : []) {
+    const raw = item && item.commit && item.commit.message ? String(item.commit.message) : ''
+    const first = raw.split('\n')[0].trim()
+    if (first) msgs.push(first)
+  }
+  const total = Number(c.total_commits)
+  const overflow = Number.isFinite(total) && total > 0 ? total : msgs.length
+  if (overflow > COMPARE_MAX_MESSAGES) {
+    const shown = msgs.slice(0, COMPARE_MAX_MESSAGES - 1)
+    shown.push('还有 ' + (overflow - shown.length) + ' 个提交')
+    return shown
+  }
+  return msgs.slice(0, COMPARE_MAX_MESSAGES)
+}
+
+/** 默认网络通道：node:https，15 秒超时，失败收敛成 { status:null, error }，绝不抛异常。
+ *  必须带 User-Agent —— 不带时 GitHub 会 403。 */
+export function defaultHttpsGet(url) {
+  return new Promise((resolve) => {
+    let u
+    try { u = new URL(url) } catch (e) { return resolve({ status: null, body: '', error: '无效的 URL: ' + url }) }
+    const req = https.request(u, {
+      method: 'GET',
+      headers: { 'User-Agent': GITHUB_UA, Accept: 'application/vnd.github+json' },
+      timeout: 15000,
+    }, (res) => {
+      const chunks = []
+      res.on('data', (c) => chunks.push(c))
+      res.on('end', () => resolve({ status: res.statusCode, body: Buffer.concat(chunks).toString('utf8'), error: null }))
+    })
+    req.on('timeout', () => req.destroy(new Error('请求超时')))
+    req.on('error', (e) => resolve({ status: null, body: '', error: e && e.message ? e.message : String(e) }))
+    req.end()
+  })
+}
+
+/**
+ * 检查远端最新版本：以 commit sha 为主判据，semver 兜底。
+ * 任何网络失败都收敛成 error 字符串，绝不抛异常、绝不影响既有端点。
+ * opts 全部可注入（httpsGet/cache/now），因此自测无需真实联网。
+ * @returns {{ current, repo, hasUpdate, latest, latestTag, remoteSha, changelog, checkedAt, checked, error }}
+ */
+export async function performVersionCheck(current, slug, opts) {
+  const o = opts || {}
+  const httpsGet = o.httpsGet || defaultHttpsGet
+  const key = JSON.stringify(['version', slug, o.pkgName || '', current, o.localSha || '', !!o.force])
+  if (!o.force && o.cache && typeof o.cache.get === 'function') {
+    const hit = o.cache.get(key)
+    if (hit && (o.now ? o.now() : Date.now()) - hit.at < VERSION_CACHE_TTL_MS) {
+      return { ...hit.value, checked: false }
+    }
+  }
+  const out = {
+    current: current || null, repo: slug || null, hasUpdate: false, latest: null,
+    latestTag: null, remoteSha: null, changelog: [], checkedAt: null, checked: true, error: null,
+  }
+  let tags = []
+  let tag = null
+  const api = (p) => GITHUB_API + '/repos/' + slug + p
+
+  // 传输层失败（status 为 null）时优先回报真实原因（ENOTFOUND/超时），
+  // 否则会退化成毫无信息量的「HTTP null」
+  const describeFail = (r) => {
+    if (r && r.error) return '无法连接 GitHub：' + r.error
+    if (r && (r.status === 403 || r.status === 429)) return 'GitHub API 限流（HTTP ' + r.status + '），请稍后重试'
+    return 'GitHub API 返回 HTTP ' + (r ? r.status : 'null')
+  }
+
+  // 远端版本 tag（只比较 semver，不依赖返回顺序）
+  try {
+    const r = await httpsGet(api('/tags'))
+    if (r.status === 403 || r.status === 429) {
+      out.error = 'GitHub API 限流（HTTP ' + r.status + '），请稍后重试'
+    } else if (r.status !== 200) {
+      out.error = describeFail(r)
+    } else {
+      let parsed = null
+      try { parsed = JSON.parse(r.body || '[]') } catch (e) { parsed = null }
+      if (!Array.isArray(parsed)) out.error = 'GitHub API 返回了非预期内容'
+      else { tags = parsed; tag = latestTagOf(parsed) }
+    }
+  } catch (e) {
+    out.error = '无法连接 GitHub：' + (e && e.message ? e.message : String(e))
+  }
+
+  // 远端 HEAD sha（与本地锁文件里的 sha 同一命名空间，可直接同真值比较）
+  try {
+    const r = await httpsGet(api('/commits/' + (o.branch || 'main')))
+    if (r.status === 200) {
+      try { out.remoteSha = JSON.parse(r.body || '{}').sha || null } catch (e) { out.remoteSha = null }
+    } else if (r.status === 403 || r.status === 429) {
+      if (!out.error) out.error = 'GitHub API 限流（HTTP ' + r.status + '），请稍后重试'
+    } else if (!out.error && !tags.length) {
+      // tags 已成功时不必因 commits 的 404 报错（分支名可能不是 main）
+      out.error = describeFail(r)
+    }
+  } catch (e) {
+    if (!out.error) out.error = '无法连接 GitHub：' + (e && e.message ? e.message : String(e))
+  }
+
+  out.latestTag = tag ? String(tag.name) : null
+  // latest：优先最高 tag；无 tag 时退化为远端 sha 前 7 位（UI 原样显示，不再格式化）
+  if (out.latestTag) out.latest = out.latestTag
+  else if (out.remoteSha) out.latest = out.remoteSha.slice(0, 7)
+  const remoteVer = out.latestTag ? out.latestTag.replace(/^v/, '') : null
+  const cur = typeof current === 'string' ? current.replace(/^v/, '') : current
+  if (o.localSha && out.remoteSha) out.hasUpdate = String(o.localSha) !== String(out.remoteSha)
+  else if (remoteVer) out.hasUpdate = semverGt(remoteVer, cur)
+  else out.hasUpdate = false
+
+  // 更新摘要：以本地 sha 为 compare 基线（tag 可能不存在；sha 是唯一始终可得的真值）。
+  // compare 失败只让 changelog 退化为 []，绝不影响 hasUpdate 这个主判据。
+  const base = o.localSha || o.localTag
+  const head = out.remoteSha || out.latestTag
+  if (out.hasUpdate && base && head) {
+    try {
+      const r = await httpsGet(api('/compare/' + encodeURIComponent(base) + '...' + encodeURIComponent(head)))
+      if (r.status === 200) {
+        let parsed = null
+        try { parsed = JSON.parse(r.body || '{}') } catch (e) { parsed = null }
+        out.changelog = summaryFromCompare(parsed)
+      }
+    } catch (e) { out.changelog = [] }
+  }
+
+  out.checkedAt = new Date().toISOString()
+  if (o.cache && typeof o.cache.set === 'function') o.cache.set(key, { at: Date.now(), value: out })
+  return { ...out }
 }
 
 /**
@@ -806,7 +1150,7 @@ export function apply(ctx, config) {
   }
 
   /** 实测：改写 spec → 备份 package.json → 跑 pnpm install（可注入 runner 供测试） */
-  const runProfileInstall = async (runner, pnpmPathOpt) => {
+  const runProfileInstall = async (runner, pnpmPathOpt, opts) => {
     if (installing) return { ok: false, error: '安装正在进行中，请稍候' }
     const prof = resolveProfile()
     const file = join(prof.dir, 'package.json')
@@ -850,9 +1194,12 @@ export function apply(ctx, config) {
     const args = [pnpmPath, 'install']
     installing = true
     const startedAt = Date.now()
+    // 升级路径装的是 github: 依赖，必须把 git 的 SSH 回退拉回 HTTPS（见 githubHttpsOnlyEnv）
+    const baseEnv = { ...process.env, ELECTRON_RUN_AS_NODE: '1' }
+    const childEnv = opts && opts.githubHttpsOnly ? githubHttpsOnlyEnv(baseEnv) : baseEnv
     let r
     try {
-      r = await runner({ cmd: process.execPath, args, cwd: prof.dir, env: { ...process.env, ELECTRON_RUN_AS_NODE: '1' }, timeout: INSTALL_TIMEOUT_MS })
+      r = await runner({ cmd: process.execPath, args, cwd: prof.dir, env: childEnv, timeout: INSTALL_TIMEOUT_MS })
     } catch (e) {
       installing = false
       return { ok: false, error: 'pnpm install 启动失败：' + (e && e.message ? e.message : String(e)), log: '' }
@@ -913,18 +1260,195 @@ export function apply(ctx, config) {
     }
   }
 
+  // ---------- 版本检查 / 自我升级（模块整体 fail-soft：任何网络失败都不得影响既有端点） ----------
+
+  const versionCache = new Map()
+  let lastCheckedAt = null
+
+  /** 只读本机自身的安装态：版本、原始声明、kind/mode、锁文件 sha。全部来自磁盘，不联网。 */
+  const inspectSelf = () => {
+    const pkgName = selfPackageName()
+    if (!pkgName) return { ok: false, error: '无法读取自身 package.json（name 缺失）' }
+    const prof = resolveProfile()
+    if (!prof || !prof.dir) return { ok: false, error: '未找到 profile 目录', pkgName }
+    let pkg = null
+    try { pkg = JSON.parse(readFileSync(join(prof.dir, 'package.json'), 'utf8')) } catch (e) { pkg = null }
+    const deps = (pkg && pkg.dependencies && typeof pkg.dependencies === 'object') ? pkg.dependencies : {}
+    // 依赖键名用读到的包名匹配，绝不写死旧名
+    const spec = Object.prototype.hasOwnProperty.call(deps, pkgName) ? String(deps[pkgName]) : null
+    const kind = depKind(spec)
+    // link:/file:/portal: 一律视为开发态（本机指向源码目录），其余算受管安装
+    const mode = kind === 'link' ? 'dev' : 'managed'
+    let installed = null
+    try { installed = JSON.parse(readFileSync(join(prof.dir, 'node_modules', pkgName, 'package.json'), 'utf8')) } catch (e) { installed = null }
+    const current = (installed && installed.version) ? String(installed.version) : selfVersion()
+    return { ok: true, pkgName, prof, spec, kind, mode, current, localSha: localShaFromLock(prof.dir, pkgName), hasProfPkg: !!pkg }
+  }
+
+  const emptyVersionShape = (extra) => ({
+    ok: true, current: selfVersion(), mode: 'managed', kind: 'unknown', spec: null,
+    repo: selfRepoSlug(), hasUpdate: false, latest: null, changelog: [],
+    checkedAt: lastCheckedAt, checked: false, error: null, ...extra,
+  })
+
+  /** GET /dsh-sync/version（?force=1 跳过缓存）。契约形状见任务书；失败也返回 200 + ok:true + error */
+  const handleVersion = async (body, req, opts) => {
+    const o = opts || {}
+    try {
+      const info = inspectSelf()
+      const slug = selfRepoSlug()
+      const base = emptyVersionShape({
+        current: info.ok ? info.current : selfVersion(),
+        mode: info.ok ? info.mode : 'managed',
+        kind: info.ok ? info.kind : 'unknown',
+        spec: info.ok ? info.spec : null,
+        repo: slug || null,
+      })
+      if (!slug) return { ...base, error: '无法从自身 package.json 的 repository.url 解析出仓库地址' }
+      // registry 安装一律不自动升级：npm 上同名包属于另一个作者
+      if (info.ok && info.kind === 'registry') return { ...base, error: registryRejectError(info.pkgName) }
+      let result
+      try {
+        result = await (o.check || performVersionCheck)(base.current, slug, {
+          httpsGet: o.httpsGet, cache: versionCache, now: o.now,
+          force: !!(o.force || queryFlag(req && req.url, 'force')),
+          localSha: info.ok ? info.localSha : null,
+          pkgName: info.ok ? info.pkgName : null,
+        })
+      } catch (e) {
+        // performVersionCheck 本身已 fail-soft；这里兜住注入替身抛出的异常，端点仍返回 200
+        return { ...base, error: '版本检查失败：' + (e && e.message ? e.message : String(e)) }
+      }
+      if (result && result.checkedAt) lastCheckedAt = result.checkedAt
+      return {
+        ...base,
+        hasUpdate: !!result.hasUpdate,
+        latest: result.latest || null,
+        changelog: Array.isArray(result.changelog) ? result.changelog.slice(0, COMPARE_MAX_MESSAGES) : [],
+        checkedAt: result.checkedAt || null,
+        checked: result.checked !== false,
+        error: result.error || null,
+      }
+    } catch (e) {
+      return emptyVersionShape({ repo: selfRepoSlug(), error: '版本检查失败：' + (e && e.message ? e.message : String(e)) })
+    }
+  }
+
+  /**
+   * POST /dsh-sync/upgrade。把 profile 的 dependencies[<自身包名>] 改写成指向目标 ref 的
+   * 确定性 spec（github:<owner>/<repo>#<tag|sha>），备份 package.json，再复用既有的
+   * runProfileInstall() 跑一次 pnpm install（单飞护栏/超时/日志截断都在里面）。
+   *
+   * 为什么复用裸 `pnpm install` 就够：pnpm 的「锁文件已最新 → 跳过 resolution」只对裸 install 生效；
+   * 一旦 specifier 本身变了（link: → github:#tag）它就必然重新解析该依赖。这也是这里必须
+   * 先断言 spec 真的变了的原因 —— 没变就别白跑一次安装。
+   *
+   * 安全红线：只改写 dependencies[<name>] 这一个键，其它依赖键与 dsh.profile.bundles 等字段原样保留。
+   */
+  const handleUpgrade = async (body, req, opts) => {
+    const o = opts || {}
+    const started = Date.now()
+    try {
+      const info = inspectSelf()
+      if (!info.ok) return { ok: false, error: info.error || '无法读取本机插件信息' }
+      const { pkgName } = info
+      const slug = selfRepoSlug()
+      if (!slug) return { ok: false, error: '无法从自身 package.json 的 repository.url 解析出仓库地址' }
+
+      // 1) 开发态拒绝：本机指向源码目录，升级的正确做法是 git pull
+      if (info.kind === 'link') {
+        return { ok: false, error: '开发态安装（link:）：本机指向源码目录，请用 git pull 更新' }
+      }
+      // 2) registry 安装拒绝：npm 同名包属于另一个作者
+      if (info.kind === 'registry') return { ok: false, error: registryRejectError(pkgName) }
+
+      // 3) 版本检查（force：升级前必须拿最新结果，不受 10 分钟缓存影响）
+      const direct = o.check || performVersionCheck
+      const ver = await direct(info.current, slug, {
+        httpsGet: o.httpsGet, cache: versionCache, now: o.now, force: true,
+        localSha: info.localSha, pkgName,
+      })
+      if (ver && ver.checkedAt) lastCheckedAt = ver.checkedAt
+      if (ver && ver.error) return { ok: false, error: ver.error }
+      if (!ver || !ver.hasUpdate) {
+        return { ok: true, upgraded: false, alreadyLatest: true, from: info.current, to: info.current, spec: info.spec, exitCode: 0, durationMs: Date.now() - started, needRestart: false, before: { version: info.current, spec: info.spec }, backup: null, log: '', error: null }
+      }
+      const ref = ver.latestTag || ver.remoteSha
+      if (!ref) return { ok: false, error: '远端最新版本没有可用的 tag 或 commit，无法生成确定性 spec' }
+
+      // 4) 改写 spec（备份 package.json → 写回）。只动这一个键。
+      const file = join(info.prof.dir, 'package.json')
+      let pkg
+      try { pkg = JSON.parse(readFileSync(file, 'utf8')) } catch (e) {
+        return { ok: false, error: 'profile 的 package.json 读取失败：' + (e && e.message ? e.message : String(e)) }
+      }
+      const before = JSON.parse(JSON.stringify(pkg))
+      pkg.dependencies = (pkg.dependencies && typeof pkg.dependencies === 'object') ? pkg.dependencies : {}
+      const newSpec = 'github:' + slug + '#' + ref
+      const oldSpec = pkg.dependencies[pkgName]
+      // spec 未变 → 已在该 ref 上，直接返回，不白跑一次 pnpm install
+      if (String(oldSpec) === newSpec) {
+        return { ok: true, upgraded: false, from: info.current, to: ver.latest, spec: newSpec, exitCode: 0, durationMs: Date.now() - started, needRestart: false, before: { version: info.current, spec: oldSpec === undefined ? null : String(oldSpec) }, backup: null, log: '', error: null }
+      }
+      pkg.dependencies[pkgName] = newSpec
+      const backup = file + '.bak-dsh-sync-' + new Date().toISOString().replace(/[-:T]/g, '').slice(0, 14)
+      try {
+        copyFileSync(file, backup)
+        writeJsonFile(file, pkg)
+      } catch (e) {
+        return { ok: false, error: '改写 profile package.json 失败：' + (e && e.message ? e.message : String(e)), durationMs: Date.now() - started }
+      }
+      if (!nonTargetFieldsIntact(before, pkg, pkgName)) {
+        return { ok: false, error: '改写后校验失败：目标依赖之外的字段发生变化，已终止（备份见 ' + backup + '）', durationMs: Date.now() - started }
+      }
+      log('upgrade: ' + (oldSpec === undefined ? '(none)' : String(oldSpec)) + ' -> ' + newSpec + ' (backup ' + backup + ')')
+
+      // 5) 复用既有安装路径（绝不新写第二条 pnpm install 分支）
+      const install = o.install || ((r, p, op) => runProfileInstall(r || defaultRunner, p, op))
+      const ir = await install(o.runner, o.pnpmPath, { githubHttpsOnly: true })
+      const logTail = (ir && ir.log) ? String(ir.log) : ''
+      if (!ir || !ir.ok) {
+        return { ok: false, error: (ir && ir.error) ? ir.error : 'pnpm install 失败', log: logTail, durationMs: Date.now() - started, backup, from: info.current, to: ver.latest, spec: newSpec }
+      }
+      // 6) 重新读 profile package.json 确认 spec 已落地；to = 目标版本，needRestart 恒为 true
+      //    （插件代码在 DSH 启动时加载，生效必须重启 —— 已实测确认）
+      let confirmed = null
+      try {
+        const after = JSON.parse(readFileSync(file, 'utf8'))
+        confirmed = after.dependencies ? after.dependencies[pkgName] : null
+      } catch (e) { confirmed = null }
+      if (String(confirmed) !== newSpec) {
+        return { ok: false, error: '安装后校验失败：profile 里仍是 ' + String(confirmed), log: logTail, durationMs: Date.now() - started, backup, from: info.current, to: ver.latest, spec: newSpec }
+      }
+      log('upgrade ok: ' + info.current + ' -> ' + ver.latest + ' in ' + (Date.now() - started) + 'ms')
+      return {
+        ok: true, from: info.current, to: ver.latest, upgraded: true, spec: newSpec,
+        exitCode: (ir && typeof ir.exitCode === 'number') ? ir.exitCode : 0, durationMs: Date.now() - started,
+        needRestart: true, before: { version: info.current, spec: oldSpec === undefined ? null : String(oldSpec) },
+        backup, log: logTail, error: null,
+      }
+    } catch (e) {
+      return { ok: false, error: e && e.message ? e.message : String(e), durationMs: Date.now() - started }
+    }
+  }
+
   const handlers = {
     'GET /dsh-sync/status': handleStatus,
     'GET /dsh-sync/plugins': handlePlugins,
+    'GET /dsh-sync/version': handleVersion,
     'POST /dsh-sync/config': handleConfig,
     'POST /dsh-sync/backup': handleBackup,
     'POST /dsh-sync/restore': handleRestore,
     'POST /dsh-sync/rollback': handleRollback,
     'POST /dsh-sync/plugins/install': (body) => handlePluginInstall(body),
+    'POST /dsh-sync/upgrade': handleUpgrade,
   }
 
   /** 供 tools-selftest.mjs 直接调用的内部句柄（不启动 DSH、不注册路由） */
-  apply._internals = { handlePlugins, handlePluginInstall, buildPluginsReport, resolveProfile, defaultRunner }
+  apply._internals = {
+    handlePlugins, handlePluginInstall, buildPluginsReport, resolveProfile, defaultRunner,
+    handleVersion, handleUpgrade, inspectSelf, versionCache, runProfileInstall,
+  }
 
   const setupRoutes = (routeCtx) => {
     try {
@@ -944,7 +1468,7 @@ export function apply(ctx, config) {
                 return json(res, { ok: false, error: '方法不允许：需要 ' + method })
               }
               const body = method === 'POST' ? await readBody(req) : {}
-              const result = await handler(body)
+              const result = await handler(body, req)
               json(res, result)
             } catch (e) {
               json(res, { ok: false, error: e && e.message ? e.message : String(e) })
@@ -953,7 +1477,7 @@ export function apply(ctx, config) {
         })
         if (typeof dispose === 'function') cleanupFns.push(dispose)
       }
-      log('HTTP endpoints ready: /dsh-sync/{status,config,backup,restore,rollback,plugins,plugins/install}')
+      log('HTTP endpoints ready: /dsh-sync/{status,config,backup,restore,rollback,plugins,plugins/install,version,upgrade}')
     } catch (e) {
       log('route registration failed: ' + (e && e.message ? e.message : String(e)))
     }
