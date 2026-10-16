@@ -13,6 +13,9 @@ import {
   buildPayload, collectFiles, encryptBundle, decryptBundle, extractPayload,
   bundleName, makeSnapshot, rollbackFromSnapshot, isExcluded,
   davRequest, ensureRemoteDir, parsePropfind, listRemoteBackups,
+  repoSpecFromUrl, depKind, collectInstallMeta, extractPayloadMeta,
+  writeLastRestore, readLastRestore, planProfileInstall, findPnpmPath,
+  createTestHarness,
 } from './index.js'
 
 let pass = 0, fail = 0
@@ -195,6 +198,207 @@ try {
   for (const d of [root, restored, snapRoot, root + '-restored2']) {
     try { rmSync(d, { recursive: true, force: true }) } catch (e) { /* ignore */ }
   }
+}
+
+// ---------- 6. 恢复后重装插件依赖（B 机） ----------
+
+// 6.1 仓库地址 → pnpm spec
+check('repoSpec: git+https github', repoSpecFromUrl('git+https://github.com/ddldxiacan/dsh-sync-release.git') === 'github:ddldxiacan/dsh-sync-release')
+check('repoSpec: https github 无 .git', repoSpecFromUrl('https://github.com/ddldxiacan/dsh-sync-release') === 'github:ddldxiacan/dsh-sync-release')
+check('repoSpec: scp 形式 ssh', repoSpecFromUrl('git@github.com:ddldxiacan/dsh-sync-release.git') === 'github:ddldxiacan/dsh-sync-release')
+check('repoSpec: git+ssh', repoSpecFromUrl('git+ssh://git@github.com/ddldxiacan/dsh-sync-release.git') === 'github:ddldxiacan/dsh-sync-release')
+check('repoSpec: gitlab', repoSpecFromUrl('git+https://gitlab.com/team/plugin.git') === 'gitlab:team/plugin')
+check('repoSpec: bitbucket', repoSpecFromUrl('https://bitbucket.org/team/plugin.git') === 'bitbucket:team/plugin')
+check('repoSpec: 其他主机回退 https', repoSpecFromUrl('https://git.example.com/team/plugin.git') === 'https://git.example.com/team/plugin')
+check('repoSpec: 无法解析返回 null', repoSpecFromUrl('') === null && repoSpecFromUrl('not a url') === null)
+
+// 6.2 依赖分类
+check('depKind: link/portal', depKind('link:E:/x') === 'link' && depKind('portal:../x') === 'link')
+check('depKind: github 简写', depKind('github:ddldxiacan/dsh-sync-release') === 'git')
+check('depKind: git+https', depKind('git+https://github.com/a/b.git') === 'git')
+check('depKind: registry 版本号', depKind('^0.4.6') === 'registry' && depKind('3.27.1') === 'registry')
+
+// 6.3 meta 往返 + 向后兼容（不传 meta 必须与旧版产物逐字节一致）
+{
+  const root = join(tmpdir(), 'dsh-sync-meta-' + Date.now())
+  try {
+    mkdirSync(join(root, 'profiles', 'desktop'), { recursive: true })
+    writeFileSync(join(root, 'profiles', 'desktop', 'package.json'), '{"a":1}', 'utf8')
+    writeFileSync(join(root, 'a.txt'), 'hello', 'utf8')
+    const rels = collectFiles(root)
+    const noMeta = buildPayload(root, rels)
+    const legacy = Buffer.from(JSON.stringify({ files: JSON.parse(noMeta.toString('utf8')).files }), 'utf8')
+    check('buildPayload 不传 meta 与旧版逐字节一致', noMeta.equals(legacy))
+    check('buildPayload 不传 meta 时无 meta 字段', JSON.parse(noMeta.toString('utf8')).meta === undefined)
+    const meta = { profile: 'desktop', linkMap: { p: { from: 'link:E:/x', spec: 'github:a/p', reason: 'repository.url' } } }
+    const withMeta = buildPayload(root, rels, meta)
+    check('buildPayload 传 meta 时写回相同内容', JSON.stringify(extractPayloadMeta(withMeta)) === JSON.stringify(meta))
+    check('含 meta 的 payload 仍可正常解包', extractPayload(withMeta, join(root, 'out')) === rels.length)
+    check('旧备份（无 meta）extractPayloadMeta 返回 null', extractPayloadMeta(noMeta) === null)
+    // meta 不破坏加解密往返
+    const rt = decryptBundle(encryptBundle(withMeta, 'pw'), 'pw')
+    check('含 meta 的 payload 加解密往返', rt.equals(withMeta))
+  } finally {
+    try { rmSync(root, { recursive: true, force: true }) } catch (e) { /* ignore */ }
+  }
+}
+
+// 6.4 collectInstallMeta 针对真实布局（link 指向的仓库地址取自 node_modules 里的 package.json）
+{
+  const root = join(tmpdir(), 'dsh-sync-ci-' + Date.now())
+  const prof = join(root, 'profiles', 'desktop')
+  try {
+    mkdirSync(join(prof, 'node_modules', 'dsh-sync-plugin'), { recursive: true })
+    writeFileSync(join(prof, 'package.json'), JSON.stringify({
+      dependencies: {
+        'dsh-sync-plugin': 'link:E:/somewhere/dsh-sync-release',
+        'dsh-claude-style': '^0.15.0',
+        '@liustack/modlens': '3.27.1',
+      },
+    }), 'utf8')
+    writeFileSync(join(prof, 'node_modules', 'dsh-sync-plugin', 'package.json'),
+      JSON.stringify({ name: 'dsh-sync-plugin', repository: { url: 'git+https://github.com/ddldxiacan/dsh-sync-release.git' } }), 'utf8')
+    const meta = collectInstallMeta(root, 'desktop')
+    check('collectInstallMeta: 只挑出 link 依赖', Object.keys(meta.linkMap).length === 1 && Object.keys(meta.unmapped).length === 0)
+    check('collectInstallMeta: link→github spec', meta.linkMap['dsh-sync-plugin'].spec === 'github:ddldxiacan/dsh-sync-release')
+    check('collectInstallMeta: 保留原始 from 与 reason',
+      meta.linkMap['dsh-sync-plugin'].from === 'link:E:/somewhere/dsh-sync-release' &&
+      meta.linkMap['dsh-sync-plugin'].reason === 'repository.url')
+    check('collectInstallMeta: profile 名与时间戳', meta.profile === 'desktop' && typeof meta.createdAt === 'string')
+
+    // node_modules 缺失时归入 unmapped，而不是猜一个 spec
+    rmSync(join(prof, 'node_modules'), { recursive: true, force: true })
+    const meta2 = collectInstallMeta(root, 'desktop')
+    check('collectInstallMeta: 装不了时进 unmapped', Object.keys(meta2.linkMap).length === 0 && meta2.unmapped['dsh-sync-plugin'] === 'link:E:/somewhere/dsh-sync-release')
+  } finally {
+    try { rmSync(root, { recursive: true, force: true }) } catch (e) { /* ignore */ }
+  }
+}
+
+// 6.5 端到端：用临时 profile 走一遍「建 payload → 恢复 → 装插件」，pnpm 用假 runner
+{
+  const root = join(tmpdir(), 'dsh-sync-e2e-a-' + Date.now())
+  const rootB = root + '-b'
+  const prof = join(root, 'profiles', 'desktop')
+  try {
+    mkdirSync(join(prof, 'node_modules', 'dsh-sync-plugin'), { recursive: true })
+    writeFileSync(join(prof, 'package.json'), JSON.stringify({
+      name: 'desktop-profile',
+      dependencies: { 'dsh-sync-plugin': 'link:E:/A-only/dsh-sync-release' },
+    }), 'utf8')
+    writeFileSync(join(prof, 'node_modules', 'dsh-sync-plugin', 'package.json'),
+      JSON.stringify({ name: 'dsh-sync-plugin', repository: { url: 'git+https://github.com/ddldxiacan/dsh-sync-release.git' } }), 'utf8')
+    writeFileSync(join(prof, 'pnpm-lock.yaml'), 'lockfileVersion: 9\nimporters:\n  .:\n    dependencies:\n      dsh-sync-plugin:\n        specifier: link:E:/A-only/dsh-sync-release\n', 'utf8')
+
+    // A 机：备份（带 meta）
+    const payload = buildPayload(root, collectFiles(root), collectInstallMeta(root, 'desktop'))
+    const bundle = encryptBundle(payload, 'pw')
+
+    // B 机：新目录只放恢复出来的文件（模拟 node_modules 不在备份里）
+    const rootB = join(tmpdir(), 'dsh-sync-e2e-b-' + Date.now())
+    mkdirSync(rootB, { recursive: true })
+    const meta = extractPayloadMeta(decryptBundle(bundle, 'pw'))
+    extractPayload(decryptBundle(bundle, 'pw'), rootB)
+    writeLastRestore(rootB, { at: new Date().toISOString(), bundle: 'x', profile: meta.profile, linkMap: meta.linkMap })
+    check('E2E: B 机恢复后没有 node_modules', !existsSync(join(rootB, 'profiles', 'desktop', 'node_modules', 'dsh-sync-plugin', 'package.json')))
+
+    // 用 B 机的目录实例化 host，跑 /plugins 与 /plugins/install
+    const h = createTestHarness({ root: rootB, profile: 'desktop' })
+    const rep = await h.handlePlugins()
+    check('E2E: /plugins 报出 profile 与缺失项', rep.ok === true && rep.profile === 'desktop' && rep.missing.length === 1 && rep.needsInstall === true)
+    check('E2E: /plugins 给出改写建议', rep.deps[0].rewrite === 'github:ddldxiacan/dsh-sync-release' && rep.deps[0].installed === false)
+    check('E2E: 记录的 linkMap 生效', rep.mapped['dsh-sync-plugin'].spec === 'github:ddldxiacan/dsh-sync-release')
+    check('client 契约: missing 是包名数组', Array.isArray(rep.missing) && rep.missing[0] === 'dsh-sync-plugin')
+
+    let captured = null
+    const fakeRunner = (opt) => {
+      captured = opt
+      // 模拟真实 pnpm：重建 node_modules，并把锁文件里的 link specifier 同步成仓库地址
+      mkdirSync(join(opt.cwd, 'node_modules', 'dsh-sync-plugin'), { recursive: true })
+      writeFileSync(join(opt.cwd, 'node_modules', 'dsh-sync-plugin', 'package.json'), '{"name":"dsh-sync-plugin"}', 'utf8')
+      writeFileSync(join(opt.cwd, 'pnpm-lock.yaml'), 'lockfileVersion: 9\nimporters:\n  .:\n    dependencies:\n      dsh-sync-plugin:\n        specifier: github:ddldxiacan/dsh-sync-release\n', 'utf8')
+      return { status: 0, stdout: 'Done in 2m6.7s', stderr: '' }
+    }
+    const res = await h.handlePluginInstall({}, fakeRunner, 'C:/fake/pnpm.mjs')
+    check('E2E: 安装成功且返回结构完整', res.ok === true && res.exitCode === 0 && typeof res.durationMs === 'number')
+    check('client 契约: installed 是包名数组', Array.isArray(res.installed) && res.installed.includes('dsh-sync-plugin'))
+    check('client 契约: rewritten 是 包名→声明 映射', res.rewritten['dsh-sync-plugin'] === 'github:ddldxiacan/dsh-sync-release')
+    check('client 契约: removed 是包名数组', Array.isArray(res.removed) && res.removed.length === 0)
+    check('E2E: 命令行为 pnpm install（不带 lockfile 相关 flag）',
+      captured.args.length === 2 && captured.args[0] === 'C:/fake/pnpm.mjs' && captured.args[1] === 'install')
+    check('E2E: cwd 与 ELECTRON_RUN_AS_NODE 正确', captured.cwd === join(rootB, 'profiles', 'desktop') && captured.env.ELECTRON_RUN_AS_NODE === '1')
+    check('E2E: 超时为 15 分钟', captured.timeout === 15 * 60 * 1000)
+    const pkgAfter = JSON.parse(readFileSync(join(rootB, 'profiles', 'desktop', 'package.json'), 'utf8'))
+    check('E2E: package.json 里 link: 已改写为仓库地址', pkgAfter.dependencies['dsh-sync-plugin'] === 'github:ddldxiacan/dsh-sync-release')
+    check('E2E: 改写前已备份 package.json',
+      readdirSync(join(rootB, 'profiles', 'desktop')).some((n) => n.startsWith('package.json.bak-dsh-sync-')) &&
+      JSON.parse(readFileSync(join(rootB, 'profiles', 'desktop', 'package.json'), 'utf8')).dependencies['dsh-sync-plugin'].startsWith('github:'))
+    check('E2E: 回报锁文件已同步', res.lockSynced === true)
+    const rep2 = await h.handlePlugins()
+    check('E2E: 安装后插件已就位、needsInstall 转 false', rep2.deps[0].installed === true && rep2.missing.length === 0 && rep2.needsInstall === false)
+
+    // 失败路径：runner 返回非 0 不应抛异常，且要带回日志尾巴
+    const h2 = createTestHarness({ root: rootB, profile: 'desktop' })
+    const res2 = await h2.handlePluginInstall({}, () => ({ status: 1, stdout: '', stderr: 'ERR_PNPM_NO_MATCHING_VERSION' }), 'C:/fake/pnpm.mjs')
+    check('E2E: 安装失败时 ok=false 且不抛异常', res2.ok === false && res2.exitCode === 1 && /ERR_PNPM/.test(res2.log))
+    // runner 抛异常也必须被吞掉（fail-soft）
+    const res3 = await h2.handlePluginInstall({}, () => { throw new Error('spawn ENOENT') }, 'C:/fake/pnpm.mjs')
+    check('E2E: runner 抛异常被吞掉并回报', res3.ok === false && /ENOENT/.test(res3.error))
+
+    // 找不到 pnpm 时给出明确错误
+    const res4 = await h2.handlePluginInstall({}, () => ({ status: 0, stdout: '', stderr: '' }), null)
+    check('E2E: 无 pnpm 时报错而非崩溃', res4.ok === false && /pnpm/.test(res4.error))
+  } finally {
+    for (const d of [root, join(tmpdir(), 'dsh-sync-e2e-b-' + 0)]) {
+      try { rmSync(d, { recursive: true, force: true }) } catch (e) { /* ignore */ }
+    }
+  }
+}
+
+// 6.6 无法推导 spec 的 link 依赖：移除而不是让整条 install 失败
+{
+  const root = join(tmpdir(), 'dsh-sync-drop-' + Date.now())
+  try {
+    mkdirSync(join(root, 'profiles', 'desktop'), { recursive: true })
+    writeFileSync(join(root, 'profiles', 'desktop', 'package.json'), JSON.stringify({
+      dependencies: { 'ghost-plugin': 'link:E:/not-on-b' },
+    }), 'utf8')
+    const h = createTestHarness({ root, profile: 'desktop' })
+    const rep = await h.handlePlugins()
+    check('无仓库信息时标记 removed 而非静默重写', rep.deps[0].removed === true && rep.missing.length === 1)
+    let captured = null
+    const res = await h.handlePluginInstall({}, (opt) => { captured = opt; return { status: 0, stdout: 'ok', stderr: '' } }, 'C:/fake/pnpm.mjs')
+    check('不可推导的 link 依赖被移除', res.ok === true && res.removed.includes('ghost-plugin'))
+    const pkg = JSON.parse(readFileSync(join(root, 'profiles', 'desktop', 'package.json'), 'utf8'))
+    check('package.json 里该依赖已删除', pkg.dependencies['ghost-plugin'] === undefined)
+    check('移除依赖后 pnpm 仍能装（命令已下发）', captured.args[1] === 'install')
+  } finally {
+    try { rmSync(root, { recursive: true, force: true }) } catch (e) { /* ignore */ }
+  }
+}
+
+// 6.7 默认 runner 必须异步 —— 同步阻塞会冻死 DSH 主进程的事件循环（实测冷装 2 分 6.7 秒）
+{
+  const src = readFileSync(new URL('./index.js', import.meta.url), 'utf8')
+  check('源码中不得出现同步 spawnSync(', !/spawnSync\s*\(/.test(src))
+
+  const h = createTestHarness({ root: join(tmpdir(), 'dsh-sync-async-' + Date.now()), profile: 'desktop' })
+  const runner = h.defaultRunner
+  check('defaultRunner 返回 Promise', typeof runner === 'function' && runner({ cmd: 'x', args: [] }) instanceof Promise)
+
+  // 子进程睡 700ms；期间事件循环必须还能跑定时器。若 runner 是同步的，
+  // 下面的 ticked 只会在子进程结束后才置位 —— 顺序反过来即可判定阻塞。
+  let ticked = false
+  const timer = new Promise((r) => setTimeout(() => { ticked = true; r('timer') }, 150))
+  const child = runner({
+    cmd: process.execPath,
+    args: ['-e', 'setTimeout(() => { console.log("child-output"); process.exit(0) }, 700)'],
+    cwd: tmpdir(), env: process.env, timeout: 30000,
+  }).then((v) => { check('异步 runner: 事件循环未被阻塞（定时器先于子进程完成）', ticked === true); return v })
+  const raced = await Promise.race([timer.then(() => 'timer-first'), child.then(() => 'child-first')])
+  check('异步 runner: 定时器先完成', raced === 'timer-first')
+  const out = await child
+  check('异步 runner: 透传退出码与 stdout', out.status === 0 && /child-output/.test(out.stdout))
 }
 
 console.log('\n==== ' + pass + ' passed, ' + fail + ' failed ====')

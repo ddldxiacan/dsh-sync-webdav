@@ -10,7 +10,10 @@
  *   POST /dsh-sync/backup   {passphrase}            -> { ok:true, name, size, fileCount } | { ok:false, error }
  *   POST /dsh-sync/restore  {name?, passphrase}     -> { ok:true, restored, snapshot }    | { ok:false, error }
  *   POST /dsh-sync/rollback {snapshot}              -> { ok:true, restored }              | { ok:false, error }
+ *   GET  /dsh-sync/plugins                          -> { ok:true, profile, deps[], missing[], needsInstall, pnpm }
+ *   POST /dsh-sync/plugins/install {}               -> { ok:true, installed[], rewritten{}, removed[], durationMs, log } | { ok:false, error, log }
  * 所有响应 HTTP 200，按 `ok` 字段判断成败；错误统一在 `error` 字段。
+ * /plugins 失败时是 { ok:false, error }（HTTP 仍 200），必须看返回体的 ok，不能依赖 res.ok。
  *
  * 约束：无 npm 依赖、无构建步骤、ESM 形态的 IIFE 包；不 require 任何
  * `@deepseek-ai/dsh-client-*` 包（宿主明确警告其不稳定，抛错会白屏整个 slot），
@@ -75,6 +78,26 @@ window.__ModuleLoader__.load({
     }
 
     /**
+     * 安装结果摘要：装了什么、改写了哪些来源、跳过了哪些、耗时，并提醒重启。
+     * rewritten 是 { 包名: 改写后的依赖声明 } 映射。
+     */
+    function formatInstallResult(d) {
+      const data = d || {};
+      const installed = Array.isArray(data.installed) ? data.installed : [];
+      const removed = Array.isArray(data.removed) ? data.removed : [];
+      const rewritten = (data.rewritten && typeof data.rewritten === 'object') ? data.rewritten : {};
+      const names = Object.keys(rewritten);
+      const parts = [installed.length
+        ? '已安装 ' + installed.length + ' 个（' + installed.join('、') + '）'
+        : '没有新增安装'];
+      if (names.length) parts.push('已改写 ' + names.map((n) => n + ' → ' + rewritten[n]).join('、'));
+      if (removed.length) parts.push('已跳过 ' + removed.join('、'));
+      const ms = Number(data.durationMs);
+      if (isFinite(ms) && ms >= 0) parts.push('耗时 ' + (ms / 1000).toFixed(1) + ' 秒');
+      return '插件重装完成：' + parts.join('；') + '。请重启 DeepSeek Harness 使插件生效。';
+    }
+
+    /**
      * 唯一网络出口。任何失败都收敛成 { ok:false, offline:boolean, error }，
      * 绝不把异常抛给渲染层。
      *
@@ -109,13 +132,16 @@ window.__ModuleLoader__.load({
     /** GET /dsh-sync/status —— 成功时返回 status 对象本身（它不以 ok 字段为载体）。 */
     const fetchStatus = () => request('/status');
 
-    /** 5 个端点的语义化包装：统一返回 { ok, ... }，ok 时附带 data。 */
+    /** 7 个端点的语义化包装：统一返回 { ok, ... }，ok 时附带 data。 */
     const api = {
       status: fetchStatus,
       config: (body) => request('/config', { method: 'POST', body }),
       backup: (body) => request('/backup', { method: 'POST', body }),
       restore: (body) => request('/restore', { method: 'POST', body }),
       rollback: (body) => request('/rollback', { method: 'POST', body }),
+      // 这两个端点的业务失败也是 HTTP 200，成败要看返回体里的 ok 字段
+      plugins: () => request('/plugins'),
+      pluginsInstall: (body) => request('/plugins/install', { method: 'POST', body }),
     };
 
     // ============================================================
@@ -170,6 +196,14 @@ window.__ModuleLoader__.load({
 .${PREFIX}-modal-title { font-weight: 600; }
 .${PREFIX}-modal-body { font-size: 13px; line-height: 1.7; color: var(--dsw-alias-label-secondary); }
 .${PREFIX}-modal-actions { display: flex; justify-content: flex-end; gap: 8px; }
+.${PREFIX}-warn { padding: 8px 10px; border-radius: 6px; font-size: 12px; line-height: 1.7; color: var(--dsw-alias-label-secondary);
+  background: var(--dsw-alias-fill-l1); border-left: 3px solid var(--dsw-alias-state-error-primary); }
+.${PREFIX}-warn-title { color: var(--dsw-alias-state-error-primary); font-weight: 600; margin-bottom: 2px; }
+.${PREFIX}-log { font-size: 12px; color: var(--dsw-alias-label-tertiary); }
+.${PREFIX}-log summary { cursor: pointer; }
+.${PREFIX}-log-pre { max-height: 200px; overflow: auto; margin: 6px 0 0; padding: 8px; border-radius: 6px; font-size: 12px;
+  font-family: ui-monospace, SFMono-Regular, Menlo, monospace; white-space: pre-wrap; word-break: break-all;
+  color: var(--dsw-alias-label-secondary); background: var(--dsw-alias-bg-l2); border: 1px solid var(--dsw-alias-border-l2); }
 `;
 
     // ============================================================
@@ -242,8 +276,10 @@ window.__ModuleLoader__.load({
       // 口令：仅内存，绝不写入任何持久化位置
       const [passphrase, setPassphrase] = useState('');
       const [status, setStatus] = useState(null);
+      // 插件依赖状态：null = 尚未取到或端点不可用（静默降级，不弹错）
+      const [plugins, setPlugins] = useState(null);
       const [loading, setLoading] = useState(true);
-      const [busy, setBusy] = useState('');           // '' | 'config' | 'backup' | 'restore' | 'rollback' | 'refresh'
+      const [busy, setBusy] = useState('');           // '' | 'config' | 'backup' | 'restore' | 'rollback' | 'install' | 'refresh'
       const [msg, setMsg] = useState(null);           // { kind, text }
       const [offline, setOffline] = useState(false);
       const [confirm, setConfirm] = useState(null);   // { title, body, confirmLabel, run }
@@ -295,8 +331,21 @@ window.__ModuleLoader__.load({
         }
       }, []);
 
-      // 加载时拉一次状态
+      /**
+       * GET /dsh-sync/plugins —— 插件依赖状态。失败静默降级：只把状态置空，
+       * 不写 msg、不置 offline，卡片其余部分照常可用。
+       */
+      const refreshPlugins = useCallback(async () => {
+        const res = await api.plugins();
+        if (!mountedRef.current) return null;
+        const data = (res.ok && res.data && res.data.ok) ? res.data : null;
+        setPlugins(data);
+        return data;
+      }, []);
+
+      // 加载时拉一次状态与插件依赖
       useEffect(() => { refresh(); }, [refresh]);
+      useEffect(() => { refreshPlugins(); }, [refreshPlugins]);
 
       /** POST /dsh-sync/config —— 保存并测试连接 */
       const onSaveConfig = async () => {
@@ -354,7 +403,11 @@ window.__ModuleLoader__.load({
         setConfirm(null);
         if (consume(res, null)) {
           const d = res.data || {};
-          setMsg({ kind: 'ok', text: '已恢复 ' + (d.restored || 0) + ' 个文件，快照：' + (d.snapshot || '—') });
+          // 备份里没有 node_modules：恢复后插件只剩配置，这里立刻刷新插件状态
+          const plug = await refreshPlugins();
+          if (!mountedRef.current) return;
+          setMsg({ kind: 'ok', text: '已恢复 ' + (d.restored || 0) + ' 个文件，快照：' + (d.snapshot || '—') +
+            (plug && plug.needsInstall ? ' 注意：插件代码尚未安装，请点击下方「重装插件」。' : '') });
         }
         await refresh({ silent: true });
       };
@@ -389,11 +442,64 @@ window.__ModuleLoader__.load({
         await refresh({ silent: true });
       };
 
+      /** 重装入口：先弹确认（会联网装包，且重启后才生效） */
+      const askInstall = (names) => {
+        const list = Array.isArray(names) ? names : [];
+        setConfirm({
+          title: '确认重装插件',
+          body: h(React.Fragment, null,
+            h('div', null, '将为当前 profile 重新安装缺失的插件依赖：'),
+            list.length
+              ? h('div', { className: PREFIX + '-item-name' }, list.join('、'))
+              : h('div', { className: PREFIX + '-hint' }, '（未列出具体包名）'),
+            h('div', null, '安装会通过 pnpm 联网下载，可能需要几十秒，期间请勿关闭页面。'),
+            h('div', null, '安装完成后需要重启 DeepSeek Harness 才会生效。'),
+          ),
+          confirmLabel: '重装',
+          run: () => doInstall(),
+        });
+      };
+
+      /** POST /dsh-sync/plugins/install —— 重装插件依赖（失败也可能带 log） */
+      const doInstall = async () => {
+        if (busy) return;
+        setBusy('install');
+        setMsg(null);
+        const res = await api.pluginsInstall({});
+        if (!mountedRef.current) return;
+        setBusy('');
+        setConfirm(null);
+        const data = (res.ok && res.data && typeof res.data === 'object') ? res.data : res;
+        if (data && data.ok) {
+          setOffline(false);
+          await refreshPlugins();   // 让按钮随状态消失，避免重复安装
+          if (!mountedRef.current) return;
+          setMsg({ kind: 'ok', text: formatInstallResult(data), log: data.log || '' });
+          return;
+        }
+        if (res.offline) {
+          setOffline(true);
+          setMsg({ kind: 'error', text: NOT_READY });
+          return;
+        }
+        setOffline(false);
+        setMsg({ kind: 'error', text: pickError(data, '安装失败'), log: (data && data.log) || '' });
+      };
+
       const backups = (status && status.remote && Array.isArray(status.remote.backups)) ? status.remote.backups : [];
       const configured = !!(status && status.configured);
       const reachable = !!(status && status.remote && status.remote.reachable);
       const lastLocalSnapshot = status && status.lastLocalSnapshot;
       const anyBusy = !!busy;
+
+      const pluginDeps = (plugins && Array.isArray(plugins.deps)) ? plugins.deps : [];
+      const missingPlugins = (plugins && Array.isArray(plugins.missing)) ? plugins.missing : [];
+      const missingNames = missingPlugins.length
+        ? missingPlugins
+        : pluginDeps.filter((d) => d && d.installed === false).map((d) => d.name);
+      const needsInstall = !!(plugins && plugins.needsInstall);
+      const pnpmAvailable = !!(plugins && plugins.pnpm && plugins.pnpm.available);
+      const lastRestore = (plugins && plugins.lastRestore) ? plugins.lastRestore : null;
 
       return h('div', { className: PREFIX + '-root' },
         h('style', null, CSS),
@@ -497,7 +603,54 @@ window.__ModuleLoader__.load({
           ),
         ),
 
+        // ---- 插件依赖（恢复后重装）----
+        h('div', { className: PREFIX + '-card' },
+          h('div', { className: PREFIX + '-card-title' },
+            h('span', null, '插件依赖'),
+            plugins && needsInstall
+              ? h('span', { className: PREFIX + '-bad' }, '· ' + missingNames.length + ' 个未安装')
+              : null,
+          ),
+          !plugins
+            ? h('div', { className: PREFIX + '-hint' }, '读不到插件依赖状态，不影响其余功能。')
+            : needsInstall
+              ? h(React.Fragment, null,
+                  h('div', { className: PREFIX + '-warn' },
+                    h('div', { className: PREFIX + '-warn-title' },
+                      '检测到 ' + missingNames.length + ' 个插件依赖未安装' + (plugins.profile ? '（profile：' + plugins.profile + '）' : '')),
+                    h('div', null, '备份里没有 node_modules，恢复后这些插件只剩配置没有代码，DSH 启动时会把它们静默跳过。'),
+                    missingNames.length
+                      ? h('div', { className: PREFIX + '-row' },
+                          missingNames.map((n) => h('span', { key: n, className: PREFIX + '-badge ' + PREFIX + '-bad' }, n)))
+                      : null,
+                    lastRestore
+                      ? h('div', { className: PREFIX + '-hint' },
+                          '上次恢复：' + formatTime(lastRestore.at) +
+                          (lastRestore.bundle ? '（' + lastRestore.bundle + '）' : ''))
+                      : null,
+                  ),
+                  pnpmAvailable
+                    ? h('div', { className: PREFIX + '-row' },
+                        h(Button, { variant: 'primary', disabled: anyBusy, onClick: () => askInstall(missingNames) },
+                          busy === 'install' ? '安装中…' : '重装插件'),
+                      )
+                    : null,
+                  pnpmAvailable
+                    ? h('div', { className: PREFIX + '-hint' }, '安装由 pnpm 完成，装好后需要重启 DeepSeek Harness 才会生效。')
+                    : h('div', { className: PREFIX + '-hint' }, '找不到 pnpm，无法自动安装，请手动执行 ',
+                        h('span', { className: PREFIX + '-item-name' }, 'dsh plugin install')),
+                )
+              : h('div', { className: PREFIX + '-hint' }, '插件依赖完整（' + pluginDeps.length + ' 个）'),
+        ),
+
         msg ? h(Message, { kind: msg.kind }, msg.text) : null,
+        // 安装日志可能几千字符：折叠 + 限高滚动，不铺在卡片上
+        msg && msg.log
+          ? h('details', { className: PREFIX + '-log' },
+              h('summary', null, '安装日志（点击展开）'),
+              h('pre', { className: PREFIX + '-log-pre' }, msg.log),
+            )
+          : null,
 
         h(ConfirmModal, {
           open: !!confirm,
