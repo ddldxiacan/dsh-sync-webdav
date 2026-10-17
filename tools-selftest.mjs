@@ -11,6 +11,7 @@ import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import {
   buildPayload, collectFiles, encryptBundle, decryptBundle, extractPayload,
+  isExcludedAppData, collectAppDataFiles, appDataAbsPath,
   bundleName, makeSnapshot, rollbackFromSnapshot, isExcluded,
   davRequest, ensureRemoteDir, parsePropfind, listRemoteBackups,
   repoSpecFromUrl, depKind, collectInstallMeta, extractPayloadMeta,
@@ -34,7 +35,8 @@ check('exclude: logs', isExcluded('logs/a.log'))
 check('exclude: npm-cache', isExcluded('npm-cache'))
 check('exclude: tmp*', isExcluded('tmpfoo'))
 check('exclude: cache*', isExcluded('cache-1'))
-check('exclude: >10MB file', isExcluded('big.bin', 10 * 1024 * 1024 + 1))
+check('exclude: >50MB file', isExcluded('big.bin', 50 * 1024 * 1024 + 1))
+check('keep: 10-50MB file (0.3.0 放宽)', !isExcluded('big.bin', 10 * 1024 * 1024 + 1))
 check('keep: normal', !isExcluded('settings.json', 100))
 // 回归：node_modules 是插件依赖（实测 ~221MB），sessions 是会话历史（实测 ~27MB）。
 // 二者若进备份，base64 payload 达 350MB+，会把 Node 堆撑爆（实测 OOM）。
@@ -42,6 +44,23 @@ check('exclude: node_modules (任意深度)', isExcluded('profiles/desktop/node_
 check('exclude: sessions', isExcluded('sessions/abc/session.v4.jsonl.zstd'))
 check('keep: profile 配置不受 node_modules 排除影响', !isExcluded('profiles/desktop/cordis.patch.yml'))
 check('keep: settings 与凭据', !isExcluded('settings.yaml') && !isExcluded('.credentials.yaml'))
+
+// ---------- 1b. AppData 排除规则 ----------
+check('appdata exclude: Local Storage', isExcludedAppData('dsh-desktop/Local Storage/leveldb/000003.log'))
+check('appdata exclude: Cache 前缀目录', isExcludedAppData('dsh-desktop/Cache/Cache_Data/x'))
+check('appdata keep: settings.json', !isExcludedAppData('dsh-desktop/desktop/settings.json', 100))
+check('appdata exclude: >2MB file', isExcludedAppData('dsh-desktop/desktop/big.db', 2 * 1024 * 1024 + 1))
+check('appdata 路径解析：__appdata__ 前缀返回绝对路径', typeof appDataAbsPath('__appdata__/dsh-desktop/desktop/settings.json') === 'string')
+check('appdata 路径解析：无前缀返回 null', appDataAbsPath('dsh-desktop/desktop/settings.json') === null)
+check('appdata 路径解析：路径穿越返回 null', appDataAbsPath('__appdata__/../../etc/passwd') === null)
+if (process.env.APPDATA) {
+  const ad = collectAppDataFiles()
+  check('appdata 收集：全部带 __appdata__ 前缀', ad.every((f) => f.startsWith('__appdata__/')))
+  check('appdata 收集：包含 dsh-desktop/desktop/settings.json', ad.some((f) => f.endsWith('dsh-desktop/desktop/settings.json')), ad.length + ' files')
+  check('appdata 收集：不含 Local Storage / Cache', !ad.some((f) => /Local Storage|\/Cache\//.test(f)))
+} else {
+  console.log('SKIP  appdata 收集（无 APPDATA 环境变量）')
+}
 
 // ---------- 2. 加解密往返 ----------
 {

@@ -6,12 +6,16 @@
  *
  * 恢复/回滚都只覆盖：两者把备份（或快照）里实际存在的文件挨个拷进 ~/.dsh，
  * 绝不删除备份之外 ~/.dsh 里已有的文件。因此被排除项（dsh-runtimes/、node_modules/、
- * sessions/、logs/、npm-cache、tmp*、cache*、>10MB 文件）在恢复/回滚后原样保留 —— 这是刻意的，
+ * sessions/、logs/、npm-cache、tmp*、cache*、>50MB 文件）在恢复/回滚后原样保留 —— 这是刻意的，
  * 否则 ~/.dsh/dsh-runtimes/ 里的 node 运行时会随回滚被删掉，DSH 无法启动。
  * 同理，node_modules/（可重装的插件依赖）也不会因回滚而丢失。
  *
  * 备份包含 dsh-sync.json 自身的 WebDAV 凭据（url/username/password），属有意设计：
  * 用户要求配置整体同步，故清单与凭据一并进备份；备份本身已用口令加密。
+ *
+ * 0.3.0 起，Electron 应用级设置（%APPDATA%\@deepseek-ai\dsh-desktop\desktop\settings.json 等
+ * 小型配置文件）也一并打包：以 __appdata__/ 前缀并入同一 payload，恢复/回滚时自动写回原位；
+ * Chromium 缓存类目录（Cache/Local Storage/blob_storage 等）与 >2MB 文件仍排除。
  *
  * 备份文件格式（二进制）：
  *   [8 字节 magic "DSHSYNC1"][4 字节 headerLen(LE)][header JSON utf8][AES-256-GCM ciphertext]
@@ -35,11 +39,79 @@ import https from 'node:https'
 import { fileURLToPath } from 'node:url'
 
 const MAGIC = Buffer.from('DSHSYNC1', 'utf8')
-const MAX_FILE_BYTES = 10 * 1024 * 1024
+const MAX_FILE_BYTES = 50 * 1024 * 1024
 const SNAPSHOT_KEEP = 5
 const CONFIG_FILE_NAME = 'dsh-sync.json'
 const SNAPSHOT_ROOT_NAME = '.dsh-sync-snapshots'
 const RESTORE_STATE_NAME = 'dsh-sync-last-restore.json'
+// Electron 应用级用户数据（settings.json 等）：不在 ~/.dsh 下，单独收集后以 __appdata__/ 前缀入库。
+// 只取稳定的小型配置文件，排除 Chromium 缓存类目录（体积大且可再生）。
+const APPDATA_ROOT_NAME = '@deepseek-ai'
+const APPDATA_PREFIX = '__appdata__/'
+const APPDATA_MAX_FILE_BYTES = 2 * 1024 * 1024
+export function isExcludedAppData(relPosix, fileSizeBytes, isDir) {
+  // 采用「缓存目录黑名单 + 顶层文件白名单」：Chromium/Electron 的 userData 下绝大多数是
+  // 缓存类可再生内容，只同步已知承载用户配置的文件与目录。
+  const segs = relPosix.split('/')
+  const APPDATA_CACHE_DIRS = new Set([
+    'blob_storage', 'Cache', 'Cache_Data', 'Code Cache', 'Crashpad', 'DawnGraphiteCache',
+    'DawnWebGPUCache', 'Dictionaries', 'DIPS', 'GPUCache', 'GPUPersistentCache', 'GrShaderCache',
+    'Local Storage', 'Network', 'Partitions', 'Session Storage', 'ShaderCache', 'Shared Dictionary',
+    'shared_proto_db', 'VideoDecodeStats', 'WebStorage', 'logs', 'old',
+  ])
+  for (const seg of segs) {
+    if (APPDATA_CACHE_DIRS.has(seg)) return true
+    if (/^Cache/.test(seg) || /^Dawn(GPU|Graphite|WebGPU)Cache$/.test(seg)) return true
+  }
+  // 顶层（dsh-desktop 直下）只同步白名单文件：.updaterId、lockfile、Local State、
+  // Preferences、DIPS 等均为 Chromium 运行态，不属于用户配置且机器相关
+  if (!isDir && segs.length === 2) {
+    const KNOWN_TOP = new Set(['settings.json'])
+    if (!KNOWN_TOP.has(segs[1])) return true
+  }
+  if (fileSizeBytes !== undefined && fileSizeBytes > APPDATA_MAX_FILE_BYTES) return true
+  return false
+}
+/** 收集 AppData 应用设置文件（相对 AppData Roaming 根，含 __appdata__ 前缀），供打包 */
+function appDataRoamingRoot() {
+  if (process.env.APPDATA) return process.env.APPDATA
+  try { return join(homedir(), 'AppData', 'Roaming') } catch (e) { return null }
+}
+export function collectAppDataFiles() {
+  const roaming = appDataRoamingRoot()
+  if (!roaming) return []
+  const root = join(roaming, APPDATA_ROOT_NAME)
+  const out = []
+  const walk = (dir, prefix) => {
+    let entries
+    try { entries = readdirSync(dir, { withFileTypes: true }) } catch (e) { return }
+    for (const ent of entries) {
+      const rel = prefix ? prefix + '/' + ent.name : ent.name
+      const abs = join(dir, ent.name)
+      if (ent.isDirectory()) {
+        if (isExcludedAppData(rel, undefined, true)) continue
+        walk(abs, rel)
+      } else if (ent.isFile()) {
+        let size = 0
+        try { size = statSync(abs).size } catch (e) { continue }
+        if (isExcludedAppData(rel, size, false)) continue
+        out.push(APPDATA_PREFIX + rel)
+      }
+    }
+  }
+  walk(root, '')
+  out.sort()
+  return out
+}
+/** AppData 相对路径（带 __appdata__/ 前缀）→ 绝对路径；非法或前缀不符返回 null */
+export function appDataAbsPath(relPosix) {
+  if (typeof relPosix !== 'string' || !relPosix.startsWith(APPDATA_PREFIX)) return null
+  const rel = relPosix.slice(APPDATA_PREFIX.length)
+  if (!isSafeRelPath(rel)) return null
+  const roaming = appDataRoamingRoot()
+  if (!roaming) return null
+  return join(roaming, APPDATA_ROOT_NAME, ...rel.split('/'))
+}
 // B 机恢复后重装插件依赖用；pnpm 随 DSH 一起分发在 resources/runtime/ 下
 const PNPM_REL_PATH = join('runtime', 'pnpm', 'bin', 'pnpm.mjs')
 const INSTALL_TIMEOUT_MS = 15 * 60 * 1000
@@ -51,9 +123,9 @@ const LOG_TAIL_CHARS = 4000
 
 /** 是否应排除某个相对路径（posix 分隔）。规则：
  *  目录名：dsh-runtimes、node_modules、sessions、logs、npm-cache，以及 tmp 或 cache 开头的目录
- *  单个文件大于 10MB
+ *  单个文件大于 50MB
  *
- * 为何排除 node_modules：`profiles/<name>/node_modules` 是插件依赖，实测占 ~221MB
+ * 为何排除 node_modules：`profiles/<name>/node_modules` 是插件依赖，实测占 ~800MB
  * 且可由 pnpm 重装，属可重建产物而非配置。若打包进去，base64 封装后 payload 达
  * 350MB+，加序列化副本会直接把 Node 堆撑爆（实测 OOM）。
  *
@@ -97,10 +169,18 @@ export function collectFiles(root) {
 
 /** 打包（未加密）：返回明文 payload Buffer。meta 仅在新版本携带，旧备份不含该字段
  *  （不传 meta 时产物与旧版逐字节一致，保证格式向后兼容） */
-export function buildPayload(root, relFiles, meta) {
+export function buildPayload(root, relFiles, meta, appDataFiles) {
   const files = []
   for (const rel of relFiles) {
     const buf = readFileSync(join(root, rel))
+    files.push({ path: rel, sha256: createHash('sha256').update(buf).digest('hex'), data: buf.toString('base64') })
+  }
+  // AppData 应用设置：以 __appdata__/ 前缀并入同一 payload，恢复时由 extractPayload 写回原位
+  for (const rel of (appDataFiles || [])) {
+    const abs = appDataAbsPath(rel)
+    if (!abs) continue
+    let buf
+    try { buf = readFileSync(abs) } catch (e) { continue }
     files.push({ path: rel, sha256: createHash('sha256').update(buf).digest('hex'), data: buf.toString('base64') })
   }
   const obj = meta ? { files, meta } : { files }
@@ -160,7 +240,8 @@ export function extractPayload(payload, root) {
   let count = 0
   for (const f of (parsed.files || [])) {
     if (!isSafeRelPath(f.path)) continue
-    const abs = join(root, f.path)
+    const abs = f.path.startsWith(APPDATA_PREFIX) ? appDataAbsPath(f.path) : join(root, f.path)
+    if (!abs) continue
     mkdirSync(dirname(abs), { recursive: true })
     const buf = Buffer.from(f.data, 'base64')
     const sha = createHash('sha256').update(buf).digest('hex')
@@ -193,6 +274,16 @@ export function makeSnapshot(root, snapshotRoot, keep, date) {
     mkdirSync(dirname(target), { recursive: true })
     copyFileSync(join(root, rel), target)
   }
+  // AppData 应用设置一并进快照，保证回滚语义与备份一致
+  for (const rel of collectAppDataFiles()) {
+    const abs = appDataAbsPath(rel)
+    if (!abs) continue
+    const target = join(dest, rel)
+    try {
+      mkdirSync(dirname(target), { recursive: true })
+      copyFileSync(abs, target)
+    } catch (e) { /* 单文件失败不阻断快照 */ }
+  }
   // 只保留最近 keep 份
   let olds = readdirSync(snapshotRoot).filter((n) => { try { return statSync(join(snapshotRoot, n)).isDirectory() } catch (e) { return false } }).sort()
   while (olds.length > keep) {
@@ -214,7 +305,8 @@ export function rollbackFromSnapshot(snapshotDir, root, snapshotRoot, keep) {
       if (ent.isDirectory()) walk(abs, rel)
       else if (ent.isFile()) {
         if (!isSafeRelPath(rel)) continue
-        const target = join(root, rel)
+        const target = rel.startsWith(APPDATA_PREFIX) ? appDataAbsPath(rel) : join(root, rel)
+        if (!target) continue
         mkdirSync(dirname(target), { recursive: true })
         copyFileSync(abs, target)   // 已存在则覆盖；不存在则新建。root 里其余条目不动。
         count++
@@ -1017,7 +1109,8 @@ export function apply(ctx, config) {
     const passphrase = String(body.passphrase || '')
     if (!passphrase) return { ok: false, error: 'passphrase 不能为空' }
     const relFiles = collectFiles(dshRoot)
-    const payload = buildPayload(dshRoot, relFiles, collectInstallMeta(dshRoot, cfg.profile))
+    const appDataFiles = collectAppDataFiles()
+    const payload = buildPayload(dshRoot, relFiles, collectInstallMeta(dshRoot, cfg.profile), appDataFiles)
     const bundle = encryptBundle(payload, passphrase)
     const name = bundleName()
     const url = remoteDirUrl(c, name)
@@ -1029,7 +1122,7 @@ export function apply(ctx, config) {
     if (res.status !== 200 && res.status !== 201 && res.status !== 204) {
       return { ok: false, error: 'PUT 失败（HTTP ' + res.status + '）' }
     }
-    log('backup uploaded: ' + name + ' (' + bundle.length + ' bytes, ' + relFiles.length + ' files)')
+    log('backup uploaded: ' + name + ' (' + bundle.length + ' bytes, ' + relFiles.length + ' files + ' + appDataFiles.length + ' appdata files)')
     return { ok: true, name, size: bundle.length, fileCount: relFiles.length }
   }
 

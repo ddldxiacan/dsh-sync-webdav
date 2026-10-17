@@ -118,12 +118,14 @@ git push origin main --tags
 打包 `~/.dsh` 下**除以下之外**的全部内容：
 
 - `dsh-runtimes/`（Node 运行时，体积大且与机器架构相关）
-- `node_modules/`（插件依赖，**实测 221MB**，可由 pnpm 重装）
-- `sessions/`（会话历史，**实测 27MB**，属可再生的使用记录）
+- `node_modules/`（插件依赖，**实测 800MB+**，可由 pnpm 重装）
+- `sessions/`（会话历史，属可再生的使用记录，**这是唯一不同步的对话数据**）
 - `logs/`、`npm-cache/`、`tmp*/`、`cache*/`
-- 单个大于 10MB 的文件
+- 单个大于 50MB 的文件
 
-实测效果：`~/.dsh` 共 258MB / 18918 个文件 → 备份 **11.5MB / 126 个文件**，耗时约 180ms。
+**v0.3.0 起额外同步 Electron 应用级设置**：`%APPDATA%\@deepseek-ai\dsh-desktop\desktop\settings.json` 等用户配置文件，以 `__appdata__/` 前缀并入同一加密备份，恢复/回滚时自动写回原位（Chromium 缓存类目录与 >2MB 文件仍排除，不撑大备份）。
+
+账号凭据（`.credentials.yaml`）、各插件配置（`cordis.yml`/`package.json`/`.plugin-manager`）、agent-presets、task-board、skins、附件等**全部在同步范围内**——只有聊天对话（`sessions/`）与可重建产物（`node_modules/`、运行时）不打包。
 
 > 排除 `node_modules` 与 `sessions` 不只是为了省空间：它们在 base64 封装后会让 payload 达到 350MB+，加上序列化副本会**直接把 Node 堆撑爆**（实测 OOM）。这两项都是可重建的产物，不属于配置。
 
@@ -228,7 +230,7 @@ header: { version, salt(b64), iv(b64), tag(b64), payloadSha256 }
 node tools-selftest.mjs
 ```
 
-预期 `88 passed, 0 failed`。覆盖：排除规则（含 `node_modules`/`sessions` 回归断言）、加解密往返、错误口令与篡改拒绝、打包/解包、备份 `meta` 与旧备份向后兼容、快照与回滚（含「`dsh-runtimes/` 必须在回滚后存活」的回归断言）、路径穿越防护、`link:` → 仓库 spec 改写、**B 机恢复 E2E**（A 机备份 → B 机恢复 → 重装插件依赖）、**异步 runner 不阻塞事件循环**（含「源码中不得出现 `spawnSync(`」防退化护栏），以及一个内置 mock WebDAV 服务器上的 Basic Auth / MKCOL / PUT / GET / PROPFIND 全链路。
+预期自测全绿（`0 failed`）。覆盖：排除规则（含 `node_modules`/`sessions` 回归断言）、加解密往返、错误口令与篡改拒绝、打包/解包、备份 `meta` 与旧备份向后兼容、快照与回滚（含「`dsh-runtimes/` 必须在回滚后存活」的回归断言）、路径穿越防护、`link:` → 仓库 spec 改写、**B 机恢复 E2E**（A 机备份 → B 机恢复 → 重装插件依赖）、**异步 runner 不阻塞事件循环**（含「源码中不得出现 `spawnSync(`」防退化护栏），以及一个内置 mock WebDAV 服务器上的 Basic Auth / MKCOL / PUT / GET / PROPFIND 全链路。
 
 ## 已知限制
 

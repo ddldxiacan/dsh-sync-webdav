@@ -1,7 +1,7 @@
 {
   "name": "dsh-sync-webdav",
-  "version": "0.2.1",
-  "description": "DSH WebDAV 配置同步插件：把 ~/.dsh 加密备份到 WebDAV，支持跨机器恢复与快照回滚",
+  "version": "0.3.0",
+  "description": "DSH WebDAV 配置同步插件：把 ~/.dsh 与应用级设置加密备份到 WebDAV，支持跨机器恢复与快照回滚",
   "type": "module",
   "license": "MIT",
   "keywords": [
