@@ -234,14 +234,34 @@ function isSafeRelPath(p) {
   return true
 }
 
-/** 把明文 payload 解包写入 root；返回文件数 */
-export function extractPayload(payload, root) {
+/**
+ * 把明文 payload 解包写入 root。返回 { count, skipped, verified, mismatches }：
+ *   count      实际写入的文件数
+ *   skipped    因路径不安全/无法解析而跳过的条目 [{ path, reason }]（正常备份恒为空，
+ *              出现即表示备份内容异常，调用方必须向用户明示，不得当作无事发生）
+ *   verified   写入后逐文件回读并通过 SHA-256 校验的数量
+ *   mismatches 写入后回读校验失败的条目 [{ path, reason }]（写入层异常，极罕见）
+ * 单个条目内容校验失败仍抛错：那是备份损坏/被篡改的信号，必须中断而不是静默跳过。
+ */
+export function extractPayloadDetailed(payload, root) {
   const parsed = JSON.parse(payload.toString('utf8'))
+  const files = Array.isArray(parsed.files) ? parsed.files : []
   let count = 0
-  for (const f of (parsed.files || [])) {
-    if (!isSafeRelPath(f.path)) continue
+  const skipped = []
+  for (const f of files) {
+    if (!f || typeof f.path !== 'string' || !f.path) {
+      skipped.push({ path: (f && f.path) ? String(f.path) : '(无路径)', reason: '条目缺少有效路径' })
+      continue
+    }
+    if (!isSafeRelPath(f.path)) {
+      skipped.push({ path: f.path, reason: '路径不安全（含 ..、盘符或绝对路径）' })
+      continue
+    }
     const abs = f.path.startsWith(APPDATA_PREFIX) ? appDataAbsPath(f.path) : join(root, f.path)
-    if (!abs) continue
+    if (!abs) {
+      skipped.push({ path: f.path, reason: '无法解析到本地路径' })
+      continue
+    }
     mkdirSync(dirname(abs), { recursive: true })
     const buf = Buffer.from(f.data, 'base64')
     const sha = createHash('sha256').update(buf).digest('hex')
@@ -249,7 +269,29 @@ export function extractPayload(payload, root) {
     writeFileSync(abs, buf)
     count++
   }
-  return count
+  let verified = 0
+  const mismatches = []
+  for (const f of files) {
+    if (!f || typeof f.path !== 'string' || !f.path || !isSafeRelPath(f.path)) continue
+    const abs = f.path.startsWith(APPDATA_PREFIX) ? appDataAbsPath(f.path) : join(root, f.path)
+    if (!abs) continue
+    let onDisk
+    try {
+      onDisk = readFileSync(abs)
+    } catch (e) {
+      mismatches.push({ path: f.path, reason: '回读失败: ' + e.message })
+      continue
+    }
+    const sha = createHash('sha256').update(onDisk).digest('hex')
+    if (sha === f.sha256) verified++
+    else mismatches.push({ path: f.path, reason: '写入后内容不一致' })
+  }
+  return { count, skipped, verified, mismatches }
+}
+
+/** 把明文 payload 解包写入 root；返回文件数（旧调用方兼容入口） */
+export function extractPayload(payload, root) {
+  return extractPayloadDetailed(payload, root).count
 }
 
 /** 备份文件名 */
@@ -1140,11 +1182,12 @@ export function apply(ctx, config) {
     const url = remoteDirUrl(c, name)
     const res = await davRequest(url, 'GET', { username: c.username, password: c.password, timeoutMs: 120000 })
     if (res.status !== 200) return { ok: false, error: 'GET 失败（HTTP ' + res.status + '）' }
+    // 先解密校验（口令错误/内容损坏在这里就明确报错，绝不在解包中途才炸）
     const payload = decryptBundle(res.body, passphrase)
     // 恢复前先本地快照（安全性快照，本身就是回滚目标）
     lastLocalSnapshot = makeSnapshot(dshRoot, snapshotRoot, SNAPSHOT_KEEP)
     // 只覆盖：备份里没有的现有文件（含 dsh-runtimes/ 等排除项）一律保留
-    const count = extractPayload(payload, dshRoot)
+    const r = extractPayloadDetailed(payload, dshRoot)
     // 记录本次恢复的插件依赖映射，供设置卡片上的「重装插件依赖」按钮使用。
     // 刻意不在此处自动跑 pnpm install：恢复流程只做文件覆盖，安装由用户点击触发。
     const meta = extractPayloadMeta(payload)
@@ -1154,9 +1197,17 @@ export function apply(ctx, config) {
         profile: meta.profile || cfg.profile, linkMap: meta.linkMap || {},
       })
     }
-    log('restored ' + name + ': ' + count + ' files (snapshot ' + lastLocalSnapshot + ')' +
+    log('restored ' + name + ': ' + r.count + ' files, verified ' + r.verified +
+        (r.skipped.length ? ', skipped ' + r.skipped.length : '') +
+        (r.mismatches.length ? ', mismatches ' + r.mismatches.length : '') +
+        ' (snapshot ' + lastLocalSnapshot + ')' +
         (meta ? ', install meta captured' : ', no install meta in bundle'))
-    return { ok: true, restored: count, snapshot: lastLocalSnapshot, meta: meta ? { profile: meta.profile, linkCount: Object.keys(meta.linkMap || {}).length } : undefined }
+    return {
+      ok: true, restored: r.count, verified: r.verified,
+      skipped: r.skipped, mismatches: r.mismatches,
+      snapshot: lastLocalSnapshot,
+      meta: meta ? { profile: meta.profile, linkCount: Object.keys(meta.linkMap || {}).length } : undefined,
+    }
   }
 
   const handleRollback = async (body) => {

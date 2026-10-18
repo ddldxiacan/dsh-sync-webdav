@@ -11,6 +11,7 @@ import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import {
   buildPayload, collectFiles, encryptBundle, decryptBundle, extractPayload,
+  extractPayloadDetailed,
   isExcludedAppData, collectAppDataFiles, appDataAbsPath,
   bundleName, makeSnapshot, rollbackFromSnapshot, isExcluded,
   davRequest, ensureRemoteDir, parsePropfind, listRemoteBackups,
@@ -109,6 +110,9 @@ try {
   check('extractPayload file count', count === files.length, count + ' files')
   check('content roundtrip', readFileSync(join(restored, 'sub', 'deeper', 'note.txt'), 'utf8') === 'hello dsh-sync')
   check('excluded files not in bundle', !existsSync(join(restored, 'dsh-runtimes')) && !existsSync(join(restored, 'logs')))
+  const detail = extractPayloadDetailed(dec, restored)
+  check('extractPayloadDetailed: 正常解包无跳过、写入后全量校验通过', detail.skipped.length === 0 && detail.mismatches.length === 0 && detail.verified === detail.count && detail.count === files.length,
+    'count=' + detail.count + ' verified=' + detail.verified)
 
   // ---------- 3b. extractPayload 路径穿越防护 ----------
   {
@@ -127,6 +131,11 @@ try {
     const okCount = extractPayload(evilPayload, evilRoot)
     check('extractPayload rejects traversal/absolute paths', okCount === 1, 'accepted=' + okCount)
     check('extractPayload wrote only the safe file', existsSync(join(evilRoot, 'ok.txt')))
+    const evilDetail = extractPayloadDetailed(evilPayload, evilRoot)
+    check('extractPayloadDetailed: 7 条非法路径全部入 skipped 清单', evilDetail.skipped.length === 7 && evilDetail.count === 1,
+      'skipped=' + evilDetail.skipped.length + ' count=' + evilDetail.count)
+    check('extractPayloadDetailed: 安全文件写入后校验通过', evilDetail.verified === 1 && evilDetail.mismatches.length === 0,
+      'verified=' + evilDetail.verified)
   }
 
   // ---------- 4. 快照/回滚往返 ----------
@@ -141,7 +150,9 @@ try {
   check('rollback does NOT delete files outside snapshot', existsSync(join(root, 'added.txt')))
   check('rollback preserves excluded dsh-runtimes (regression: ~/.dsh/dsh-runtimes must survive)', existsSync(join(root, 'dsh-runtimes', 'node.exe')) && readFileSync(join(root, 'dsh-runtimes', 'node.exe'), 'utf8') === 'fake-binary')
   check('rollback preserves excluded logs/', existsSync(join(root, 'logs', 'a.log')))
-  check('rollback returns file count', rcount === 4, 'count=' + rcount + ' snapBeforeRollback=' + taken)
+  // 有真实 AppData settings.json 的环境，快照里会多一条 __appdata__ 条目 —— 计数随环境变化，只断言主体文件数
+  const expectedRollbackCount = 4 + collectAppDataFiles().length
+  check('rollback returns file count', rcount === expectedRollbackCount, 'count=' + rcount + ' expected=' + expectedRollbackCount + ' snapBeforeRollback=' + taken)
 
   // 只覆盖语义下，快照里的内容仍须被还原（再次改动后回滚）
   writeFileSync(join(root, 'settings.json'), '{"a":12345}')

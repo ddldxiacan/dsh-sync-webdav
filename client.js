@@ -47,7 +47,7 @@ window.__ModuleLoader__.load({
     const PREFIX = 'dsh-sync';
 
     /** 端点不可达 / 未注册（插件 Host 半区未加载或未注册路由）时的统一文案。 */
-    const NOT_READY = '插件服务未就绪';
+    const NOT_READY = '插件服务未就绪：请确认本机已安装 dsh-sync-webdav 插件（与备份同版本）并重启 DeepSeek Harness';
 
     const CONFIG_FIELDS = [
       { key: 'url', label: 'WebDAV URL', placeholder: 'https://dav.example.com/dav/', type: 'text' },
@@ -458,7 +458,7 @@ window.__ModuleLoader__.load({
         await refresh({ silent: true });
       };
 
-      /** 恢复入口：先弹确认（提示会先自动快照现有配置） */
+      /** 恢复入口：先弹确认（提示会先自动快照现有配置，恢复后需重启才生效） */
       const askRestore = (name) => {
         setConfirm({
           title: '确认恢复',
@@ -466,6 +466,10 @@ window.__ModuleLoader__.load({
             h('div', null, name ? '将从远端备份恢复：' : '将从远端最新备份恢复。'),
             name ? h('div', { className: PREFIX + '-item-name' }, name) : null,
             h('div', null, '恢复前会自动为当前配置创建一份本地快照，可用它回滚。'),
+            h('div', { className: PREFIX + '-warn' },
+              h('div', { className: PREFIX + '-warn-title' }, '恢复完成后必须重启 DeepSeek Harness 才会生效'),
+              h('div', null, '恢复只写配置不重启：备份里没有插件代码（node_modules），本插件与其它插件要重启后才能加载。'),
+            ),
           ),
           confirmLabel: '恢复',
           run: () => doRestore(name),
@@ -487,8 +491,28 @@ window.__ModuleLoader__.load({
           // 备份里没有 node_modules：恢复后插件只剩配置，这里立刻刷新插件状态
           const plug = await refreshPlugins();
           if (!mountedRef.current) return;
-          setMsg({ kind: 'ok', text: '已恢复 ' + (d.restored || 0) + ' 个文件，快照：' + (d.snapshot || '—') +
-            (plug && plug.needsInstall ? ' 注意：插件代码尚未安装，请点击下方「重装插件」。' : '') });
+          const skipped = Array.isArray(d.skipped) ? d.skipped : [];
+          const mismatch = Array.isArray(d.mismatches) ? d.mismatches : [];
+          const parts = [];
+          if (d.restored > 0 && d.verified === d.restored && !skipped.length && !mismatch.length) {
+            parts.push('已恢复 ' + d.restored + ' 个文件（逐文件校验通过），快照：' + (d.snapshot || '—'));
+          } else {
+            if (d.restored > 0) parts.push('已写入 ' + d.restored + ' 个文件，校验通过 ' + (d.verified || 0) + ' 个');
+            else parts.push('恢复没有写入任何文件');
+            parts.push('快照：' + (d.snapshot || '—'));
+          }
+          if (skipped.length) {
+            parts.push('有 ' + skipped.length + ' 个条目被跳过：' +
+              skipped.slice(0, 5).map((s) => (s && s.path ? s.path : '?') + '（' + (s && s.reason ? s.reason : '?') + '）').join('、') +
+              (skipped.length > 5 ? ' 等' : ''));
+          }
+          if (mismatch.length) {
+            parts.push('有 ' + mismatch.length + ' 个文件写入校验失败：' +
+              mismatch.slice(0, 5).map((m) => (m && m.path ? m.path : '?')).join('、') +
+              (mismatch.length > 5 ? ' 等' : ''));
+          }
+          parts.push((plug && plug.needsInstall) ? '插件代码尚未安装，请点击下方「重装插件」。' : '请重启 DeepSeek Harness 使恢复生效。');
+          setMsg({ kind: skipped.length || mismatch.length || !(d.verified === d.restored) ? 'error' : 'ok', text: '恢复完成：' + parts.join(' ') });
         }
         await refresh({ silent: true });
       };

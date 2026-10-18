@@ -13,7 +13,7 @@
 
 [CmdletBinding()]
 param(
-    [string]$RepoUrl   = 'https://github.com/ddldxiacan/dsh-sync-release.git',
+    [string]$RepoUrl   = 'git@github.com:ddldxiacan/dsh-sync-webdav.git',
     [string]$GitExe    = 'D:\Program Files\Git\cmd\git.exe',
     [string]$Branch    = 'main'
 )
