@@ -33,7 +33,7 @@ import {
   rmSync, statSync, writeFileSync,
 } from 'node:fs'
 import { homedir } from 'node:os'
-import { dirname, isAbsolute, join } from 'node:path'
+import { dirname, isAbsolute, join, relative, resolve } from 'node:path'
 import http from 'node:http'
 import https from 'node:https'
 import { fileURLToPath } from 'node:url'
@@ -1090,6 +1090,194 @@ export async function performVersionCheck(current, slug, opts) {
   return { ...out }
 }
 
+/** 云端备份文件名。只允许插件自己写出的名字，避免 DELETE 打到目录里的其它对象。 */
+export function isSafeBackupName(name) {
+  return typeof name === 'string' && /^dsh-sync-\d{8}-\d{6}\.bundle$/.test(name)
+}
+
+/** 从绝对路径里取出 `/.dsh/` 之后的那段（换电脑后用户名、盘符都变了，只有这段还在）。 */
+export function dshPathSuffix(absPath) {
+  const norm = String(absPath || '').replace(/\\/g, '/')
+  const key = '/.dsh/'
+  const idx = norm.toLowerCase().lastIndexOf(key)
+  if (idx < 0) return null
+  return norm.slice(idx + key.length)
+}
+
+function specKindAndTarget(spec) {
+  const m = /^(link|file|portal):(.*)$/i.exec(String(spec || ''))
+  if (!m) return null
+  return { kind: m[1].toLowerCase(), target: m[2] }
+}
+
+/** link:/file:/portal: 的目标落到本机的绝对路径。相对路径相对 profile 目录。 */
+export function resolveDepTarget(spec, profileDir) {
+  const parsed = specKindAndTarget(spec)
+  if (!parsed) return null
+  const target = parsed.target
+  if (isAbsolute(target) || /^[A-Za-z]:[\\/]/.test(target)) return target
+  return join(profileDir, ...target.split(/[\\/]/).filter((s) => s && s !== '.'))
+}
+
+function isInsideDir(root, target) {
+  const rel = relative(resolve(root), resolve(target))
+  return rel === '' || (!rel.startsWith('..') && !isAbsolute(rel))
+}
+
+/**
+ * 把指向「某台电脑 ~/.dsh 里面」的 file:/link: 改成相对当前 profile 的路径。
+ * 文件必须已经在这台电脑的 ~/.dsh 里（恢复刚写完，或本来就在）。
+ * 指到 ~/.dsh 外面的 link:（例如开发目录）不在这里改，交给 linkMap。
+ * 改不了时返回 null。
+ */
+export function retargetDependencySpec(spec, profileDir, dshRoot) {
+  const parsed = specKindAndTarget(spec)
+  if (!parsed) return null
+  const suffix = dshPathSuffix(parsed.target)
+  if (!suffix) return null
+  if (suffix.split('/').some((s) => s === '' || s === '.' || s === '..')) return null
+  const abs = join(dshRoot, ...suffix.split('/'))
+  if (!isInsideDir(dshRoot, abs) || !existsSync(abs)) return null
+  const rel = relative(profileDir, abs).replace(/\\/g, '/')
+  if (!rel || isAbsolute(rel)) return null
+  const next = parsed.kind + ':' + rel
+  const prev = String(spec).replace(/\\/g, '/')
+  return next === prev ? null : next
+}
+
+function yamlUnquote(raw) {
+  let body = String(raw || '').trim()
+  const hash = body.indexOf(' #')
+  if (hash >= 0) body = body.slice(0, hash).trim()
+  if (body.length >= 2 && ((body.startsWith("'") && body.endsWith("'")) || (body.startsWith('"') && body.endsWith('"')))) {
+    return body.slice(1, -1).replace(/''/g, "'")
+  }
+  return body
+}
+
+function yamlSingleQuote(s) {
+  return "'" + String(s).replace(/'/g, "''") + "'"
+}
+
+function pathsEqual(a, b) {
+  return String(a || '').replace(/\\/g, '/').replace(/\/+$/, '').toLowerCase() ===
+    String(b || '').replace(/\\/g, '/').replace(/\/+$/, '').toLowerCase()
+}
+
+function isUnderDir(file, dir) {
+  const a = String(file || '').replace(/\\/g, '/').replace(/\/+$/, '').toLowerCase()
+  const d = String(dir || '').replace(/\\/g, '/').replace(/\/+$/, '').toLowerCase()
+  return !!d && (a === d || a.startsWith(d + '/'))
+}
+
+function readStoreDirFromModules(profileDir) {
+  try {
+    const text = readFileSync(join(profileDir, 'node_modules', '.modules.yaml'), 'utf8')
+    const m = /^storeDir:\s*(.+)$/m.exec(text)
+    return m ? yamlUnquote(m[1]) : null
+  } catch (e) { return null }
+}
+
+/**
+ * 把一个 profile 里「只在源机器上成立」的路径改成这台电脑能用的路径。
+ * - package.json / pnpm-lock.yaml 里指向 ~/.dsh 内部的 file:、link:
+ * - pnpm-workspace.yaml 的 storeDir。源机器写死的 store 会让这台电脑的
+ *   `pnpm install` 整批失败（路径不存在，或和已有 node_modules 的 store 不一致），
+ *   于是 package.json 里列出的插件全部变成「包不可用」。
+ * 已有 node_modules/.modules.yaml 时，storeDir 以它为准，避免 ERR_PNPM_UNEXPECTED_STORE。
+ */
+export function portabilizeProfile(profileDir, dshRoot, opts) {
+  const o = opts || {}
+  const home = o.home || homedir()
+  const rewritten = []
+  const replacements = []
+  const pkgFile = join(profileDir, 'package.json')
+  let pkg = null
+  try { pkg = JSON.parse(readFileSync(pkgFile, 'utf8')) } catch (e) { pkg = null }
+  if (pkg && pkg.dependencies && typeof pkg.dependencies === 'object') {
+    let changed = false
+    for (const [name, spec] of Object.entries(pkg.dependencies)) {
+      const next = retargetDependencySpec(spec, profileDir, dshRoot)
+      if (!next) continue
+      replacements.push({ from: String(spec), to: next })
+      rewritten.push({ name, from: String(spec), to: next })
+      pkg.dependencies[name] = next
+      changed = true
+    }
+    if (changed) writeJsonFile(pkgFile, pkg)
+  }
+  try {
+    const lockFile = join(profileDir, 'pnpm-lock.yaml')
+    let lock = readFileSync(lockFile, 'utf8')
+    let lockChanged = false
+    for (const r of replacements) {
+      if (!lock.includes(r.from)) continue
+      lock = lock.split(r.from).join(r.to)
+      lockChanged = true
+    }
+    if (lockChanged) writeFileSync(lockFile, lock, 'utf8')
+  } catch (e) { /* 没有锁文件就跳过 */ }
+
+  let storeDir = null
+  try {
+    const wsFile = join(profileDir, 'pnpm-workspace.yaml')
+    const text = readFileSync(wsFile, 'utf8')
+    const m = /^storeDir:\s*(.+)$/m.exec(text)
+    if (m) {
+      const current = yamlUnquote(m[1])
+      const fromModules = readStoreDirFromModules(profileDir)
+      let next = null
+      if (fromModules && !pathsEqual(fromModules, current)) next = fromModules
+      else if (!fromModules && (!isUnderDir(current, home) || !existsSync(current))) {
+        next = join(home, '.pnpm', 'store', 'v11')
+      }
+      if (next && !pathsEqual(next, current)) {
+        writeFileSync(wsFile, text.replace(/^storeDir:\s*.+$/m, 'storeDir: ' + yamlSingleQuote(next)), 'utf8')
+        storeDir = { from: current, to: next }
+      }
+    }
+  } catch (e) { /* 没有 workspace 文件就跳过 */ }
+  return { rewritten, storeDir }
+}
+
+/** 恢复之后扫一遍每个 profile，把源机器的绝对路径改到这台电脑。 */
+export function portabilizeRestoredTree(dshRoot, opts) {
+  const profilesDir = join(dshRoot, 'profiles')
+  const profiles = []
+  let names = []
+  try { names = readdirSync(profilesDir) } catch (e) { names = [] }
+  for (const name of names) {
+    const dir = join(profilesDir, name)
+    try { if (!statSync(dir).isDirectory()) continue } catch (e) { continue }
+    if (!existsSync(join(dir, 'package.json'))) continue
+    profiles.push({ name, ...portabilizeProfile(dir, dshRoot, opts) })
+  }
+  return { profiles }
+}
+
+/** 按名字删除远端 .bundle。非法名字拒绝，404 视为已经不在。 */
+export async function deleteRemoteBackups(cfg, names) {
+  const deleted = []
+  const failed = []
+  const list = Array.isArray(names) ? names : []
+  for (const name of list) {
+    if (!isSafeBackupName(name)) {
+      failed.push({ name: String(name), error: '备份名称非法' })
+      continue
+    }
+    let res
+    try {
+      res = await davRequest(remoteDirUrl(cfg, name), 'DELETE', { username: cfg.username, password: cfg.password })
+    } catch (e) {
+      failed.push({ name, error: e && e.message ? e.message : String(e) })
+      continue
+    }
+    if (res.status === 200 || res.status === 204 || res.status === 404) deleted.push(name)
+    else failed.push({ name, error: 'HTTP ' + res.status })
+  }
+  return { deleted, failed }
+}
+
 /**
  * 读取 profile 的 package.json，生成安装方案（不改文件）。
  * @returns {{ ok:boolean, error?:string, profileDir?, file?, deps?:Array, rewrite?, remove?:Array }}
@@ -1111,10 +1299,11 @@ export function planProfileInstall(profileDir, linkMap) {
     const kind = depKind(spec)
     const item = { name, spec, kind }
     if (kind === 'link') {
-      // 相对路径（在 B 机上可能同样有效）保持原样；只改绝对路径等无法解析的
-      const target = String(spec).replace(/^(link|file|portal):/i, '')
-      const localish = !isAbsolute(target) && !/^[A-Za-z]:/.test(target)
-      if (localish && existsSync(join(profileDir, target))) {
+      // 目标在这台电脑上真实存在就保留（含恢复后改写好的 file:../../local-packages/…）。
+      // 不能因为包里写了 repository.url 就改成 github:——那会丢掉本机打过补丁的 tarball，
+      // 而且一个失效的绝对路径会让整次 pnpm install 失败，其它插件一起变成「包不可用」。
+      const resolved = resolveDepTarget(spec, profileDir)
+      if (resolved && existsSync(resolved)) {
         item.kept = true
       } else {
         // 优先用备份里记录的映射：B 机上 node_modules 尚未重建，本地推导不出仓库地址。
@@ -1271,23 +1460,37 @@ export function apply(ctx, config) {
 
   // ---- 各端点处理逻辑（与路由解耦，便于复用） ----
 
+  // 设置页要原样回显已保存的配置。密码本来就写在本机 dsh-sync.json 里，只回给本机页面。
+  const savedConfigView = (c) => {
+    if (!c) return null
+    return {
+      url: String(c.url || ''),
+      username: String(c.username || ''),
+      password: String(c.password || ''),
+      remoteDir: String(c.remoteDir || ''),
+      hasPassword: !!c.password,
+    }
+  }
+
   const handleStatus = async () => {
     const c = loadPluginConfig()
-    if (!c) return { configured: false, remote: { reachable: false, backups: [] }, lastLocalSnapshot: lastLocalSnapshot || undefined }
+    const config = savedConfigView(c)
+    if (!c) return { configured: false, config, remote: { reachable: false, backups: [] }, lastLocalSnapshot: lastLocalSnapshot || undefined }
     try {
       const err = await ensureRemoteDir(c)
       if (err) {
-        return { configured: true, remote: { reachable: false, backups: [] }, lastLocalSnapshot: lastLocalSnapshot || undefined, error: err }
+        return { configured: true, config, remote: { reachable: false, backups: [] }, lastLocalSnapshot: lastLocalSnapshot || undefined, error: err }
       }
       const backups = await listRemoteBackups(c)
       return {
         configured: true,
+        config,
         remote: { reachable: true, backups, latest: backups.length ? backups[backups.length - 1].name : undefined },
         lastLocalSnapshot: lastLocalSnapshot || undefined,
       }
     } catch (e) {
       return {
-        configured: true, remote: { reachable: false, backups: [] },
+        configured: true, config, remote: { reachable: false, backups: [] },
         lastLocalSnapshot: lastLocalSnapshot || undefined,
         error: e && e.message ? e.message : String(e),
       }
@@ -1365,8 +1568,14 @@ export function apply(ctx, config) {
     lastLocalSnapshot = makeSnapshot(dshRoot, snapshotRoot, SNAPSHOT_KEEP)
     // 只覆盖：备份里没有的现有文件（含 dsh-runtimes/ 等排除项）一律保留
     const r = extractPayloadDetailed(payload, dshRoot)
-    // 记录本次恢复的插件依赖映射，供设置卡片上的「重装插件依赖」按钮使用。
-    // 刻意不在此处自动跑 pnpm install：恢复流程只做文件覆盖，安装由用户点击触发。
+    // 源机器的 file: 绝对路径和 pnpm storeDir 在这台电脑上不存在。不改的话，
+    // 接下来的 pnpm install 会整批失败，package.json 里的插件全部显示「包不可用」。
+    let portability = { profiles: [] }
+    try { portability = portabilizeRestoredTree(dshRoot) } catch (e) {
+      log('portabilize failed: ' + (e && e.message ? e.message : String(e)))
+    }
+    // 记录本次恢复的插件依赖映射。安装本身由设置页在恢复成功后自动触发
+    // （pnpm 可能要几分钟，不放在这条请求里，避免和「先写完文件」缠在一起）。
     const meta = extractPayloadMeta(payload)
     if (meta) {
       writeLastRestore(dshRoot, {
@@ -1374,16 +1583,37 @@ export function apply(ctx, config) {
         profile: meta.profile || cfg.profile, linkMap: meta.linkMap || {},
       })
     }
+    const rewrittenN = (portability.profiles || []).reduce((n, p) => n + ((p.rewritten && p.rewritten.length) || 0), 0)
     log('restored ' + name + ': ' + r.count + ' files, verified ' + r.verified +
         (r.skipped.length ? ', skipped ' + r.skipped.length : '') +
         (r.mismatches.length ? ', mismatches ' + r.mismatches.length : '') +
         ' (snapshot ' + lastLocalSnapshot + ')' +
-        (meta ? ', install meta captured' : ', no install meta in bundle'))
+        (meta ? ', install meta captured' : ', no install meta in bundle') +
+        (rewrittenN ? ', retargeted ' + rewrittenN + ' local specs' : ''))
     return {
       ok: true, restored: r.count, verified: r.verified,
       skipped: r.skipped, mismatches: r.mismatches,
       snapshot: lastLocalSnapshot,
+      portability,
       meta: meta ? { profile: meta.profile, linkCount: Object.keys(meta.linkMap || {}).length } : undefined,
+    }
+  }
+
+  const handleDelete = async (body) => {
+    const c = loadPluginConfig()
+    if (!c) return { ok: false, error: '尚未配置 WebDAV' }
+    const names = Array.isArray(body.names) ? body.names : (body.name ? [String(body.name)] : [])
+    if (!names.length) return { ok: false, error: '请指定要删除的备份' }
+    const { deleted, failed } = await deleteRemoteBackups(c, names)
+    if (deleted.length) log('remote delete: ' + deleted.join(', '))
+    if (failed.length) log('remote delete failed: ' + failed.map((f) => f.name + ' ' + f.error).join('; '))
+    return {
+      ok: failed.length === 0 && deleted.length > 0,
+      deleted,
+      failed,
+      error: failed.length
+        ? failed.map((f) => f.name + '：' + f.error).join('；')
+        : (deleted.length ? undefined : '没有删除任何备份'),
     }
   }
 
@@ -1465,6 +1695,14 @@ export function apply(ctx, config) {
    *  字段形状遵循 client.js 头部契约：missing 是包名数组，deps[].installed 是布尔值。 */
   const buildPluginsReport = () => {
     const prof = resolveProfile()
+    // 已经恢复过的机器打开设置页时也要改路径，否则用户不重新恢复就一直装不上
+    try {
+      const fixed = portabilizeProfile(prof.dir, dshRoot)
+      if ((fixed.rewritten && fixed.rewritten.length) || fixed.storeDir) {
+        log('portabilize ' + prof.name + ': specs ' + fixed.rewritten.length +
+          (fixed.storeDir ? ', storeDir retargeted' : ''))
+      }
+    } catch (e) { /* 改路径失败不挡住状态查询 */ }
     // 恢复时记录的映射必须先读：B 机上 node_modules 尚未重建，只能靠备份里的 linkMap
     const last = readLastRestore(dshRoot)
     const plan = planProfileInstall(prof.dir, last && last.linkMap)
@@ -1509,6 +1747,9 @@ export function apply(ctx, config) {
     // 区分「未提供」与「显式传入空值」：测试用 null 模拟找不到 pnpm，不能被 || 吞掉
     const pnpmPath = pnpmPathOpt === undefined ? findPnpmPath(process.resourcesPath) : pnpmPathOpt
     if (!pnpmPath) return { ok: false, error: '未找到 pnpm（期望 resources/runtime/primary-runtime/dependencies/pnpm/bin/pnpm.mjs，或旧路径 runtime/pnpm/bin/pnpm.mjs）' }
+
+    // 0) 先把源机器的绝对路径改到这台电脑，再决定哪些依赖要改写成仓库地址
+    try { portabilizeProfile(prof.dir, dshRoot) } catch (e) { /* 下面的 plan 仍会去掉装不上的 link: */ }
 
     // 1) 把 link:/file: 改写成仓库地址；无法推导的直接移除（宁可少装一个插件也不能让整条 install 失败）
     //    改写规则与 /plugins 报告共用 planProfileInstall，避免两处判断分叉
@@ -1818,6 +2059,7 @@ export function apply(ctx, config) {
     'POST /dsh-sync/backup': handleBackup,
     'POST /dsh-sync/restore': handleRestore,
     'POST /dsh-sync/rollback': handleRollback,
+    'POST /dsh-sync/delete': handleDelete,
     'POST /dsh-sync/plugins/install': (body) => handlePluginInstall(body),
     'POST /dsh-sync/upgrade': handleUpgrade,
   }
@@ -1826,6 +2068,7 @@ export function apply(ctx, config) {
   apply._internals = {
     handlePlugins, handlePluginInstall, buildPluginsReport, resolveProfile, defaultRunner,
     handleVersion, handleUpgrade, inspectSelf, versionCache, runProfileInstall,
+    handleStatus, handleDelete,
   }
 
   const setupRoutes = (routeCtx) => {
@@ -1855,7 +2098,7 @@ export function apply(ctx, config) {
         })
         if (typeof dispose === 'function') cleanupFns.push(dispose)
       }
-      log('HTTP endpoints ready: /dsh-sync/{status,config,backup,restore,rollback,plugins,plugins/install,version,upgrade}')
+      log('HTTP endpoints ready: /dsh-sync/{status,config,backup,restore,rollback,delete,plugins,plugins/install,version,upgrade}')
     } catch (e) {
       log('route registration failed: ' + (e && e.message ? e.message : String(e)))
     }

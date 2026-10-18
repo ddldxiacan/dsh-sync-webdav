@@ -8,11 +8,13 @@
  * 配置文件名、快照目录名仍沿用 `dsh-sync`，改名不影响接口与磁盘布局。
  *
  * 与 Host 半区（index.js）通过 HTTP 端点通信，契约冻结：
- *   GET  /dsh-sync/status                          -> { configured, remote:{reachable,backups[],latest?}, lastLocalSnapshot?, error? }
+ *   GET  /dsh-sync/status                          -> { configured, config:{url,username,password,remoteDir,hasPassword}|null,
+ *                                                        remote:{reachable,backups[],latest?}, lastLocalSnapshot?, error? }
  *   POST /dsh-sync/config   {url,username,password,remoteDir} -> { ok:true } | { ok:false, error }
  *   POST /dsh-sync/backup   {passphrase}            -> { ok:true, name, size, fileCount, scope, pruned } | { ok:false, error }
- *   POST /dsh-sync/restore  {name?, passphrase}     -> { ok:true, restored, snapshot }    | { ok:false, error }
+ *   POST /dsh-sync/restore  {name?, passphrase}     -> { ok:true, restored, snapshot, portability? }    | { ok:false, error }
  *   POST /dsh-sync/rollback {snapshot}              -> { ok:true, restored }              | { ok:false, error }
+ *   POST /dsh-sync/delete   {name}|{names}          -> { ok:true, deleted[] }             | { ok:false, error, deleted?, failed? }
  *   GET  /dsh-sync/plugins                          -> { ok:true, profile, deps[], missing[], needsInstall, pnpm }
  *   POST /dsh-sync/plugins/install {}               -> { ok:true, installed[], rewritten{}, removed[], durationMs, log } | { ok:false, error, log }
  *   GET  /dsh-sync/version[?force=1]                -> { ok:true, current, mode:'dev'|'managed', kind, spec, repo, hasUpdate,
@@ -50,10 +52,10 @@ window.__ModuleLoader__.load({
     const NOT_READY = '插件服务未就绪：请确认本机已安装 dsh-sync-webdav 插件（与备份同版本）并重启 DeepSeek Harness';
 
     const CONFIG_FIELDS = [
-      { key: 'url', label: 'WebDAV URL', placeholder: 'https://dav.example.com/dav/', type: 'text' },
-      { key: 'username', label: '用户名', placeholder: 'user', type: 'text' },
-      { key: 'password', label: '密码', placeholder: '••••••••', type: 'password' },
-      { key: 'remoteDir', label: '远程目录', placeholder: 'dsh-sync', type: 'text' },
+      { key: 'url', label: 'WebDAV URL', placeholder: '例如 https://dav.example.com/dav/', type: 'text' },
+      { key: 'username', label: '用户名', placeholder: '例如 user', type: 'text' },
+      { key: 'password', label: '密码', placeholder: '保存后会回显为圆点', type: 'password' },
+      { key: 'remoteDir', label: '远程目录', placeholder: '例如 dsh-sync', type: 'text' },
     ];
 
     // ============================================================
@@ -199,6 +201,7 @@ window.__ModuleLoader__.load({
       backup: (body) => request('/backup', { method: 'POST', body }),
       restore: (body) => request('/restore', { method: 'POST', body }),
       rollback: (body) => request('/rollback', { method: 'POST', body }),
+      remove: (body) => request('/delete', { method: 'POST', body }),
       // 这两个端点的业务失败也是 HTTP 200，成败要看返回体里的 ok 字段
       plugins: () => request('/plugins'),
       pluginsInstall: (body) => request('/plugins/install', { method: 'POST', body }),
@@ -323,7 +326,7 @@ window.__ModuleLoader__.load({
           h('div', { className: PREFIX + '-modal-body' }, body),
           h('div', { className: PREFIX + '-modal-actions' },
             h(Button, { onClick: onCancel, disabled: busy }, '取消'),
-            h(Button, { variant: 'primary', onClick: onConfirm, disabled: busy, ref }, busy ? '处理中…' : confirmLabel),
+            h(Button, { variant: props.confirmVariant || 'primary', onClick: onConfirm, disabled: busy, ref }, busy ? '处理中…' : confirmLabel),
           ),
         ),
       );
@@ -334,8 +337,11 @@ window.__ModuleLoader__.load({
     // ============================================================
 
     function DshSyncSection() {
-      // 表单：唯一持久化位置是 Host 端配置文件，这里只在内存里持有
+      // 表单：打开页面时从 Host 已保存的配置回填。用户开始改之后不再被刷新覆盖。
       const [form, setForm] = useState({ url: '', username: '', password: '', remoteDir: '' });
+      const formDirtyRef = useRef(false);
+      const installLock = useRef(false);
+      const autoInstallTried = useRef(false);
       // 口令：仅内存，绝不写入任何持久化位置
       const [passphrase, setPassphrase] = useState('');
       const [status, setStatus] = useState(null);
@@ -346,7 +352,7 @@ window.__ModuleLoader__.load({
       // 升级结果：null = 尚未升级过；{ to, log }
       const [upgraded, setUpgraded] = useState(null);
       const [loading, setLoading] = useState(true);
-      const [busy, setBusy] = useState('');           // '' | 'config' | 'backup' | 'restore' | 'rollback' | 'install' | 'refresh' | 'version' | 'upgrade'
+      const [busy, setBusy] = useState('');           // '' | 'config' | 'backup' | 'restore' | 'rollback' | 'delete' | 'install' | 'refresh' | 'version' | 'upgrade'
       const [msg, setMsg] = useState(null);           // { kind, text }
       const [offline, setOffline] = useState(false);
       const [confirm, setConfirm] = useState(null);   // { title, body, confirmLabel, run }
@@ -354,7 +360,22 @@ window.__ModuleLoader__.load({
       const mountedRef = useRef(true);
       useEffect(() => () => { mountedRef.current = false; }, []);
 
-      const setField = (key) => (e) => setForm((f) => ({ ...f, [key]: e.target.value }));
+      const setField = (key) => (e) => {
+        formDirtyRef.current = true;
+        setForm((f) => ({ ...f, [key]: e.target.value }));
+      };
+
+      /** 用状态接口带回的已保存配置填表。用户正在编辑时不覆盖。 */
+      const applySavedConfig = (data) => {
+        const c = data && data.config;
+        if (!c || typeof c !== 'object' || formDirtyRef.current) return;
+        setForm({
+          url: typeof c.url === 'string' ? c.url : '',
+          username: typeof c.username === 'string' ? c.username : '',
+          password: typeof c.password === 'string' ? c.password : '',
+          remoteDir: typeof c.remoteDir === 'string' ? c.remoteDir : '',
+        });
+      };
 
       /** 统一吞掉所有失败：置 offline / 错误提示，绝不抛出。 */
       const consume = useCallback((res, okText) => {
@@ -386,6 +407,7 @@ window.__ModuleLoader__.load({
         if (res.ok) {
           setOffline(false);
           setStatus(res.data || null);
+          applySavedConfig(res.data);
           if (!silent && !res.data ) setMsg({ kind: 'error', text: '状态响应为空' });
         } else if (res.offline) {
           setOffline(true);
@@ -423,9 +445,17 @@ window.__ModuleLoader__.load({
         setVersion((res.ok ? normalizeVersion(res.data) : null));
       }, []);
 
-      // 加载时拉一次状态与插件依赖
+      // 加载时拉一次状态与插件依赖。有「恢复后未安装」就自动装一次。
       useEffect(() => { refresh(); }, [refresh]);
-      useEffect(() => { refreshPlugins(); }, [refreshPlugins]);
+      useEffect(() => {
+        let cancel = false;
+        (async () => {
+          const plug = await refreshPlugins();
+          if (cancel || !mountedRef.current) return;
+          await maybeAutoInstall(plug);
+        })();
+        return () => { cancel = true; };
+      }, [refreshPlugins]);
       // 打开设置页自动检查更新（不带 force，命中宿主缓存即可）
       useEffect(() => { refreshVersion(false, true); }, [refreshVersion]);
 
@@ -439,7 +469,7 @@ window.__ModuleLoader__.load({
         });
         if (!mountedRef.current) return;
         setBusy('');
-        consume(res, '已保存，连接测试通过');
+        if (consume(res, '已保存，连接测试通过')) formDirtyRef.current = false;
         await refresh({ silent: true });
       };
 
@@ -473,7 +503,7 @@ window.__ModuleLoader__.load({
             h('div', null, '恢复前会自动为当前配置创建一份本地快照，可用它回滚。'),
             h('div', { className: PREFIX + '-warn' },
               h('div', { className: PREFIX + '-warn-title' }, '恢复完成后必须重启 DeepSeek Harness 才会生效'),
-              h('div', null, '恢复只写配置不重启：备份里没有插件代码（node_modules），本插件与其它插件要重启后才能加载。'),
+              h('div', null, '备份不含插件代码。恢复后会把源机器的本机路径改成这台电脑可用的路径，并自动安装缺失的插件。安装结束前请不要重启。'),
             ),
           ),
           confirmLabel: '恢复',
@@ -516,8 +546,28 @@ window.__ModuleLoader__.load({
               mismatch.slice(0, 5).map((m) => (m && m.path ? m.path : '?')).join('、') +
               (mismatch.length > 5 ? ' 等' : ''));
           }
-          parts.push((plug && plug.needsInstall) ? '插件代码尚未安装，请点击下方「重装插件」。' : '请重启 DeepSeek Harness 使恢复生效。');
-          setMsg({ kind: skipped.length || mismatch.length || !(d.verified === d.restored) ? 'error' : 'ok', text: '恢复完成：' + parts.join(' ') });
+          const ports = (d.portability && Array.isArray(d.portability.profiles)) ? d.portability.profiles : [];
+          const rewrittenN = ports.reduce((n, p) => n + ((p.rewritten && p.rewritten.length) || 0), 0);
+          const storeN = ports.filter((p) => p && p.storeDir).length;
+          if (rewrittenN) parts.push('已改写 ' + rewrittenN + ' 条只在源电脑上有效的路径');
+          if (storeN) parts.push('已把 pnpm 存储目录改到这台电脑');
+          let installFailed = false;
+          if (plug && plug.needsInstall && plug.pnpm && plug.pnpm.available) {
+            autoInstallTried.current = true;
+            parts.push('正在安装缺失的插件，请勿关闭或重启');
+            setMsg({ kind: 'ok', text: '恢复完成：' + parts.join('。') });
+            const installed = await doInstall({ quiet: true });
+            if (installed && installed.ok) parts.push(formatInstallResult(installed));
+            else {
+              installFailed = true;
+              parts.push('插件自动安装失败：' + pickError(installed, '请点下方「重装插件」'));
+            }
+          } else if (plug && plug.needsInstall) {
+            parts.push('插件代码尚未安装，且找不到 pnpm。请手动执行 dsh plugin --profile desktop install');
+          } else {
+            parts.push('请重启 DeepSeek Harness 使恢复生效');
+          }
+          setMsg({ kind: skipped.length || mismatch.length || installFailed || !(d.verified === d.restored) ? 'error' : 'ok', text: '恢复完成：' + parts.join('。') });
         }
         await refresh({ silent: true });
       };
@@ -552,6 +602,41 @@ window.__ModuleLoader__.load({
         await refresh({ silent: true });
       };
 
+      /** 删除某一份云端备份。只删用户点名的那一份，不影响自动保留最近 5 份之外的清理。 */
+      const askDelete = (name) => {
+        if (!name) return;
+        setConfirm({
+          title: '删除云端备份',
+          confirmVariant: 'danger',
+          body: h(React.Fragment, null,
+            h('div', null, '将从 WebDAV 上永久删除这份备份，删掉后无法恢复：'),
+            h('div', { className: PREFIX + '-item-name' }, name),
+          ),
+          confirmLabel: '删除',
+          run: () => doDelete(name),
+        });
+      };
+
+      const doDelete = async (name) => {
+        if (busy) return;
+        setBusy('delete');
+        setMsg(null);
+        const res = await api.remove({ name });
+        if (!mountedRef.current) return;
+        setBusy('');
+        setConfirm(null);
+        const data = (res.ok && res.data && typeof res.data === 'object') ? res.data : res;
+        if (data && data.ok) {
+          setMsg({ kind: 'ok', text: '已从云端删除：' + ((data.deleted && data.deleted[0]) || name) });
+        } else if (res.offline) {
+          setOffline(true);
+          setMsg({ kind: 'error', text: NOT_READY });
+        } else {
+          setMsg({ kind: 'error', text: pickError(data, '删除失败') });
+        }
+        await refresh({ silent: true });
+      };
+
       /** 重装入口：先弹确认（会联网装包，且重启后才生效） */
       const askInstall = (names) => {
         const list = Array.isArray(names) ? names : [];
@@ -570,30 +655,43 @@ window.__ModuleLoader__.load({
         });
       };
 
-      /** POST /dsh-sync/plugins/install —— 重装插件依赖（失败也可能带 log） */
-      const doInstall = async () => {
-        if (busy) return;
+      /** POST /dsh-sync/plugins/install —— 重装插件依赖（失败也可能带 log）。quiet 时由调用方自己组提示。 */
+      const doInstall = async (opts) => {
+        const quiet = opts && opts.quiet;
+        if (installLock.current) return null;
+        installLock.current = true;
         setBusy('install');
-        setMsg(null);
+        if (!quiet) setMsg(null);
         const res = await api.pluginsInstall({});
-        if (!mountedRef.current) return;
+        if (!mountedRef.current) { installLock.current = false; return null; }
         setBusy('');
         setConfirm(null);
+        installLock.current = false;
         const data = (res.ok && res.data && typeof res.data === 'object') ? res.data : res;
         if (data && data.ok) {
           setOffline(false);
-          await refreshPlugins();   // 让按钮随状态消失，避免重复安装
-          if (!mountedRef.current) return;
-          setMsg({ kind: 'ok', text: formatInstallResult(data), log: data.log || '' });
-          return;
+          await refreshPlugins();
+          if (!mountedRef.current) return data;
+          if (!quiet) setMsg({ kind: 'ok', text: formatInstallResult(data), log: data.log || '' });
+          return data;
         }
         if (res.offline) {
           setOffline(true);
-          setMsg({ kind: 'error', text: NOT_READY });
-          return;
+          if (!quiet) setMsg({ kind: 'error', text: NOT_READY });
+          return { ok: false, error: NOT_READY };
         }
         setOffline(false);
-        setMsg({ kind: 'error', text: pickError(data, '安装失败'), log: (data && data.log) || '' });
+        if (!quiet) setMsg({ kind: 'error', text: pickError(data, '安装失败'), log: (data && data.log) || '' });
+        return data && typeof data === 'object' ? data : { ok: false, error: pickError(data, '安装失败') };
+      };
+
+      /** 上次恢复留下了未安装的插件时，打开设置页就装一次，避免用户重启后只看到「包不可用」。 */
+      const maybeAutoInstall = async (plug) => {
+        if (autoInstallTried.current) return;
+        if (!plug || !plug.needsInstall || !plug.lastRestore || !plug.pnpm || !plug.pnpm.available) return;
+        autoInstallTried.current = true;
+        setMsg({ kind: 'ok', text: '检测到上次恢复后有插件依赖未安装，正在自动安装…请勿关闭或重启。' });
+        await doInstall();
       };
 
       /** 升级入口：先弹确认（会重装插件，且重启后才生效） */
@@ -747,6 +845,8 @@ window.__ModuleLoader__.load({
                       formatSize(b && b.size) + ' · ' + formatTime(b && b.modified)),
                   ),
                   h(Button, { small: true, disabled: anyBusy, onClick: () => askRestore(b && b.name) }, '恢复'),
+                  h(Button, { small: true, variant: 'danger', disabled: anyBusy, onClick: () => askDelete(b && b.name) },
+                    busy === 'delete' ? '删除中…' : '删除'),
                 )),
               )
             : null,
@@ -761,6 +861,13 @@ window.__ModuleLoader__.load({
         // ---- 服务器配置 ----
         h('div', { className: PREFIX + '-card' },
           h('div', { className: PREFIX + '-card-title' }, '服务器配置'),
+          (status && status.config && status.config.url)
+            ? h('div', { className: PREFIX + '-hint' },
+                '已保存：' + status.config.url +
+                ' · 用户 ' + (status.config.username || '（空）') +
+                ' · 目录 ' + (status.config.remoteDir || '（根目录）') +
+                ' · 密码' + (status.config.hasPassword ? '已填写' : '未填写'))
+            : h('div', { className: PREFIX + '-hint' }, '还没有保存过服务器配置。填好后点「保存并测试连接」，下次打开会显示在这里。'),
           h('div', { className: PREFIX + '-grid' },
             CONFIG_FIELDS.map((f) => h(Field, {
               key: f.key,
@@ -831,7 +938,7 @@ window.__ModuleLoader__.load({
                   h('div', { className: PREFIX + '-warn' },
                     h('div', { className: PREFIX + '-warn-title' },
                       '检测到 ' + missingNames.length + ' 个插件依赖未安装' + (plugins.profile ? '（profile：' + plugins.profile + '）' : '')),
-                    h('div', null, '备份里没有 node_modules，恢复后这些插件只剩配置没有代码，DSH 启动时会把它们静默跳过。'),
+                    h('div', null, '备份里没有 node_modules。另一台电脑会把这些插件标成「包不可用」，直到依赖安装完成并重启。'),
                     missingNames.length
                       ? h('div', { className: PREFIX + '-row' },
                           missingNames.map((n) => h('span', { key: n, className: PREFIX + '-badge ' + PREFIX + '-bad' }, n)))
@@ -905,6 +1012,7 @@ window.__ModuleLoader__.load({
           title: confirm ? confirm.title : '',
           body: confirm ? confirm.body : null,
           confirmLabel: confirm ? confirm.confirmLabel : '确定',
+          confirmVariant: confirm ? confirm.confirmVariant : 'primary',
           busy: anyBusy,
           onCancel: () => { if (!anyBusy) setConfirm(null); },
           onConfirm: () => { if (confirm && !anyBusy) confirm.run(); },

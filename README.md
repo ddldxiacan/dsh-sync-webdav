@@ -15,14 +15,15 @@ dsh-sync 把这件事变成两个按钮：**备份**（加密上传）和**恢�
 
 ## 功能
 
-在**设置页**新增一张「配置同步（WebDAV）」卡片（与 general / account / models / plugins 并列，全新 id `sync`，不替换任何现有页面）：
+在**设置页**新增一张「配置同步（WebDAV）」卡片（与 general / account / models / plugins 并列，全新 id `sync`，不替换任何现有页面）。已保存的服务器地址、用户名、远程目录和密码会在下次打开时回填到输入框，并在卡片上写明「已保存：…」，避免只看到占位符、分不清有没有配置过。
 
 | 功能 | 说明 |
 |---|---|
 | 服务器配置 | WebDAV URL、用户名、密码、远程目录；「保存并测试连接」会真实发起 PROPFIND/MKCOL 验证 |
 | 状态区 | 远端可达性、备份条目（名称/大小/时间）、最近一次本地快照 |
 | 备份 | 输入口令 → 打包 `~/.dsh` → AES-256-GCM 加密 → PUT 上传 |
-| 恢复 | 选一个备份（或「恢复最新」）→ 确认 → 自动先做本地快照 → 解密覆盖 |
+| 恢复 | 选一个备份（或「恢复最新」）→ 确认 → 自动先做本地快照 → 解密覆盖 → 改写源机器路径 → 自动安装缺失插件 |
+| 删除 | 远端备份列表里每一份都可以单独删除 |
 | 回滚 | 从本地快照列表还原 |
 | 插件重装 | 恢复后检测到插件依赖缺失 → 点「重装插件」→ 自动改写 `link:` 依赖并执行 pnpm install |
 | 版本升级 | 打开设置页自动检查新版本；有新版时一键升级本插件自身（升级前自动备份，失败可回滚） |
@@ -41,8 +42,15 @@ dsh-sync 把这件事变成两个按钮：**备份**（加密上传）和**恢�
 1. **先装上本插件**（`github:ddldxiacan/dsh-sync-webdav`，或本地路径），重启 DSH
 2. 在设置卡片填入**同一套** WebDAV 配置
 3. 输入**同一个口令** → 选备份 → 点「恢复」
-4. 恢复完成后，卡片会提示「插件依赖未安装」→ 点「**重装插件**」
+4. 等卡片提示插件安装完成（备份不含 `node_modules`，插件代码要在这台电脑重新装）。安装结束前不要重启
 5. 重启 DSH
+
+第 4 步会自动做两件事，否则另一台电脑上的插件会全部显示「包不可用」：
+
+- 把只在 A 机成立的路径改到这台电脑。包括 `file:C:/Users/某用户/.dsh/...` 这种本地包（改成相对路径），以及 `pnpm-workspace.yaml` 里写死的 `storeDir`（别人的 pnpm 存储目录会让**整次** `pnpm install` 失败，于是每个插件都报 `cannot resolve profile bundle`）
+- 发现有插件依赖没装好时，自动执行 `pnpm install`。装不好时卡片上仍留着「重装插件」按钮
+
+`link:` / `file:` 指向 A 机独有目录、而这台电脑上没有对应文件时，会改写成备份里记录的仓库地址；推导不出仓库的条目会从依赖里去掉，避免一条坏依赖拖垮全部插件。
 
 第 4 步会自动处理 A 机的本地路径依赖：A 机若用 `link:E:\…\dsh-sync-release` 这种写法装了本插件，这个绝对路径在 B 机**并不存在**，直接 `pnpm install` 会失败。插件在**备份时**就把这类依赖的仓库地址采集进备份包，恢复时自动改写为 `github:ddldxiacan/dsh-sync-webdav` 之类的可移植 spec 再安装。
 
@@ -221,10 +229,11 @@ dsh-sync-release/
 
 | 方法与路径 | 请求体 | 成功响应 |
 |---|---|---|
-| `GET /dsh-sync/status` | — | `{ configured, remote: { reachable, backups: [{name,size,modified}], latest? }, lastLocalSnapshot? }` |
+| `GET /dsh-sync/status` | — | `{ configured, config: { url, username, password, remoteDir, hasPassword } \| null, remote: { reachable, backups: [{name,size,modified}], latest? }, lastLocalSnapshot? }` |
 | `POST /dsh-sync/config` | `{ url, username, password, remoteDir }` | `{ ok: true }`（先做连通性测试，失败不保存） |
 | `POST /dsh-sync/backup` | `{ passphrase }` | `{ ok: true, name, size, fileCount, scope, pruned }` |
-| `POST /dsh-sync/restore` | `{ name?, passphrase }` | `{ ok: true, restored, snapshot, meta? }` |
+| `POST /dsh-sync/restore` | `{ name?, passphrase }` | `{ ok: true, restored, snapshot, portability?, meta? }` |
+| `POST /dsh-sync/delete` | `{ name }` 或 `{ names: [] }` | `{ ok: true, deleted }`（只接受 `dsh-sync-YYYYMMDD-HHMMSS.bundle`） |
 | `POST /dsh-sync/rollback` | `{ snapshot }` | `{ ok: true, restored }` |
 | `GET /dsh-sync/plugins` | — | `{ ok: true, profile, profileDir, deps: [{name, spec, kind, installed, rewrite?}], missing, needsInstall, mapped, pnpm: {available, path?}, lastRestore? }` |
 | `POST /dsh-sync/plugins/install` | `{}` | `{ ok: true, installed, exitCode, durationMs, rewritten, removed, lockSynced, log }` |

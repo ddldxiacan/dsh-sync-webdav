@@ -18,6 +18,7 @@ import {
   summarizePackedScope, pruneRemoteBackups, parseGitLsRemote,
   repoSpecFromUrl, depKind, collectInstallMeta, extractPayloadMeta,
   writeLastRestore, readLastRestore, planProfileInstall, findPnpmPath,
+  portabilizeRestoredTree, deleteRemoteBackups, isSafeBackupName, resolveDepTarget,
   createTestHarness,
   parseSemver, cmpSemver, semverGt, latestTagOf, shaOfDependency, summaryFromCompare,
   queryFlag, nonTargetFieldsIntact, selfPackageName, selfRepoSlug, selfVersion,
@@ -990,6 +991,117 @@ check('depKind: registry 版本号', depKind('^0.4.6') === 'registry' && depKind
   } finally {
     try { rmSync(forceRoot, { recursive: true, force: true }) } catch (e) { /* ignore */ }
   }
+
+  // 换机器：源机器的 file: 绝对路径和 storeDir 必须改到这台电脑，否则 pnpm 整批失败、插件全部「包不可用」
+  const portRoot = join(tmpdir(), 'dsh-sync-port-' + Date.now())
+  const portProf = join(portRoot, 'profiles', 'desktop')
+  const portHome = join(portRoot, 'home-b')
+  try {
+    mkdirSync(join(portRoot, 'local-packages'), { recursive: true })
+    mkdirSync(portProf, { recursive: true })
+    const tgzAbs = join(portRoot, 'local-packages', 'plug.tgz')
+    writeFileSync(tgzAbs, 'not-a-real-tarball', 'utf8')
+    const foreignSpec = 'file:C:/Users/Administrator/.dsh/local-packages/plug.tgz'
+    writeFileSync(join(portProf, 'package.json'), JSON.stringify({
+      dependencies: {
+        '@opencode2dsh/dsh-plugin': foreignSpec,
+        'ghost-plugin': 'link:E:/only-on-a',
+      },
+    }), 'utf8')
+    writeFileSync(join(portProf, 'pnpm-lock.yaml'), 'specifier: ' + foreignSpec + '\n', 'utf8')
+    writeFileSync(join(portProf, 'pnpm-workspace.yaml'), "packages:\n  - .\nstoreDir: 'C:\\\\Users\\\\Administrator\\\\.pnpm\\\\store\\\\v11'\n", 'utf8')
+    mkdirSync(join(portProf, 'node_modules'), { recursive: true })
+    const localStore = join(portHome, '.pnpm', 'store', 'v11')
+    writeFileSync(join(portProf, 'node_modules', '.modules.yaml'), 'storeDir: ' + localStore + '\n', 'utf8')
+    const fixed = portabilizeRestoredTree(portRoot, { home: portHome })
+    const pkg = JSON.parse(readFileSync(join(portProf, 'package.json'), 'utf8'))
+    const relSpec = pkg.dependencies['@opencode2dsh/dsh-plugin']
+    check('portabilize: ~/.dsh 内的 file: 改成相对路径', relSpec === 'file:../../local-packages/plug.tgz', relSpec)
+    check('portabilize: 不改写 ~/.dsh 以外的 link:', pkg.dependencies['ghost-plugin'] === 'link:E:/only-on-a')
+    check('portabilize: 锁文件里的旧绝对路径一并替换', readFileSync(join(portProf, 'pnpm-lock.yaml'), 'utf8').includes(relSpec))
+    check('portabilize: storeDir 让位给本机 node_modules 里已有的 store',
+      fixed.profiles[0].storeDir && fixed.profiles[0].storeDir.to === localStore,
+      JSON.stringify(fixed.profiles[0] && fixed.profiles[0].storeDir))
+    const ws = readFileSync(join(portProf, 'pnpm-workspace.yaml'), 'utf8')
+    check('portabilize: workspace 里写的是本机 store', ws.includes(localStore.replace(/\\/g, '\\\\')) || ws.includes(localStore), ws)
+
+    // 本机 tarball 真实存在时，即使 linkMap 想改成 github: 也必须保留，否则补丁包被换成上游
+    writeLastRestore(portRoot, {
+      at: new Date().toISOString(), profile: 'desktop',
+      linkMap: { '@opencode2dsh/dsh-plugin': { from: relSpec, spec: 'github:FishBottle7/opencode2dsh', reason: 'repository.url' } },
+    })
+    const kept = planProfileInstall(portProf, readLastRestore(portRoot).linkMap)
+    const row = kept.deps.find((d) => d.name === '@opencode2dsh/dsh-plugin')
+    check('plan: 本机存在的 file: 不改写成 github', row && row.kept === true && !row.rewrite, JSON.stringify(row))
+    check('resolveDepTarget: 相对 file: 落到 tarball', resolveDepTarget(relSpec, portProf) && existsSync(resolveDepTarget(relSpec, portProf)))
+  } finally {
+    try { rmSync(portRoot, { recursive: true, force: true }) } catch (e) { /* ignore */ }
+  }
+
+  // 没有 .modules.yaml 时，别人的 storeDir 改到当前用户家目录下
+  const portRoot2 = join(tmpdir(), 'dsh-sync-port2-' + Date.now())
+  const portProf2 = join(portRoot2, 'profiles', 'desktop')
+  const portHome2 = join(portRoot2, 'home-b')
+  try {
+    mkdirSync(portProf2, { recursive: true })
+    writeFileSync(join(portProf2, 'package.json'), JSON.stringify({ dependencies: {} }), 'utf8')
+    writeFileSync(join(portProf2, 'pnpm-workspace.yaml'), "storeDir: 'D:\\\\Users\\\\Someone\\\\.pnpm\\\\store\\\\v11'\n", 'utf8')
+    const fixed2 = portabilizeRestoredTree(portRoot2, { home: portHome2 })
+    const expectStore = join(portHome2, '.pnpm', 'store', 'v11')
+    check('portabilize: 没有本机 store 时改到当前用户目录',
+      fixed2.profiles[0].storeDir && fixed2.profiles[0].storeDir.to === expectStore,
+      JSON.stringify(fixed2.profiles[0] && fixed2.profiles[0].storeDir))
+  } finally {
+    try { rmSync(portRoot2, { recursive: true, force: true }) } catch (e) { /* ignore */ }
+  }
+
+  check('isSafeBackupName: 只接受插件自己的文件名',
+    isSafeBackupName('dsh-sync-20261018-092823.bundle') &&
+    !isSafeBackupName('../secret.txt') &&
+    !isSafeBackupName('dsh-sync.bundle') &&
+    !isSafeBackupName('dsh-sync-20261018-092823.bundle/../x'))
+
+  const davDel = createServer((req, res) => {
+    const name = new URL(req.url, 'http://127.0.0.1').pathname.split('/').pop()
+    if (req.method === 'DELETE') {
+      if (davDel.__files.has(name)) { davDel.__files.delete(name); res.writeHead(204); return res.end() }
+      res.writeHead(404); return res.end()
+    }
+    res.writeHead(405); res.end()
+  })
+  davDel.__files = new Map([['dsh-sync-20261018-010000.bundle', Buffer.from('a')]])
+  await new Promise((r) => davDel.listen(0, '127.0.0.1', r))
+  try {
+    const cfg = { url: 'http://127.0.0.1:' + davDel.address().port + '/dav/', username: 'user', password: 'pw', remoteDir: '' }
+    const bad = await deleteRemoteBackups(cfg, ['../evil', 'dsh-sync-20261018-010000.bundle', 'dsh-sync-20261018-020000.bundle'])
+    check('deleteRemoteBackups: 非法名字拒绝，存在的删掉，不存在的 404 也算删掉',
+      bad.failed.length === 1 && bad.failed[0].name === '../evil' && bad.deleted.length === 2 && davDel.__files.size === 0,
+      JSON.stringify(bad))
+  } finally { davDel.close() }
+
+  const statusRoot = join(tmpdir(), 'dsh-sync-status-' + Date.now())
+  try {
+    mkdirSync(statusRoot, { recursive: true })
+    writeFileSync(join(statusRoot, 'dsh-sync.json'), JSON.stringify({
+      url: 'http://127.0.0.1:1/', username: 'alice', password: 's3cret', remoteDir: 'dsh-sync',
+    }), 'utf8')
+    const hs = createTestHarness({ root: statusRoot, profile: 'desktop' })
+    const st = await hs.handleStatus()
+    check('status: 远端连不上也回显已保存的配置',
+      st.configured === true && st.config && st.config.url === 'http://127.0.0.1:1/' &&
+      st.config.username === 'alice' && st.config.password === 's3cret' &&
+      st.config.remoteDir === 'dsh-sync' && st.config.hasPassword === true,
+      JSON.stringify(st.config) + ' err=' + st.error)
+    const hd = await hs.handleDelete({ name: 'not a bundle' })
+    check('delete: 未通过名称校验时不发请求', hd.ok === false && /非法/.test(hd.error || ''), JSON.stringify(hd))
+  } finally {
+    try { rmSync(statusRoot, { recursive: true, force: true }) } catch (e) { /* ignore */ }
+  }
+
+  const clientSrc = readFileSync(new URL('./client.js', import.meta.url), 'utf8')
+  check('client: 打开页面回填已保存配置', clientSrc.includes('applySavedConfig') && clientSrc.includes('status.config'))
+  check('client: 云端备份可以删除', clientSrc.includes("request('/delete'") && clientSrc.includes('askDelete'))
+  check('client: 恢复后自动安装缺失插件', clientSrc.includes('maybeAutoInstall') && clientSrc.includes('doInstall({ quiet: true })'))
 }
 
 console.log('\n==== ' + pass + ' passed, ' + fail + ' failed ====')
