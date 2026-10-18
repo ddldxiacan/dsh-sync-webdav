@@ -14,7 +14,9 @@ import {
   extractPayloadDetailed,
   isExcludedAppData, collectAppDataFiles, appDataAbsPath,
   bundleName, makeSnapshot, rollbackFromSnapshot, isExcluded,
-  davRequest, ensureRemoteDir, parsePropfind, listRemoteBackups,
+  davRequest, ensureRemoteDir, parsePropfind, listRemoteBackups, listAccountBackups,
+  backupSearchDirs, normalizeRemoteDir, resolvePassphrase, configForDisk, describeDecryptError,
+  redactBackupBytes,
   summarizePackedScope, pruneRemoteBackups, parseGitLsRemote,
   repoSpecFromUrl, depKind, collectInstallMeta, extractPayloadMeta,
   writeLastRestore, readLastRestore, planProfileInstall, findPnpmPath,
@@ -1061,6 +1063,90 @@ check('depKind: registry 版本号', depKind('^0.4.6') === 'registry' && depKind
     !isSafeBackupName('dsh-sync.bundle') &&
     !isSafeBackupName('dsh-sync-20261018-092823.bundle/../x'))
 
+  check('backupSearchDirs: 保存成 dsh-sync 时仍会看根目录',
+    JSON.stringify(backupSearchDirs({ remoteDir: 'dsh-sync' })) === JSON.stringify(['dsh-sync', '']))
+  check('backupSearchDirs: 根目录配置仍会看 dsh-sync',
+    JSON.stringify(backupSearchDirs({ remoteDir: '' })) === JSON.stringify(['', 'dsh-sync']))
+  check('backupSearchDirs: 其它目录三个位置都看，且去掉首尾斜杠',
+    JSON.stringify(backupSearchDirs({ remoteDir: '/other/' })) === JSON.stringify(['other', '', 'dsh-sync']))
+  check('normalizeRemoteDir: 空与斜杠都是根目录', normalizeRemoteDir(' / ') === '' && normalizeRemoteDir(undefined) === '')
+
+  const passSaved = { passphrase: 'saved-one' }
+  check('resolvePassphrase: 留空且记住时用本机口令', resolvePassphrase(passSaved, { passphrase: '', remember: true }).passphrase === 'saved-one')
+  check('resolvePassphrase: 取消记住时不回落本机口令', resolvePassphrase(passSaved, { passphrase: '', remember: false }).passphrase === '')
+  check('resolvePassphrase: 新输入优先，并准备记住',
+    (() => { const r = resolvePassphrase(passSaved, { passphrase: 'new-one' }); return r.passphrase === 'new-one' && r.typed === true && r.remember === true })())
+  check('configForDisk: 保存服务器配置时保留口令，忽略请求里夹带的口令',
+    (() => {
+      const c = configForDisk({ passphrase: 'keep-me' }, { url: 'https://dav.example/dav', username: 'a', password: 'b', remoteDir: '/dsh-sync/', passphrase: 'nope' })
+      return c.passphrase === 'keep-me' && c.remoteDir === 'dsh-sync' && c.url === 'https://dav.example/dav'
+    })())
+  check('describeDecryptError: 认证失败说成口令不一致', /口令与这份备份不一致/.test(describeDecryptError(new Error('Unsupported state or unable to authenticate data'))))
+  check('describeDecryptError: 其它错误原样', describeDecryptError(new Error('不是有效的 dsh-sync 备份文件')) === '不是有效的 dsh-sync 备份文件')
+
+  const redactRoot = join(tmpdir(), 'dsh-sync-redact-' + Date.now())
+  try {
+    mkdirSync(redactRoot, { recursive: true })
+    writeFileSync(join(redactRoot, 'dsh-sync.json'), JSON.stringify({
+      url: 'https://dav.example/dav', username: 'a', password: 'webdav-secret', remoteDir: 'dsh-sync', passphrase: 'backup-passphrase-should-not-leak',
+    }, null, 2))
+    writeFileSync(join(redactRoot, 'settings.json'), '{"ok":1}')
+    const redacted = redactBackupBytes('dsh-sync.json', readFileSync(join(redactRoot, 'dsh-sync.json')))
+    const redactedText = redacted.toString('utf8')
+    check('redact: 备份字节里没有口令，仍保留 WebDAV 密码',
+      !redactedText.includes('backup-passphrase-should-not-leak') && redactedText.includes('webdav-secret') && redactedText.includes('"remoteDir": "dsh-sync"'))
+    const packed = JSON.parse(buildPayload(redactRoot, collectFiles(redactRoot)).toString('utf8'))
+    const packedCfg = Buffer.from(packed.files.find((f) => f.path === 'dsh-sync.json').data, 'base64').toString('utf8')
+    check('redact: 打进备份的 dsh-sync.json 不含口令', !packedCfg.includes('backup-passphrase-should-not-leak') && packedCfg.includes('webdav-secret'))
+  } finally {
+    try { rmSync(redactRoot, { recursive: true, force: true }) } catch (e) { /* ignore */ }
+  }
+
+  // 白电脑保存的是 dsh-sync（空目录），黑电脑实际把备份写在网盘根目录。列表必须两边都能看到。
+  const davSplit = createServer((req, res) => {
+    const path = decodeURIComponent(new URL(req.url, 'http://127.0.0.1').pathname)
+    const dir = path.endsWith('/') ? path : path + '/'
+    if (req.method === 'PROPFIND') {
+      const direct = [...davSplit.__files.keys()].filter((k) => {
+        if (!k.startsWith(dir) || k === dir) return false
+        const rest = k.slice(dir.length).replace(/\/$/, '')
+        return rest && !rest.includes('/')
+      })
+      const rows = ['<D:response><D:href>' + dir + '</D:href><D:propstat><D:prop><D:resourcetype><D:collection/></D:resourcetype></D:prop></D:propstat></D:response>']
+      for (const k of direct) {
+        const buf = davSplit.__files.get(k)
+        const isDir = buf == null
+        rows.push('<D:response><D:href>' + k + '</D:href><D:propstat><D:prop>' +
+          (isDir ? '<D:resourcetype><D:collection/></D:resourcetype>' : '<D:getcontentlength>' + buf.length + '</D:getcontentlength>') +
+          '</D:prop></D:propstat></D:response>')
+      }
+      res.writeHead(207, { 'Content-Type': 'application/xml' })
+      return res.end('<?xml version="1.0"?><D:multistatus xmlns:D="DAV:">' + rows.join('') + '</D:multistatus>')
+    }
+    res.writeHead(405); res.end()
+  })
+  davSplit.__files = new Map([
+    ['/dav/dsh-sync/', null],
+    ['/dav/dsh-sync-20261018-094708.bundle', Buffer.alloc(24)],
+    ['/dav/dsh-sync-20261018-094823.bundle', Buffer.alloc(24)],
+  ])
+  await new Promise((r) => davSplit.listen(0, '127.0.0.1', r))
+  try {
+    const splitCfg = {
+      url: 'http://127.0.0.1:' + davSplit.address().port + '/dav',
+      username: 'u', password: 'p', remoteDir: 'dsh-sync',
+    }
+    const onlySub = await listRemoteBackups(splitCfg)
+    check('listRemoteBackups: 只看 dsh-sync 时是空的（白电脑原来的现象）', onlySub.length === 0, JSON.stringify(onlySub))
+    const merged = await listAccountBackups(splitCfg)
+    check('listAccountBackups: 保存成 dsh-sync 也能看到根目录那两份',
+      merged.errors.length === 0 && merged.backups.length === 2 &&
+      merged.backups.every((b) => b.remoteDir === '' && b.encrypted === true) &&
+      merged.backups[0].name === 'dsh-sync-20261018-094708.bundle' &&
+      merged.backups[1].name === 'dsh-sync-20261018-094823.bundle',
+      JSON.stringify(merged))
+  } finally { davSplit.close() }
+
   const davDel = createServer((req, res) => {
     const name = new URL(req.url, 'http://127.0.0.1').pathname.split('/').pop()
     if (req.method === 'DELETE') {
@@ -1084,14 +1170,24 @@ check('depKind: registry 版本号', depKind('^0.4.6') === 'registry' && depKind
     mkdirSync(statusRoot, { recursive: true })
     writeFileSync(join(statusRoot, 'dsh-sync.json'), JSON.stringify({
       url: 'http://127.0.0.1:1/', username: 'alice', password: 's3cret', remoteDir: 'dsh-sync',
+      passphrase: 'hidden-pass',
     }), 'utf8')
     const hs = createTestHarness({ root: statusRoot, profile: 'desktop' })
     const st = await hs.handleStatus()
     check('status: 远端连不上也回显已保存的配置',
       st.configured === true && st.config && st.config.url === 'http://127.0.0.1:1/' &&
       st.config.username === 'alice' && st.config.password === 's3cret' &&
-      st.config.remoteDir === 'dsh-sync' && st.config.hasPassword === true,
+      st.config.remoteDir === 'dsh-sync' && st.config.hasPassword === true &&
+      st.config.hasPassphrase === true && !JSON.stringify(st).includes('hidden-pass'),
       JSON.stringify(st.config) + ' err=' + st.error)
+    const savedPass = await hs.handlePassphrase({ passphrase: 'another-pass' })
+    const onDisk = readFileSync(join(statusRoot, 'dsh-sync.json'), 'utf8')
+    check('passphrase: 记住口令写进本机配置，响应里不带口令',
+      savedPass.ok === true && savedPass.hasPassphrase === true && !('passphrase' in savedPass) && onDisk.includes('another-pass') && !onDisk.includes('hidden-pass'))
+    const clearedPass = await hs.handlePassphrase({ clear: true })
+    const clearedDisk = readFileSync(join(statusRoot, 'dsh-sync.json'), 'utf8')
+    check('passphrase: 可以清除本机口令，WebDAV 密码还在',
+      clearedPass.ok === true && clearedPass.hasPassphrase === false && !clearedDisk.includes('another-pass') && clearedDisk.includes('s3cret'))
     const hd = await hs.handleDelete({ name: 'not a bundle' })
     check('delete: 未通过名称校验时不发请求', hd.ok === false && /非法/.test(hd.error || ''), JSON.stringify(hd))
   } finally {
@@ -1102,6 +1198,10 @@ check('depKind: registry 版本号', depKind('^0.4.6') === 'registry' && depKind
   check('client: 打开页面回填已保存配置', clientSrc.includes('applySavedConfig') && clientSrc.includes('status.config'))
   check('client: 云端备份可以删除', clientSrc.includes("request('/delete'") && clientSrc.includes('askDelete'))
   check('client: 恢复后自动安装缺失插件', clientSrc.includes('maybeAutoInstall') && clientSrc.includes('doInstall({ quiet: true })'))
+  check('client: 同账号备份合并显示，并标明是否加密',
+    clientSrc.includes('listAccountBackups') === false && clientSrc.includes('backupSummary') && clientSrc.includes('已加密') && clientSrc.includes('locationLabel'))
+  check('client: 口令可在本机记住', clientSrc.includes("request('/passphrase'") && clientSrc.includes('在本机记住口令'))
+  check('client: 远程目录未保存时会拦住备份', clientSrc.includes('远程目录已改成'))
 }
 
 console.log('\n==== ' + pass + ' passed, ' + fail + ' failed ====')

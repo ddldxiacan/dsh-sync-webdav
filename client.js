@@ -8,13 +8,14 @@
  * 配置文件名、快照目录名仍沿用 `dsh-sync`，改名不影响接口与磁盘布局。
  *
  * 与 Host 半区（index.js）通过 HTTP 端点通信，契约冻结：
- *   GET  /dsh-sync/status                          -> { configured, config:{url,username,password,remoteDir,hasPassword}|null,
- *                                                        remote:{reachable,backups[],latest?}, lastLocalSnapshot?, error? }
+ *   GET  /dsh-sync/status                          -> { configured, config:{url,username,password,remoteDir,hasPassword,hasPassphrase}|null,
+ *                                                        remote:{reachable,backups[{name,size,modified,remoteDir,encrypted}],latest?}, lastLocalSnapshot?, error? }
  *   POST /dsh-sync/config   {url,username,password,remoteDir} -> { ok:true } | { ok:false, error }
- *   POST /dsh-sync/backup   {passphrase}            -> { ok:true, name, size, fileCount, scope, pruned } | { ok:false, error }
- *   POST /dsh-sync/restore  {name?, passphrase}     -> { ok:true, restored, snapshot, portability? }    | { ok:false, error }
+ *   POST /dsh-sync/passphrase {passphrase}|{clear:true} -> { ok:true, hasPassphrase } | { ok:false, error }
+ *   POST /dsh-sync/backup   {passphrase?, remember?} -> { ok:true, name, size, fileCount, scope, pruned } | { ok:false, error }
+ *   POST /dsh-sync/restore  {name?, remoteDir?, passphrase?, remember?} -> { ok:true, restored, snapshot, portability? } | { ok:false, error }
  *   POST /dsh-sync/rollback {snapshot}              -> { ok:true, restored }              | { ok:false, error }
- *   POST /dsh-sync/delete   {name}|{names}          -> { ok:true, deleted[] }             | { ok:false, error, deleted?, failed? }
+ *   POST /dsh-sync/delete   {name, remoteDir?}|{names} -> { ok:true, deleted[] }          | { ok:false, error, deleted?, failed? }
  *   GET  /dsh-sync/plugins                          -> { ok:true, profile, deps[], missing[], needsInstall, pnpm }
  *   POST /dsh-sync/plugins/install {}               -> { ok:true, installed[], rewritten{}, removed[], durationMs, log } | { ok:false, error, log }
  *   GET  /dsh-sync/version[?force=1]                -> { ok:true, current, mode:'dev'|'managed', kind, spec, repo, hasUpdate,
@@ -55,7 +56,7 @@ window.__ModuleLoader__.load({
       { key: 'url', label: 'WebDAV URL', placeholder: '例如 https://dav.example.com/dav/', type: 'text' },
       { key: 'username', label: '用户名', placeholder: '例如 user', type: 'text' },
       { key: 'password', label: '密码', placeholder: '保存后会回显为圆点', type: 'password' },
-      { key: 'remoteDir', label: '远程目录', placeholder: '例如 dsh-sync', type: 'text' },
+      { key: 'remoteDir', label: '远程目录', placeholder: '建议 dsh-sync；留空是网盘根目录，改完要点保存', type: 'text' },
     ];
 
     // ============================================================
@@ -96,6 +97,26 @@ window.__ModuleLoader__.load({
       const days = Math.floor(hours / 24);
       if (days < 30) return days + ' 天前';
       return formatTime(value);
+    }
+
+    /** 与 Host 一致：空字符串表示网盘根目录。 */
+    function normalizeDir(dir) {
+      return String(dir || '').trim().replace(/\\/g, '/').replace(/^\/+|\/+$/g, '');
+    }
+
+    function locationLabel(remoteDir) {
+      const d = normalizeDir(remoteDir);
+      return d || '根目录';
+    }
+
+    /** 列表标题：同账号合并后的份数，以及是否加了口令。 */
+    function backupSummary(backups) {
+      const list = Array.isArray(backups) ? backups : [];
+      const encrypted = list.filter((b) => !b || b.encrypted !== false).length;
+      const plain = list.length - encrypted;
+      if (!list.length) return '远端暂无备份条目';
+      if (plain === 0) return '远端备份（' + list.length + '，全部已用口令加密）';
+      return '远端备份（' + list.length + '，' + encrypted + ' 份已加密，' + plain + ' 份未加密）';
     }
 
     /** 短 sha 展示：40 位 hex 截 7 位，已是短 sha 的原样。 */
@@ -199,6 +220,7 @@ window.__ModuleLoader__.load({
       status: fetchStatus,
       config: (body) => request('/config', { method: 'POST', body }),
       backup: (body) => request('/backup', { method: 'POST', body }),
+      passphrase: (body) => request('/passphrase', { method: 'POST', body }),
       restore: (body) => request('/restore', { method: 'POST', body }),
       rollback: (body) => request('/rollback', { method: 'POST', body }),
       remove: (body) => request('/delete', { method: 'POST', body }),
@@ -223,6 +245,8 @@ window.__ModuleLoader__.load({
   background: var(--dsw-alias-settings-card-fill, var(--dsw-alias-bg-l1)); }
 .${PREFIX}-card-title { font-size: 13px; font-weight: 600; display: flex; align-items: center; gap: 8px; }
 .${PREFIX}-hint { color: var(--dsw-alias-label-tertiary); font-size: 12px; line-height: 1.6; }
+.${PREFIX}-check { display: flex; align-items: center; gap: 8px; font-size: 12px; color: var(--dsw-alias-label-secondary); }
+.${PREFIX}-check input { margin: 0; }
 .${PREFIX}-grid { display: flex; flex-direction: column; gap: 8px; }
 .${PREFIX}-field { display: grid; grid-template-columns: 96px 1fr; align-items: center; gap: 8px; }
 .${PREFIX}-field label { color: var(--dsw-alias-label-secondary); }
@@ -342,8 +366,9 @@ window.__ModuleLoader__.load({
       const formDirtyRef = useRef(false);
       const installLock = useRef(false);
       const autoInstallTried = useRef(false);
-      // 口令：仅内存，绝不写入任何持久化位置
+      // 口令：勾选记住后由 Host 写入本机 dsh-sync.json，页面上只显示「已记住」，不回显原文
       const [passphrase, setPassphrase] = useState('');
+      const [remember, setRemember] = useState(true);
       const [status, setStatus] = useState(null);
       // 插件依赖状态：null = 尚未取到或端点不可用（静默降级，不弹错）
       const [plugins, setPlugins] = useState(null);
@@ -473,13 +498,26 @@ window.__ModuleLoader__.load({
         await refresh({ silent: true });
       };
 
-      /** POST /dsh-sync/backup —— 立即备份 */
+      /** POST /dsh-sync/backup —— 立即备份。留空且已记住时，Host 用本机口令。 */
       const onBackup = async () => {
         if (busy) return;
-        if (!passphrase) { setMsg({ kind: 'error', text: '请先输入口令' }); return; }
+        const savedDir = normalizeDir(status && status.config && status.config.remoteDir);
+        const typedDir = normalizeDir(form.remoteDir);
+        if (status && status.configured && typedDir !== savedDir) {
+          setMsg({
+            kind: 'error',
+            text: '远程目录已改成「' + (typedDir || '根目录') + '」但还没保存，现在生效的仍是「' + (savedDir || '根目录') + '」。请先点「保存并测试连接」，避免新备份写到另一台电脑看不到的位置。',
+          });
+          return;
+        }
+        const known = !!(status && status.config && status.config.hasPassphrase);
+        if (!passphrase && !(remember && known)) {
+          setMsg({ kind: 'error', text: '请先输入口令。勾选「在本机记住」后，这台电脑以后可以留空。' });
+          return;
+        }
         setBusy('backup');
         setMsg(null);
-        const res = await api.backup({ passphrase });
+        const res = await api.backup({ passphrase, remember });
         if (!mountedRef.current) return;
         setBusy('');
         if (consume(res, null)) {
@@ -493,13 +531,41 @@ window.__ModuleLoader__.load({
         await refresh({ silent: true });
       };
 
+      /** POST /dsh-sync/passphrase —— 只记住口令，不立刻打一份备份。 */
+      const onSavePassphrase = async () => {
+        if (busy) return;
+        if (!passphrase) { setMsg({ kind: 'error', text: '请先输入要记住的口令' }); return; }
+        setBusy('passphrase');
+        setMsg(null);
+        const res = await api.passphrase({ passphrase });
+        if (!mountedRef.current) return;
+        setBusy('');
+        if (consume(res, '口令已记在本机，之后备份和恢复可以留空')) setPassphrase('');
+        await refresh({ silent: true });
+      };
+
+      const onClearPassphrase = async () => {
+        if (busy) return;
+        setBusy('passphrase');
+        setMsg(null);
+        const res = await api.passphrase({ clear: true });
+        if (!mountedRef.current) return;
+        setBusy('');
+        if (consume(res, '已清除本机记住的口令')) setPassphrase('');
+        await refresh({ silent: true });
+      };
+
       /** 恢复入口：先弹确认（提示会先自动快照现有配置，恢复后需重启才生效） */
-      const askRestore = (name) => {
+      const askRestore = (backup) => {
+        const name = backup && backup.name;
+        const encrypted = !backup || backup.encrypted !== false;
         setConfirm({
           title: '确认恢复',
           body: h(React.Fragment, null,
-            h('div', null, name ? '将从远端备份恢复：' : '将从远端最新备份恢复。'),
+            h('div', null, name ? '将从远端备份恢复：' : '将从同账号下最新的一份备份恢复（根目录和 dsh-sync 一起比较）。'),
             name ? h('div', { className: PREFIX + '-item-name' }, name) : null,
+            name ? h('div', { className: PREFIX + '-hint' }, '位置：' + locationLabel(backup.remoteDir)) : null,
+            h('div', null, encrypted ? '这份备份已用口令加密。留空并勾选记住时，使用本机已保存的口令。' : '这份备份没有口令。'),
             h('div', null, '恢复前会自动为当前配置创建一份本地快照，可用它回滚。'),
             h('div', { className: PREFIX + '-warn' },
               h('div', { className: PREFIX + '-warn-title' }, '恢复完成后必须重启 DeepSeek Harness 才会生效'),
@@ -507,17 +573,27 @@ window.__ModuleLoader__.load({
             ),
           ),
           confirmLabel: '恢复',
-          run: () => doRestore(name),
+          run: () => doRestore(backup),
         });
       };
 
       /** POST /dsh-sync/restore */
-      const doRestore = async (name) => {
+      const doRestore = async (backup) => {
         if (busy) return;
-        if (!passphrase) { setConfirm(null); setMsg({ kind: 'error', text: '请先输入口令' }); return; }
+        const known = !!(status && status.config && status.config.hasPassphrase);
+        if (!passphrase && !(remember && known)) {
+          setConfirm(null);
+          setMsg({ kind: 'error', text: '请先输入口令。勾选「在本机记住」后，这台电脑以后可以留空。' });
+          return;
+        }
         setBusy('restore');
         setMsg(null);
-        const res = await api.restore(name ? { name, passphrase } : { passphrase });
+        const body = { passphrase, remember };
+        if (backup && backup.name) {
+          body.name = backup.name;
+          body.remoteDir = normalizeDir(backup.remoteDir);
+        }
+        const res = await api.restore(body);
         if (!mountedRef.current) return;
         setBusy('');
         setConfirm(null);
@@ -602,8 +678,9 @@ window.__ModuleLoader__.load({
         await refresh({ silent: true });
       };
 
-      /** 删除某一份云端备份。只删用户点名的那一份，不影响自动保留最近 5 份之外的清理。 */
-      const askDelete = (name) => {
+      /** 删除某一份云端备份。带上它所在的目录，避免根目录和 dsh-sync 里同名时删错。 */
+      const askDelete = (backup) => {
+        const name = backup && backup.name;
         if (!name) return;
         setConfirm({
           title: '删除云端备份',
@@ -611,17 +688,19 @@ window.__ModuleLoader__.load({
           body: h(React.Fragment, null,
             h('div', null, '将从 WebDAV 上永久删除这份备份，删掉后无法恢复：'),
             h('div', { className: PREFIX + '-item-name' }, name),
+            h('div', { className: PREFIX + '-hint' }, '位置：' + locationLabel(backup.remoteDir)),
           ),
           confirmLabel: '删除',
-          run: () => doDelete(name),
+          run: () => doDelete(backup),
         });
       };
 
-      const doDelete = async (name) => {
-        if (busy) return;
+      const doDelete = async (backup) => {
+        const name = backup && backup.name;
+        if (busy || !name) return;
         setBusy('delete');
         setMsg(null);
-        const res = await api.remove({ name });
+        const res = await api.remove({ name, remoteDir: normalizeDir(backup.remoteDir) });
         if (!mountedRef.current) return;
         setBusy('');
         setConfirm(null);
@@ -747,6 +826,11 @@ window.__ModuleLoader__.load({
 
       const backups = (status && status.remote && Array.isArray(status.remote.backups)) ? status.remote.backups : [];
       const configured = !!(status && status.configured);
+      const hasPassphrase = !!(status && status.config && status.config.hasPassphrase);
+      const savedDir = normalizeDir(status && status.config && status.config.remoteDir);
+      const typedDir = normalizeDir(form.remoteDir);
+      const dirUnsaved = configured && typedDir !== savedDir;
+      const outsideDir = backups.filter((b) => normalizeDir(b && b.remoteDir) !== savedDir);
       const reachable = !!(status && status.remote && status.remote.reachable);
       const lastLocalSnapshot = status && status.lastLocalSnapshot;
       const anyBusy = !!busy;
@@ -834,18 +918,24 @@ window.__ModuleLoader__.load({
           status && status.error ? h(Message, { kind: 'error' }, status.error) : null,
           h('div', { className: PREFIX + '-hint' },
             '最近一次本地快照：' + (lastLocalSnapshot || '无')),
-          h('div', { className: PREFIX + '-hint' },
-            backups.length ? '远端备份（' + backups.length + '）' : '远端暂无备份条目'),
+          h('div', { className: PREFIX + '-hint' }, backupSummary(backups)),
+          outsideDir.length
+            ? h('div', { className: PREFIX + '-hint' },
+                '其中 ' + outsideDir.length + ' 份不在当前保存的目录「' + locationLabel(savedDir) + '」。同一账号在根目录和 dsh-sync 里的备份会合并显示，可以直接恢复或删除。')
+            : null,
           backups.length
             ? h('div', { className: PREFIX + '-list' },
-                backups.map((b, i) => h('div', { className: PREFIX + '-item', key: (b && b.name) || i },
+                backups.map((b, i) => h('div', { className: PREFIX + '-item', key: ((b && b.remoteDir) || '') + '/' + ((b && b.name) || i) },
                   h('div', { className: PREFIX + '-item-main' },
                     h('div', { className: PREFIX + '-item-name', title: b && b.name }, (b && b.name) || '(未命名)'),
                     h('div', { className: PREFIX + '-item-meta' },
-                      formatSize(b && b.size) + ' · ' + formatTime(b && b.modified)),
+                      h('span', {
+                        className: PREFIX + '-badge ' + ((b && b.encrypted === false) ? PREFIX + '-bad' : PREFIX + '-ok'),
+                      }, (b && b.encrypted === false) ? '未加密' : '已加密'),
+                      '位置 ' + locationLabel(b && b.remoteDir) + ' · ' + formatSize(b && b.size) + ' · ' + formatTime(b && b.modified)),
                   ),
-                  h(Button, { small: true, disabled: anyBusy, onClick: () => askRestore(b && b.name) }, '恢复'),
-                  h(Button, { small: true, variant: 'danger', disabled: anyBusy, onClick: () => askDelete(b && b.name) },
+                  h(Button, { small: true, disabled: anyBusy, onClick: () => askRestore(b) }, '恢复'),
+                  h(Button, { small: true, variant: 'danger', disabled: anyBusy, onClick: () => askDelete(b) },
                     busy === 'delete' ? '删除中…' : '删除'),
                 )),
               )
@@ -881,32 +971,61 @@ window.__ModuleLoader__.load({
               onChange: setField(f.key),
             })),
           ),
+          dirUnsaved
+            ? h('div', { className: PREFIX + '-warn' },
+                h('div', { className: PREFIX + '-warn-title' }, '远程目录还没保存'),
+                h('div', null,
+                  '输入框是「' + locationLabel(typedDir) + '」，当前生效的是「' + locationLabel(savedDir) + '」。新备份仍会写到生效的目录。请先点保存并测试连接，两台电脑才会把新备份写到同一处。'),
+              )
+            : null,
           h('div', { className: PREFIX + '-row' },
             h(Button, { variant: 'primary', disabled: anyBusy, onClick: onSaveConfig },
               busy === 'config' ? '测试中…' : '保存并测试连接'),
           ),
-          h('div', { className: PREFIX + '-hint' }, '密码会随配置保存在本机 ~/.dsh/dsh-sync.json，用于访问该 WebDAV。'),
+          h('div', { className: PREFIX + '-hint' }, '密码会随配置保存在本机 ~/.dsh/dsh-sync.json，用于访问该 WebDAV。列表会同时看根目录和 dsh-sync，所以以前写到根目录的备份也不会丢。'),
         ),
 
         // ---- 备份 ----
         h('div', { className: PREFIX + '-card' },
-          h('div', { className: PREFIX + '-card-title' }, '备份'),
+          h('div', { className: PREFIX + '-card-title' },
+            h('span', null, '备份'),
+            hasPassphrase
+              ? h('span', { className: PREFIX + '-badge ' + PREFIX + '-ok' }, '本机已记住口令')
+              : h('span', { className: PREFIX + '-badge ' + PREFIX + '-bad' }, '尚未记住口令'),
+          ),
           h('div', { className: PREFIX + '-grid' },
             h(Field, {
               id: PREFIX + '-passphrase',
               label: '口令',
               type: 'password',
-              placeholder: '用于加密备份',
+              placeholder: hasPassphrase ? '已记住，留空则继续用本机口令' : '设置后用于加密备份',
               value: passphrase,
               disabled: anyBusy,
               autoComplete: 'new-password',
               onChange: (e) => setPassphrase(e.target.value),
             }),
           ),
-          h('div', { className: PREFIX + '-hint' }, '口令只保留在内存中，不会写入磁盘；恢复时需要同一口令。'),
+          h('label', { className: PREFIX + '-check' },
+            h('input', {
+              type: 'checkbox',
+              checked: remember,
+              disabled: anyBusy,
+              onChange: (e) => setRemember(!!e.target.checked),
+            }),
+            '在本机记住口令，下次备份和恢复不用重填',
+          ),
+          h('div', { className: PREFIX + '-hint' },
+            hasPassphrase
+              ? '本机已记住口令。留空会用它；输入新口令并勾选记住，只影响之后的新备份，旧备份仍用当时的口令。每份备份在列表里标明是否加密。口令写在本机配置里，不会放进备份内容。'
+              : '填一次并勾选记住即可。列表里每份备份都会标明「已加密」或「未加密」。口令只保存在这台电脑，不会放进备份内容。'),
           h('div', { className: PREFIX + '-row' },
             h(Button, { variant: 'primary', disabled: anyBusy, onClick: onBackup },
               busy === 'backup' ? '备份中…' : '立即备份'),
+            h(Button, { small: true, disabled: anyBusy || !passphrase, onClick: onSavePassphrase },
+              busy === 'passphrase' ? '保存中…' : '只保存口令'),
+            hasPassphrase
+              ? h(Button, { small: true, disabled: anyBusy, onClick: onClearPassphrase }, '清除本机口令')
+              : null,
           ),
         ),
 

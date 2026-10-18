@@ -21,7 +21,8 @@
  *   [8 字节 magic "DSHSYNC1"][4 字节 headerLen(LE)][header JSON utf8][AES-256-GCM ciphertext]
  *   header: { version, salt(b64), iv(b64), tag(b64), payloadSha256 }
  *   明文 payload: JSON { files: [{ path, sha256, data(b64) }] }
- *   密钥 = scrypt(passphrase, salt, 32)，口令只在内存中出现，绝不落盘。
+ *   密钥 = scrypt(passphrase, salt, 32)。口令可以记在本机 dsh-sync.json，方便下次备份/恢复留空使用；
+ *   打包时会从 dsh-sync.json 里剥掉口令，备份内容本身不含口令。状态接口只回报「已记住」，不回传口令。
  */
 
 import { spawn } from 'node:child_process'
@@ -173,12 +174,22 @@ export function collectFiles(root) {
   return out
 }
 
+/** 打包进备份前去掉本机口令。WebDAV 账号密码仍按原设计一并迁移，口令不进备份内容。 */
+export function redactBackupBytes(rel, buf) {
+  if (rel !== CONFIG_FILE_NAME) return buf
+  let obj
+  try { obj = JSON.parse(buf.toString('utf8')) } catch (e) { return buf }
+  if (!obj || typeof obj !== 'object' || Array.isArray(obj) || !Object.prototype.hasOwnProperty.call(obj, 'passphrase')) return buf
+  delete obj.passphrase
+  return Buffer.from(JSON.stringify(obj, null, 2) + '\n', 'utf8')
+}
+
 /** 打包（未加密）：返回明文 payload Buffer。meta 仅在新版本携带，旧备份不含该字段
  *  （不传 meta 时产物与旧版逐字节一致，保证格式向后兼容） */
 export function buildPayload(root, relFiles, meta, appDataFiles) {
   const files = []
   for (const rel of relFiles) {
-    const buf = readFileSync(join(root, rel))
+    const buf = redactBackupBytes(rel, readFileSync(join(root, rel)))
     files.push({ path: rel, sha256: createHash('sha256').update(buf).digest('hex'), data: buf.toString('base64') })
   }
   // AppData 应用设置：以 __appdata__/ 前缀并入同一 payload，恢复时由 extractPayload 写回原位
@@ -430,12 +441,12 @@ export function davRequest(urlStr, method, opts) {
   }
 }
 
-/** 远端目录 URL（保证以 / 结尾） */
+/** 远端目录 URL（保证以 / 结尾）。remoteDir 为空时就是网盘根目录。 */
 function remoteDirUrl(cfg, extra) {
   let base = String(cfg.url || '')
   if (!base.endsWith('/')) base += '/'
-  const dir = String(cfg.remoteDir || '').replace(/^\/+|\/+$/g, '')
-  let u = dir ? base + dir + '/' : base
+  const dir = normalizeRemoteDir(cfg && cfg.remoteDir)
+  let u = dir ? base + dir.split('/').map((seg) => encodeURIComponent(seg)).join('/') + '/' : base
   if (extra !== undefined) u += extra
   return u
 }
@@ -459,8 +470,8 @@ export async function ensureRemoteDir(cfg) {
     // 逐级 MKCOL（远端目录可能有多层）
     let partial = String(cfg.url || '')
     if (!partial.endsWith('/')) partial += '/'
-    for (const seg of String(cfg.remoteDir || '').split('/').filter(Boolean)) {
-      partial += seg + '/'
+    for (const seg of normalizeRemoteDir(cfg.remoteDir).split('/').filter(Boolean)) {
+      partial += encodeURIComponent(seg) + '/'
       let mk
       try {
         mk = await davRequest(partial, 'MKCOL', { username: cfg.username, password: cfg.password })
@@ -513,7 +524,71 @@ export function parsePropfind(xmlText) {
   return out
 }
 
-/** 列出远端目录里的 .bundle 备份（按名字排序，新在后） */
+/** 远程目录规范化：空字符串表示网盘根目录。 */
+export function normalizeRemoteDir(dir) {
+  return String(dir || '').trim().replace(/\\/g, '/').replace(/^\/+|\/+$/g, '')
+}
+
+/** 只允许相对目录，避免恢复/删除时把路径拼出账号之外。空目录（根目录）合法。 */
+export function isSafeRemoteDir(dir) {
+  const d = normalizeRemoteDir(dir)
+  if (!d) return true
+  if (d.includes('\0') || d.includes(':') || d.includes('\\')) return false
+  const segs = d.split('/')
+  return segs.every((seg) => seg && seg !== '.' && seg !== '..')
+}
+
+/**
+ * 同一账号要一起看的目录。
+ * 实测会出现「输入框写着 dsh-sync，但保存下来的仍是根目录」：
+ * 备份写进根目录，另一台保存成 dsh-sync 的电脑就列出空目录。
+ * 所以列表固定覆盖：当前保存的目录、网盘根目录、约定目录 dsh-sync。
+ */
+export function backupSearchDirs(cfg) {
+  const dirs = []
+  const add = (dir) => {
+    const n = normalizeRemoteDir(dir)
+    if (!isSafeRemoteDir(n) || dirs.includes(n)) return
+    dirs.push(n)
+  }
+  add(cfg && cfg.remoteDir)
+  add('')
+  add('dsh-sync')
+  return dirs
+}
+
+/** 本机已记住的口令，或这一次输入的口令。remember=false 时不回落到已保存的口令。 */
+export function resolvePassphrase(saved, body) {
+  const typed = body && typeof body.passphrase === 'string' ? body.passphrase : ''
+  const remember = !body || body.remember !== false
+  if (typed) return { passphrase: typed, typed: true, remember }
+  const stored = saved && typeof saved.passphrase === 'string' ? saved.passphrase : ''
+  if (remember && stored) return { passphrase: stored, typed: false, remember }
+  return { passphrase: '', typed: false, remember }
+}
+
+/** 保存服务器配置时保留本机口令，并忽略请求体里夹带的口令（口令走单独接口）。 */
+export function configForDisk(prev, body) {
+  const c = {
+    url: String((body && body.url) || '').trim(),
+    username: String((body && body.username) || ''),
+    password: String((body && body.password) || ''),
+    remoteDir: normalizeRemoteDir(body && body.remoteDir),
+  }
+  if (prev && typeof prev.passphrase === 'string' && prev.passphrase) c.passphrase = prev.passphrase
+  return c
+}
+
+/** 把 GCM 认证失败翻成用户能看懂的口令错误。其它解密错误原样返回。 */
+export function describeDecryptError(err) {
+  const msg = err && err.message ? err.message : String(err || '')
+  if (/authenticate|bad decrypt/i.test(msg)) {
+    return '口令与这份备份不一致。请填写备份当时的口令；本机记住的口令只对用它打出来的备份有效。'
+  }
+  return msg || '解密失败'
+}
+
+/** 列出远端目录里的 .bundle 备份（按名字排序，新在后）。404 视为该目录还没有备份。 */
 export async function listRemoteBackups(cfg) {
   const url = remoteDirUrl(cfg)
   const res = await davRequest(url, 'PROPFIND', {
@@ -521,14 +596,33 @@ export async function listRemoteBackups(cfg) {
     headers: { Depth: '1', 'Content-Type': 'application/xml' },
     body: PROPFIND_BODY,
   })
+  if (res.status === 404) return []
   if (res.status !== 207 && res.status !== 200) {
     throw new Error('PROPFIND 返回 HTTP ' + res.status)
   }
   const entries = parsePropfind(res.body.toString('utf8'))
   return entries
-    .filter((e) => !e.isDir && /\.bundle$/.test(e.name))
-    .map((e) => ({ name: e.name, size: e.size, modified: e.modified }))
+    .filter((e) => !e.isDir && /\.bundle$/.test(e.name) && isSafeBackupName(e.name))
+    .map((e) => ({ name: e.name, size: e.size, modified: e.modified, encrypted: true }))
     .sort((a, b) => (a.name < b.name ? -1 : a.name > b.name ? 1 : 0))
+}
+
+/** 合并同一账号下根目录、dsh-sync 和当前保存目录里的备份。每条带上真实 remoteDir。 */
+export async function listAccountBackups(cfg) {
+  const backups = []
+  const errors = []
+  for (const remoteDir of backupSearchDirs(cfg)) {
+    try {
+      const items = await listRemoteBackups({ ...cfg, remoteDir })
+      for (const item of items) {
+        backups.push({ ...item, remoteDir, encrypted: item.encrypted !== false })
+      }
+    } catch (e) {
+      errors.push({ remoteDir, error: e && e.message ? e.message : String(e) })
+    }
+  }
+  backups.sort((a, b) => (a.name < b.name ? -1 : a.name > b.name ? 1 : (a.remoteDir < b.remoteDir ? -1 : a.remoteDir > b.remoteDir ? 1 : 0)))
+  return { backups, errors }
 }
 
 /** 备份打包了哪些顶层目录（文件数），用来一眼看出体积是不是被非配置内容撑大。 */
@@ -1255,19 +1349,27 @@ export function portabilizeRestoredTree(dshRoot, opts) {
   return { profiles }
 }
 
-/** 按名字删除远端 .bundle。非法名字拒绝，404 视为已经不在。 */
+/** 按名字删除远端 .bundle。条目可以是字符串，或 { name, remoteDir }。非法名字拒绝，404 视为已经不在。 */
 export async function deleteRemoteBackups(cfg, names) {
   const deleted = []
   const failed = []
   const list = Array.isArray(names) ? names : []
-  for (const name of list) {
+  for (const item of list) {
+    const name = typeof item === 'string' ? item : (item && item.name)
+    const remoteDir = typeof item === 'string' || !item || item.remoteDir === undefined
+      ? normalizeRemoteDir(cfg && cfg.remoteDir)
+      : normalizeRemoteDir(item.remoteDir)
     if (!isSafeBackupName(name)) {
       failed.push({ name: String(name), error: '备份名称非法' })
       continue
     }
+    if (!isSafeRemoteDir(remoteDir)) {
+      failed.push({ name, error: '远程目录非法' })
+      continue
+    }
     let res
     try {
-      res = await davRequest(remoteDirUrl(cfg, name), 'DELETE', { username: cfg.username, password: cfg.password })
+      res = await davRequest(remoteDirUrl({ ...cfg, remoteDir }, name), 'DELETE', { username: cfg.username, password: cfg.password })
     } catch (e) {
       failed.push({ name, error: e && e.message ? e.message : String(e) })
       continue
@@ -1429,7 +1531,14 @@ export function apply(ctx, config) {
 
   const savePluginConfig = (c) => {
     mkdirSync(dshRoot, { recursive: true })
-    writeFileSync(configFile, JSON.stringify({ url: c.url, username: c.username, password: c.password, remoteDir: c.remoteDir }, null, 2), 'utf8')
+    const obj = {
+      url: String(c.url || ''),
+      username: String(c.username || ''),
+      password: String(c.password || ''),
+      remoteDir: normalizeRemoteDir(c.remoteDir),
+    }
+    if (typeof c.passphrase === 'string' && c.passphrase) obj.passphrase = c.passphrase
+    writeFileSync(configFile, JSON.stringify(obj, null, 2), 'utf8')
   }
 
   const json = (res, obj) => {
@@ -1467,8 +1576,9 @@ export function apply(ctx, config) {
       url: String(c.url || ''),
       username: String(c.username || ''),
       password: String(c.password || ''),
-      remoteDir: String(c.remoteDir || ''),
+      remoteDir: normalizeRemoteDir(c.remoteDir),
       hasPassword: !!c.password,
+      hasPassphrase: typeof c.passphrase === 'string' && !!c.passphrase,
     }
   }
 
@@ -1481,11 +1591,20 @@ export function apply(ctx, config) {
       if (err) {
         return { configured: true, config, remote: { reachable: false, backups: [] }, lastLocalSnapshot: lastLocalSnapshot || undefined, error: err }
       }
-      const backups = await listRemoteBackups(c)
+      const listed = await listAccountBackups(c)
+      const backups = listed.backups
+      if (!backups.length && listed.errors.length) {
+        throw new Error(listed.errors.map((e) => (e.remoteDir || '根目录') + '：' + e.error).join('；'))
+      }
       return {
         configured: true,
         config,
-        remote: { reachable: true, backups, latest: backups.length ? backups[backups.length - 1].name : undefined },
+        remote: {
+          reachable: true,
+          backups,
+          latest: backups.length ? backups[backups.length - 1].name : undefined,
+          listErrors: listed.errors.length ? listed.errors : undefined,
+        },
         lastLocalSnapshot: lastLocalSnapshot || undefined,
       }
     } catch (e) {
@@ -1498,12 +1617,8 @@ export function apply(ctx, config) {
   }
 
   const handleConfig = async (body) => {
-    const c = {
-      url: String(body.url || '').trim(),
-      username: String(body.username || ''),
-      password: String(body.password || ''),
-      remoteDir: String(body.remoteDir || '').trim(),
-    }
+    const prev = loadPluginConfig()
+    const c = configForDisk(prev, body)
     if (!c.url) return { ok: false, error: 'url 不能为空' }
     const err = await ensureRemoteDir(c)
     if (err) return { ok: false, error: err }
@@ -1511,11 +1626,31 @@ export function apply(ctx, config) {
     return { ok: true }
   }
 
+  const handlePassphrase = async (body) => {
+    const c = loadPluginConfig()
+    if (!c) return { ok: false, error: '尚未配置 WebDAV（先保存服务器配置）' }
+    if (body && body.clear) {
+      const next = { ...c }
+      delete next.passphrase
+      savePluginConfig(next)
+      return { ok: true, hasPassphrase: false }
+    }
+    const passphrase = body && typeof body.passphrase === 'string' ? body.passphrase : ''
+    if (!passphrase) return { ok: false, error: '口令不能为空' }
+    savePluginConfig({ ...c, passphrase })
+    return { ok: true, hasPassphrase: true }
+  }
+
   const handleBackup = async (body) => {
     const c = loadPluginConfig()
     if (!c) return { ok: false, error: '尚未配置 WebDAV（先 POST /dsh-sync/config）' }
-    const passphrase = String(body.passphrase || '')
-    if (!passphrase) return { ok: false, error: 'passphrase 不能为空' }
+    const resolved = resolvePassphrase(c, body)
+    const passphrase = resolved.passphrase
+    if (!passphrase) return { ok: false, error: '请先输入口令。勾选「在本机记住」后，这台电脑以后可以留空。' }
+    if (resolved.typed && resolved.remember) {
+      c.passphrase = passphrase
+      savePluginConfig(c)
+    }
     const relFiles = collectFiles(dshRoot)
     const appDataFiles = collectAppDataFiles()
     const payload = buildPayload(dshRoot, relFiles, collectInstallMeta(dshRoot, cfg.profile), appDataFiles)
@@ -1548,22 +1683,44 @@ export function apply(ctx, config) {
   const handleRestore = async (body) => {
     const c = loadPluginConfig()
     if (!c) return { ok: false, error: '尚未配置 WebDAV' }
-    const passphrase = String(body.passphrase || '')
-    if (!passphrase) return { ok: false, error: 'passphrase 不能为空' }
-    let name = body.name ? String(body.name) : null
-    if (!name) {
-      const backups = await listRemoteBackups(c)
-      if (!backups.length) return { ok: false, error: '远端没有备份' }
-      name = backups[backups.length - 1].name
+    const resolved = resolvePassphrase(c, body)
+    const passphrase = resolved.passphrase
+    if (!passphrase) return { ok: false, error: '请先输入口令。勾选「在本机记住」后，这台电脑以后可以留空。' }
+    if (resolved.typed && resolved.remember) {
+      c.passphrase = passphrase
+      savePluginConfig(c)
     }
-    const url = remoteDirUrl(c, name)
+    let name = body.name ? String(body.name) : null
+    const hasDir = body && Object.prototype.hasOwnProperty.call(body, 'remoteDir')
+    let remoteDir = hasDir ? normalizeRemoteDir(body.remoteDir) : null
+    if (!name || remoteDir === null) {
+      const listed = await listAccountBackups(c)
+      const backups = listed.backups
+      if (!name) {
+        if (!backups.length) return { ok: false, error: '远端没有备份' }
+        const latest = backups[backups.length - 1]
+        name = latest.name
+        if (remoteDir === null) remoteDir = latest.remoteDir
+      } else if (remoteDir === null) {
+        const hits = backups.filter((b) => b.name === name)
+        remoteDir = hits.length ? hits[hits.length - 1].remoteDir : normalizeRemoteDir(c.remoteDir)
+      }
+    }
+    if (!isSafeBackupName(name)) return { ok: false, error: '备份名称非法' }
+    if (!isSafeRemoteDir(remoteDir)) return { ok: false, error: '远程目录非法' }
+    const url = remoteDirUrl({ ...c, remoteDir }, name)
     const res = await davRequest(url, 'GET', { username: c.username, password: c.password, timeoutMs: 120000 })
     if (res.error) return { ok: false, error: '下载备份失败：' + res.error }
     if (res.status !== 200) {
       return { ok: false, error: '下载备份失败（HTTP ' + res.status + '，Content-Type: ' + ((res.headers && res.headers['content-type']) || '-') + '）' }
     }
     // 先解密校验（口令错误/内容损坏在这里就明确报错，绝不在解包中途才炸）
-    const payload = decryptBundle(res.body, passphrase)
+    let payload
+    try {
+      payload = decryptBundle(res.body, passphrase)
+    } catch (e) {
+      return { ok: false, error: describeDecryptError(e) }
+    }
     // 恢复前先本地快照（安全性快照，本身就是回滚目标）
     lastLocalSnapshot = makeSnapshot(dshRoot, snapshotRoot, SNAPSHOT_KEEP)
     // 只覆盖：备份里没有的现有文件（含 dsh-runtimes/ 等排除项）一律保留
@@ -1602,7 +1759,9 @@ export function apply(ctx, config) {
   const handleDelete = async (body) => {
     const c = loadPluginConfig()
     if (!c) return { ok: false, error: '尚未配置 WebDAV' }
-    const names = Array.isArray(body.names) ? body.names : (body.name ? [String(body.name)] : [])
+    const names = Array.isArray(body.names)
+      ? body.names
+      : (body.name ? [{ name: String(body.name), remoteDir: Object.prototype.hasOwnProperty.call(body, 'remoteDir') ? body.remoteDir : undefined }] : [])
     if (!names.length) return { ok: false, error: '请指定要删除的备份' }
     const { deleted, failed } = await deleteRemoteBackups(c, names)
     if (deleted.length) log('remote delete: ' + deleted.join(', '))
@@ -2056,6 +2215,7 @@ export function apply(ctx, config) {
     'GET /dsh-sync/plugins': handlePlugins,
     'GET /dsh-sync/version': handleVersion,
     'POST /dsh-sync/config': handleConfig,
+    'POST /dsh-sync/passphrase': handlePassphrase,
     'POST /dsh-sync/backup': handleBackup,
     'POST /dsh-sync/restore': handleRestore,
     'POST /dsh-sync/rollback': handleRollback,
@@ -2068,7 +2228,7 @@ export function apply(ctx, config) {
   apply._internals = {
     handlePlugins, handlePluginInstall, buildPluginsReport, resolveProfile, defaultRunner,
     handleVersion, handleUpgrade, inspectSelf, versionCache, runProfileInstall,
-    handleStatus, handleDelete,
+    handleStatus, handleDelete, handlePassphrase,
   }
 
   const setupRoutes = (routeCtx) => {
@@ -2098,7 +2258,7 @@ export function apply(ctx, config) {
         })
         if (typeof dispose === 'function') cleanupFns.push(dispose)
       }
-      log('HTTP endpoints ready: /dsh-sync/{status,config,backup,restore,rollback,delete,plugins,plugins/install,version,upgrade}')
+      log('HTTP endpoints ready: /dsh-sync/{status,config,passphrase,backup,restore,rollback,delete,plugins,plugins/install,version,upgrade}')
     } catch (e) {
       log('route registration failed: ' + (e && e.message ? e.message : String(e)))
     }
