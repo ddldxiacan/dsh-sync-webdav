@@ -41,6 +41,7 @@ import { fileURLToPath } from 'node:url'
 const MAGIC = Buffer.from('DSHSYNC1', 'utf8')
 const MAX_FILE_BYTES = 50 * 1024 * 1024
 const SNAPSHOT_KEEP = 5
+const REMOTE_KEEP = 5
 const CONFIG_FILE_NAME = 'dsh-sync.json'
 const SNAPSHOT_ROOT_NAME = '.dsh-sync-snapshots'
 const RESTORE_STATE_NAME = 'dsh-sync-last-restore.json'
@@ -112,8 +113,13 @@ export function appDataAbsPath(relPosix) {
   if (!roaming) return null
   return join(roaming, APPDATA_ROOT_NAME, ...rel.split('/'))
 }
-// B 机恢复后重装插件依赖用；pnpm 随 DSH 一起分发在 resources/runtime/ 下
-const PNPM_REL_PATH = join('runtime', 'pnpm', 'bin', 'pnpm.mjs')
+// B 机恢复后重装插件依赖用。桌面版把运行时放在 primary-runtime/dependencies/ 下
+// （runtime.json 的 pnpm 字段），旧布局 runtime/pnpm/ 仍保留作兼容。
+const PNPM_CANDIDATES = [
+  join('runtime', 'primary-runtime', 'dependencies', 'pnpm', 'bin', 'pnpm.mjs'),
+  join('runtime', 'pnpm', 'bin', 'pnpm.mjs'),
+  join('runtime', 'primary-runtime', 'dependencies', 'pnpm', 'bin', 'pnpm.cjs'),
+]
 const INSTALL_TIMEOUT_MS = 15 * 60 * 1000
 const LOG_TAIL_CHARS = 4000
 
@@ -367,31 +373,61 @@ function basicAuth(username, password) {
   return 'Basic ' + Buffer.from(username + ':' + password, 'utf8').toString('base64')
 }
 
-/** 发起一次 WebDAV 请求。返回 { status, headers, body(Buffer) } */
+/** 发起一次 WebDAV 请求。返回 { status, headers, body(Buffer), error? }。
+ *  只自动跟随 GET/HEAD 的 3xx：PUT/PROPFIND 被重放到别的主机会丢请求体或打错机器。
+ *  跨主机（对象存储签名直链）时去掉 Authorization——直链自带签名，多带 Basic 会被拒。 */
 export function davRequest(urlStr, method, opts) {
   const o = opts || {}
-  return new Promise((resolve, reject) => {
+  const maxRedirects = Number.isFinite(o.maxRedirects) ? o.maxRedirects : 5
+  const followRedirects = o.followRedirects !== undefined ? o.followRedirects : (method === 'GET' || method === 'HEAD')
+
+  const go = (target, hop, originHost) => new Promise((resolve, reject) => {
     let u
-    try { u = new URL(urlStr) } catch (e) { return reject(new Error('无效的 URL: ' + urlStr)) }
+    try { u = new URL(target) } catch (e) { return reject(new Error('无效的 URL: ' + target)) }
     if (u.protocol !== 'http:' && u.protocol !== 'https:') return reject(new Error('仅支持 http/https'))
     const mod = u.protocol === 'https:' ? https : http
     const headers = { ...(o.headers || {}) }
-    if (o.username !== undefined) headers['Authorization'] = basicAuth(o.username, o.password || '')
-    let body = o.body
+    if (u.host !== originHost) delete headers['Authorization']
+    // 跨主机（跳到对象存储直链）时不携带 WebDAV 凭据
+    if (o.username !== undefined && u.host === originHost) {
+      headers['Authorization'] = basicAuth(o.username, o.password || '')
+    }
+    const hopMethod = hop === 0 ? method : (method === 'HEAD' ? 'HEAD' : 'GET')
+    let body = hop === 0 ? o.body : undefined
     if (body !== undefined && body !== null) {
       if (!Buffer.isBuffer(body)) body = Buffer.from(body, 'utf8')
       headers['Content-Length'] = String(body.length)
+    } else {
+      delete headers['Content-Length']
     }
-    const req = mod.request(u, { method, headers, timeout: o.timeoutMs || 15000 }, (res) => {
+    const req = mod.request(u, { method: hopMethod, headers, timeout: o.timeoutMs || 15000 }, (res) => {
+      const code = res.statusCode
+      const loc = res.headers ? res.headers.location : null
+      if (followRedirects && code >= 300 && code < 400 && loc) {
+        res.resume()
+        if (hop >= maxRedirects) {
+          return resolve({ status: code, headers: res.headers, body: Buffer.alloc(0), error: '重定向超过 ' + maxRedirects + ' 次' })
+        }
+        const next = nextRedirectUrl(target, loc)
+        if (!next) return resolve({ status: code, headers: res.headers, body: Buffer.alloc(0), error: '无效重定向：' + loc })
+        return go(next, hop + 1, originHost).then(resolve, reject)
+      }
       const chunks = []
       res.on('data', (c) => chunks.push(c))
-      res.on('end', () => resolve({ status: res.statusCode, headers: res.headers, body: Buffer.concat(chunks) }))
+      res.on('end', () => resolve({ status: code, headers: res.headers, body: Buffer.concat(chunks) }))
     })
     req.on('timeout', () => { req.destroy(new Error('请求超时')) })
     req.on('error', reject)
     if (body !== undefined && body !== null) req.write(body)
     req.end()
   })
+
+  try {
+    const host = new URL(urlStr).host
+    return go(urlStr, 0, host)
+  } catch (e) {
+    return Promise.reject(new Error('无效的 URL: ' + urlStr))
+  }
 }
 
 /** 远端目录 URL（保证以 / 结尾） */
@@ -454,16 +490,23 @@ export function parsePropfind(xmlText) {
     const block = m[1]
     const href = (block.match(/<(?:[A-Za-z0-9_-]+:)?href[^>]*>([\s\S]*?)<\/(?:[A-Za-z0-9_-]+:)?href>/) || [])[1]
     if (!href) continue
-    const isDir = /<(?:[A-Za-z0-9_-]+:)?collection\s*\/?\s*>/.test(block)
+    // collection 后面可能紧跟属性（<D:collection xmlns:D="DAV:"/>），不能要求立刻闭合
+    const isDir = /<(?:[A-Za-z0-9_-]+:)?collection[\s/>]/.test(block)
     const sizeRaw = (block.match(/<(?:[A-Za-z0-9_-]+:)?getcontentlength[^>]*>([\s\S]*?)<\/(?:[A-Za-z0-9_-]+:)?getcontentlength>/) || [])[1]
     const modRaw = (block.match(/<(?:[A-Za-z0-9_-]+:)?getlastmodified[^>]*>([\s\S]*?)<\/(?:[A-Za-z0-9_-]+:)?getlastmodified>/) || [])[1]
     let name
     try { name = decodeURIComponent(href.replace(/\/$/, '').split('/').pop() || '') } catch (e) { name = href }
     if (!name) continue
+    // 空标签 / 缺失长度是「未知」，不是 0 字节。目录的 getcontentlength 经常挂在 404 propstat 里。
+    let size = null
+    if (sizeRaw !== undefined && String(sizeRaw).trim() !== '') {
+      const n = Number(String(sizeRaw).trim())
+      size = Number.isFinite(n) ? n : null
+    }
     out.push({
       name,
       isDir,
-      size: Number(sizeRaw) || 0,
+      size,
       modified: modRaw || null,
     })
   }
@@ -486,6 +529,33 @@ export async function listRemoteBackups(cfg) {
     .filter((e) => !e.isDir && /\.bundle$/.test(e.name))
     .map((e) => ({ name: e.name, size: e.size, modified: e.modified }))
     .sort((a, b) => (a.name < b.name ? -1 : a.name > b.name ? 1 : 0))
+}
+
+/** 备份打包了哪些顶层目录（文件数），用来一眼看出体积是不是被非配置内容撑大。 */
+export function summarizePackedScope(relFiles, appDataFiles) {
+  const counts = Object.create(null)
+  for (const rel of relFiles || []) {
+    const top = String(rel).includes('/') ? String(rel).split('/')[0] : '(files)'
+    counts[top] = (counts[top] || 0) + 1
+  }
+  const topLevel = Object.keys(counts).sort().map((name) => ({ name, files: counts[name] }))
+  return { topLevel, appDataFiles: (appDataFiles || []).length, fileCount: (relFiles || []).length }
+}
+
+/** 远端只保留最近 keep 份 .bundle（按文件名排序，旧的在前）。失败抛错，由调用方决定是否吞掉。 */
+export async function pruneRemoteBackups(cfg, keep) {
+  const n = Number.isFinite(keep) ? keep : REMOTE_KEEP
+  const backups = await listRemoteBackups(cfg)
+  if (backups.length <= n) return { deleted: [], kept: backups.map((b) => b.name) }
+  const excess = backups.slice(0, backups.length - n)
+  const deleted = []
+  for (const b of excess) {
+    const url = remoteDirUrl(cfg, b.name)
+    const res = await davRequest(url, 'DELETE', { username: cfg.username, password: cfg.password })
+    if (res.status === 200 || res.status === 204 || res.status === 404) deleted.push(b.name)
+    else throw new Error('删除旧备份失败（HTTP ' + res.status + '）：' + b.name)
+  }
+  return { deleted, kept: backups.slice(backups.length - n).map((b) => b.name) }
 }
 
 // ============================================================
@@ -526,15 +596,29 @@ export function specFromInstalledPackage(pkgDir) {
   } catch (e) { return null }
 }
 
-/** 找 pnpm 的入口脚本（随 DSH 分发，位于 resources/runtime/pnpm/bin/pnpm.mjs） */
-export function findPnpmPath(resourcesPath) {
+/** 找 pnpm 的入口脚本。按候选列表探测，并兜底扫 ~/.dsh/dsh-runtimes/<版本>/。
+ *  opts.homeRoot 仅供测试注入，避免扫到本机真实运行时。 */
+export function findPnpmPath(resourcesPath, opts) {
+  const o = opts || {}
   const roots = []
   if (resourcesPath) roots.push(resourcesPath)
   try { roots.push(join(dirname(process.execPath), 'resources')) } catch (e) { /* ignore */ }
   for (const r of roots) {
-    const p = join(r, PNPM_REL_PATH)
-    if (existsSync(p)) return p
+    for (const rel of PNPM_CANDIDATES) {
+      const p = join(r, rel)
+      if (existsSync(p)) return p
+    }
   }
+  if (o.homeRoot === null) return null
+  const home = o.homeRoot !== undefined ? o.homeRoot : join(homedir(), '.dsh', 'dsh-runtimes')
+  try {
+    for (const n of readdirSync(home)) {
+      for (const rel of PNPM_CANDIDATES) {
+        const p = join(home, n, rel)
+        if (existsSync(p)) return p
+      }
+    }
+  } catch (e) { /* ignore */ }
   return null
 }
 
@@ -833,10 +917,69 @@ export function defaultHttpsGet(url, opts) {
   })
 }
 
+/** 解析 `git ls-remote` 的 stdout。带 ^{} 的剥离开行优先（那是 commit sha，和锁文件同一命名空间）。 */
+export function parseGitLsRemote(text) {
+  const byName = new Map()
+  let head = null
+  for (const line of String(text || '').split(/\r?\n/)) {
+    const m = /^([0-9a-f]{40})\t(\S+)$/i.exec(line.trim())
+    if (!m) continue
+    const sha = m[1]
+    const ref = m[2]
+    if (ref === 'HEAD') { head = sha; continue }
+    if (!ref.startsWith('refs/tags/')) continue
+    const peeled = ref.endsWith('^{}')
+    const name = ref.slice('refs/tags/'.length).replace(/\^\{\}$/, '')
+    if (!name) continue
+    if (!byName.has(name) || peeled) byName.set(name, sha)
+  }
+  const tags = []
+  for (const [name, sha] of byName) tags.push({ name, commit: { sha } })
+  return { head, tags }
+}
+
+/** `git ls-remote <repo> HEAD refs/tags/*`。失败收敛成 { error }，不抛。opts.spawn 可注入。 */
+export function defaultGitLsRemote(slug, opts) {
+  const o = opts || {}
+  const spawnFn = o.spawn || spawn
+  const url = 'https://github.com/' + slug + '.git'
+  const args = ['ls-remote', url, 'HEAD', 'refs/tags/*']
+  const env = githubHttpsOnlyEnv({ ...process.env })
+  return new Promise((resolve) => {
+    let child
+    try {
+      child = spawnFn('git', args, { env, windowsHide: true, stdio: ['ignore', 'pipe', 'pipe'], timeout: 20000 })
+    } catch (e) {
+      resolve({ head: null, tags: [], error: e && e.message ? e.message : String(e) })
+      return
+    }
+    let stdout = ''
+    let stderr = ''
+    const cap = (key) => (buf) => {
+      if (key === 'stdout') stdout += buf.toString('utf8')
+      else stderr += buf.toString('utf8')
+    }
+    if (child.stdout) child.stdout.on('data', cap('stdout'))
+    if (child.stderr) child.stderr.on('data', cap('stderr'))
+    let settled = false
+    const done = (val) => { if (!settled) { settled = true; resolve(val) } }
+    child.on('error', (e) => done({ head: null, tags: [], error: e && e.message ? e.message : String(e) }))
+    child.on('close', (code) => {
+      if (code !== 0) {
+        done({ head: null, tags: [], error: 'git ls-remote 退出码 ' + code + (stderr ? '：' + stderr.slice(0, 200) : '') })
+        return
+      }
+      done({ ...parseGitLsRemote(stdout), error: null })
+    })
+  })
+}
+
 /**
  * 检查远端最新版本：以 commit sha 为主判据，semver 兜底。
  * 任何网络失败都收敛成 error 字符串，绝不抛异常、绝不影响既有端点。
- * opts 全部可注入（httpsGet/cache/now），因此自测无需真实联网。
+ * GitHub API 被限流或连不上时，用 git ls-remote 补 sha 与 tag（changelog 仍只走 API）。
+ * opts 全部可注入（httpsGet/cache/now/gitLsRemote），因此自测无需真实联网。
+ * 传 gitLsRemote:false 可关掉兜底。
  * @returns {{ current, repo, hasUpdate, latest, latestTag, remoteSha, changelog, checkedAt, checked, error }}
  */
 export async function performVersionCheck(current, slug, opts) {
@@ -895,6 +1038,26 @@ export async function performVersionCheck(current, slug, opts) {
     }
   } catch (e) {
     if (!out.error) out.error = '无法连接 GitHub：' + (e && e.message ? e.message : String(e))
+  }
+
+  // API 失败时用 git ls-remote 补 sha / tag，避免 60 次/小时的未认证限额把检查锁死。
+  // changelog 仍只走 compare API：限流时摘要为空，但不挡住 hasUpdate。
+  if (out.error && o.gitLsRemote !== false) {
+    try {
+      const probe = o.gitLsRemote || defaultGitLsRemote
+      const git = await probe(slug)
+      if (git && !git.error && (git.head || (git.tags && git.tags.length))) {
+        if (git.head && !out.remoteSha) out.remoteSha = git.head
+        if ((!tag || !tags.length) && git.tags && git.tags.length) {
+          tags = git.tags
+          tag = latestTagOf(git.tags)
+        }
+        if (out.remoteSha || tag) {
+          out.error = null
+          out.source = 'git-ls-remote'
+        }
+      }
+    } catch (e) { /* 保留原来的 API 错误 */ }
   }
 
   out.latestTag = tag ? String(tag.name) : null
@@ -1164,8 +1327,19 @@ export function apply(ctx, config) {
     if (res.status !== 200 && res.status !== 201 && res.status !== 204) {
       return { ok: false, error: 'PUT 失败（HTTP ' + res.status + '）' }
     }
-    log('backup uploaded: ' + name + ' (' + bundle.length + ' bytes, ' + relFiles.length + ' files + ' + appDataFiles.length + ' appdata files)')
-    return { ok: true, name, size: bundle.length, fileCount: relFiles.length }
+    const scope = summarizePackedScope(relFiles, appDataFiles)
+    let pruned = []
+    let pruneError = null
+    try {
+      const pr = await pruneRemoteBackups(c, REMOTE_KEEP)
+      pruned = pr.deleted
+      if (pruned.length) log('remote prune: deleted ' + pruned.join(', '))
+    } catch (e) {
+      pruneError = e && e.message ? e.message : String(e)
+      log('remote prune failed: ' + pruneError)
+    }
+    log('backup uploaded: ' + name + ' (' + bundle.length + ' bytes, ' + relFiles.length + ' files + ' + appDataFiles.length + ' appdata files; scope ' + scope.topLevel.map((t) => t.name + '=' + t.files).join(',') + ')')
+    return { ok: true, name, size: bundle.length, fileCount: relFiles.length, appDataCount: appDataFiles.length, scope, pruned, pruneError }
   }
 
   const handleRestore = async (body) => {
@@ -1181,7 +1355,10 @@ export function apply(ctx, config) {
     }
     const url = remoteDirUrl(c, name)
     const res = await davRequest(url, 'GET', { username: c.username, password: c.password, timeoutMs: 120000 })
-    if (res.status !== 200) return { ok: false, error: 'GET 失败（HTTP ' + res.status + '）' }
+    if (res.error) return { ok: false, error: '下载备份失败：' + res.error }
+    if (res.status !== 200) {
+      return { ok: false, error: '下载备份失败（HTTP ' + res.status + '，Content-Type: ' + ((res.headers && res.headers['content-type']) || '-') + '）' }
+    }
     // 先解密校验（口令错误/内容损坏在这里就明确报错，绝不在解包中途才炸）
     const payload = decryptBundle(res.body, passphrase)
     // 恢复前先本地快照（安全性快照，本身就是回滚目标）
@@ -1331,7 +1508,7 @@ export function apply(ctx, config) {
     const file = join(prof.dir, 'package.json')
     // 区分「未提供」与「显式传入空值」：测试用 null 模拟找不到 pnpm，不能被 || 吞掉
     const pnpmPath = pnpmPathOpt === undefined ? findPnpmPath(process.resourcesPath) : pnpmPathOpt
-    if (!pnpmPath) return { ok: false, error: '未找到 pnpm（期望 resources/runtime/pnpm/bin/pnpm.mjs）' }
+    if (!pnpmPath) return { ok: false, error: '未找到 pnpm（期望 resources/runtime/primary-runtime/dependencies/pnpm/bin/pnpm.mjs，或旧路径 runtime/pnpm/bin/pnpm.mjs）' }
 
     // 1) 把 link:/file: 改写成仓库地址；无法推导的直接移除（宁可少装一个插件也不能让整条 install 失败）
     //    改写规则与 /plugins 报告共用 planProfileInstall，避免两处判断分叉
@@ -1366,11 +1543,13 @@ export function apply(ctx, config) {
 
     // 2) 跑 pnpm install（普通模式：顺带把锁文件里遗留的 link: specifier 一并同步，否则后续
     //    DSH 自己的 pnpm install --frozen-lockfile 会因为 package.json 与锁文件不一致而失败）
-    const args = [pnpmPath, 'install']
+    // 对齐桌面版 runDesktopCli：electron 当 node 跑 pnpm.mjs，并带上 --expose-internals
+    const args = ['--expose-internals', pnpmPath, 'install']
+    if (opts && opts.force) args.push('--force')
     installing = true
     const startedAt = Date.now()
     // 升级路径装的是 github: 依赖，必须把 git 的 SSH 回退拉回 HTTPS（见 githubHttpsOnlyEnv）
-    const baseEnv = { ...process.env, ELECTRON_RUN_AS_NODE: '1' }
+    const baseEnv = { ...process.env, ELECTRON_RUN_AS_NODE: '1', DSH_DESKTOP_NODE_EXECUTABLE: process.execPath }
     const childEnv = opts && opts.githubHttpsOnly ? githubHttpsOnlyEnv(baseEnv) : baseEnv
     let r
     try {
@@ -1514,9 +1693,9 @@ export function apply(ctx, config) {
    * 确定性 spec（github:<owner>/<repo>#<tag|sha>），备份 package.json，再复用既有的
    * runProfileInstall() 跑一次 pnpm install（单飞护栏/超时/日志截断都在里面）。
    *
-   * 为什么复用裸 `pnpm install` 就够：pnpm 的「锁文件已最新 → 跳过 resolution」只对裸 install 生效；
-   * 一旦 specifier 本身变了（link: → github:#tag）它就必然重新解析该依赖。这也是这里必须
-   * 先断言 spec 真的变了的原因 —— 没变就别白跑一次安装。
+   * 为什么升级要带 --force：pnpm 看到 specifier 字符串没变时会认为锁文件已最新而跳过。
+   * 「声明已是 #vX、node_modules 里仍是旧版本」正是这种错位。spec 与已装版本、锁文件 sha
+   * 三者一致才跳过安装；否则强制重装。安装失败会把 package.json 从备份还原回去。
    *
    * 安全红线：只改写 dependencies[<name>] 这一个键，其它依赖键与 dsh.profile.bundles 等字段原样保留。
    */
@@ -1561,32 +1740,51 @@ export function apply(ctx, config) {
       pkg.dependencies = (pkg.dependencies && typeof pkg.dependencies === 'object') ? pkg.dependencies : {}
       const newSpec = 'github:' + slug + '#' + ref
       const oldSpec = pkg.dependencies[pkgName]
-      // spec 未变 → 已在该 ref 上，直接返回，不白跑一次 pnpm install
-      if (String(oldSpec) === newSpec) {
-        return { ok: true, upgraded: false, from: info.current, to: ver.latest, spec: newSpec, exitCode: 0, durationMs: Date.now() - started, needRestart: false, before: { version: info.current, spec: oldSpec === undefined ? null : String(oldSpec) }, backup: null, log: '', error: null }
-      }
-      pkg.dependencies[pkgName] = newSpec
-      const backup = file + '.bak-dsh-sync-' + new Date().toISOString().replace(/[-:T]/g, '').slice(0, 14)
+      // spec 字符串相同还不够：node_modules 里的版本和锁文件 sha 也得对上，
+      // 否则「声明已是目标 tag、内容仍是旧提交」会被短路，升级按钮永远空转。
+      let installedVer = null
       try {
-        copyFileSync(file, backup)
-        writeJsonFile(file, pkg)
-      } catch (e) {
-        return { ok: false, error: '改写 profile package.json 失败：' + (e && e.message ? e.message : String(e)), durationMs: Date.now() - started }
+        installedVer = JSON.parse(readFileSync(join(info.prof.dir, 'node_modules', pkgName, 'package.json'), 'utf8')).version
+      } catch (e) { installedVer = null }
+      const tagged = ver.latestTag ? String(ver.latestTag).replace(/^v/, '') : null
+      const specSame = String(oldSpec) === newSpec
+      const versionOk = !tagged || installedVer === tagged
+      const shaOk = !ver.remoteSha || (info.localSha && info.localSha === ver.remoteSha)
+      if (specSame && versionOk && shaOk) {
+        return { ok: true, upgraded: false, alreadyLatest: true, from: info.current, to: info.current, spec: newSpec, exitCode: 0, durationMs: Date.now() - started, needRestart: false, before: { version: info.current, spec: oldSpec === undefined ? null : String(oldSpec) }, backup: null, log: '', error: null }
       }
-      if (!nonTargetFieldsIntact(before, pkg, pkgName)) {
-        return { ok: false, error: '改写后校验失败：目标依赖之外的字段发生变化，已终止（备份见 ' + backup + '）', durationMs: Date.now() - started }
+      let backup = null
+      if (!specSame) {
+        pkg.dependencies[pkgName] = newSpec
+        backup = file + '.bak-dsh-sync-' + new Date().toISOString().replace(/[-:T]/g, '').slice(0, 14)
+        try {
+          copyFileSync(file, backup)
+          writeJsonFile(file, pkg)
+        } catch (e) {
+          return { ok: false, error: '改写 profile package.json 失败：' + (e && e.message ? e.message : String(e)), durationMs: Date.now() - started }
+        }
+        if (!nonTargetFieldsIntact(before, pkg, pkgName)) {
+          try { copyFileSync(backup, file) } catch (e2) { /* ignore */ }
+          return { ok: false, error: '改写后校验失败：目标依赖之外的字段发生变化，已还原 package.json（备份见 ' + backup + '）', durationMs: Date.now() - started }
+        }
+        log('upgrade: ' + (oldSpec === undefined ? '(none)' : String(oldSpec)) + ' -> ' + newSpec + ' (backup ' + backup + ')')
+      } else {
+        log('upgrade: spec already ' + newSpec + ' but installed content is ' + (installedVer || 'missing') + ' / sha ' + (info.localSha || 'none') + '; forcing install')
       }
-      log('upgrade: ' + (oldSpec === undefined ? '(none)' : String(oldSpec)) + ' -> ' + newSpec + ' (backup ' + backup + ')')
 
-      // 5) 复用既有安装路径（绝不新写第二条 pnpm install 分支）
+      // 5) 复用既有安装路径（绝不新写第二条 pnpm install 分支）。force：摆脱「spec 没变就跳过」。
       const install = o.install || ((r, p, op) => runProfileInstall(r || defaultRunner, p, op))
-      const ir = await install(o.runner, o.pnpmPath, { githubHttpsOnly: true })
+      const ir = await install(o.runner, o.pnpmPath, { githubHttpsOnly: true, force: true })
       const logTail = (ir && ir.log) ? String(ir.log) : ''
       if (!ir || !ir.ok) {
-        return { ok: false, error: (ir && ir.error) ? ir.error : 'pnpm install 失败', log: logTail, durationMs: Date.now() - started, backup, from: info.current, to: ver.latest, spec: newSpec }
+        let restored = false
+        if (backup) {
+          try { copyFileSync(backup, file); restored = true; log('upgrade failed; package.json restored from ' + backup) } catch (e) { /* ignore */ }
+        }
+        return { ok: false, restored, error: (ir && ir.error) ? ir.error : 'pnpm install 失败', log: logTail, durationMs: Date.now() - started, backup, from: info.current, to: ver.latest, spec: newSpec }
       }
-      // 6) 重新读 profile package.json 确认 spec 已落地；to = 目标版本，needRestart 恒为 true
-      //    （插件代码在 DSH 启动时加载，生效必须重启 —— 已实测确认）
+      // 6) 重新读 profile package.json 确认 spec 已落地，并核对 node_modules 里的实际版本。
+      //    to = 目标版本，needRestart 恒为 true（插件代码在 DSH 启动时加载，生效必须重启）。
       let confirmed = null
       try {
         const after = JSON.parse(readFileSync(file, 'utf8'))
@@ -1594,6 +1792,11 @@ export function apply(ctx, config) {
       } catch (e) { confirmed = null }
       if (String(confirmed) !== newSpec) {
         return { ok: false, error: '安装后校验失败：profile 里仍是 ' + String(confirmed), log: logTail, durationMs: Date.now() - started, backup, from: info.current, to: ver.latest, spec: newSpec }
+      }
+      let afterVer = null
+      try { afterVer = JSON.parse(readFileSync(join(info.prof.dir, 'node_modules', pkgName, 'package.json'), 'utf8')).version } catch (e) { afterVer = null }
+      if (afterVer && tagged && tagged !== String(afterVer)) {
+        return { ok: false, error: '安装后校验失败：node_modules 里是 ' + afterVer + '，目标是 ' + ver.latest, log: logTail, durationMs: Date.now() - started, backup, from: info.current, to: ver.latest, spec: newSpec }
       }
       log('upgrade ok: ' + info.current + ' -> ' + ver.latest + ' in ' + (Date.now() - started) + 'ms')
       return {

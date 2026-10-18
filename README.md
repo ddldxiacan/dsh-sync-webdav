@@ -85,7 +85,7 @@ dsh-sync 把这件事变成两个按钮：**备份**（加密上传）和**恢�
 因此：
 
 - **本地已装 sha**：从 profile 的 `pnpm-lock.yaml` 中提取（用「任意 40 位 hex」匹配——同一条 `github:` specifier 会产出 codeload / `git+ssh` / `git+https` 三种锁文件形态，字段名不统一）
-- **远端最新 sha**：`git ls-remote <repo> HEAD` 或 GitHub API `commits/main`
+- **远端最新 sha**：优先 GitHub API `commits/main`；API 限流或连不上时回退到 `git ls-remote <repo> HEAD`（tag 同样从 `refs/tags/*` 解析）。changelog 仍只走 compare API，限流时摘要可以为空，但「有没有更新」不再被锁死
 - 两者不等即为「有更新」；`latest` 字段优先取最高的 `v*` tag，无 tag 时退化为 sha 前 7 位
 
 > 注意：`node_modules/<包名>/` 里的文件**不含** sha，不能从那里读本地版本。
@@ -132,11 +132,13 @@ git push origin main --tags
 
 打包 `~/.dsh` 下**除以下之外**的全部内容：
 
-- `dsh-runtimes/`（Node 运行时，体积大且与机器架构相关）
+- `dsh-runtimes/`（按目录名整棵排除。Node 运行时体积大且与机器架构相关，**不是**靠单文件大小上限排除的）
 - `node_modules/`（插件依赖，**实测 800MB+**，可由 pnpm 重装）
 - `sessions/`（会话历史，属可再生的使用记录，**这是唯一不同步的对话数据**）
 - `logs/`、`npm-cache/`、`tmp*/`、`cache*/`
-- 单个大于 50MB 的文件
+- 上述目录之外，单个大于 50MB 的文件
+
+远端目录只保留最近 **5** 份 `.bundle`，更旧的在备份成功后自动 `DELETE`。备份结果会带上打包范围（每个顶层目录有多少文件），体积异常时能直接看出来。
 
 **v0.3.0 起额外同步 Electron 应用级设置**：`%APPDATA%\@deepseek-ai\dsh-desktop\desktop\settings.json` 等用户配置文件，以 `__appdata__/` 前缀并入同一加密备份，恢复/回滚时自动写回原位（Chromium 缓存类目录与 >2MB 文件仍排除，不撑大备份）。
 
@@ -221,7 +223,7 @@ dsh-sync-release/
 |---|---|---|
 | `GET /dsh-sync/status` | — | `{ configured, remote: { reachable, backups: [{name,size,modified}], latest? }, lastLocalSnapshot? }` |
 | `POST /dsh-sync/config` | `{ url, username, password, remoteDir }` | `{ ok: true }`（先做连通性测试，失败不保存） |
-| `POST /dsh-sync/backup` | `{ passphrase }` | `{ ok: true, name, size, fileCount }` |
+| `POST /dsh-sync/backup` | `{ passphrase }` | `{ ok: true, name, size, fileCount, scope, pruned }` |
 | `POST /dsh-sync/restore` | `{ name?, passphrase }` | `{ ok: true, restored, snapshot, meta? }` |
 | `POST /dsh-sync/rollback` | `{ snapshot }` | `{ ok: true, restored }` |
 | `GET /dsh-sync/plugins` | — | `{ ok: true, profile, profileDir, deps: [{name, spec, kind, installed, rewrite?}], missing, needsInstall, mapped, pnpm: {available, path?}, lastRestore? }` |
@@ -253,5 +255,5 @@ node tools-selftest.mjs
 2. **恢复与回滚只覆盖不删除**：回滚不会清除「快照之后新增的文件」。这是为保护 `dsh-runtimes/` 等排除项而做的取舍。
 3. Windows 保留设备名（`CON`/`NUL`/`COM1` 等）未被路径校验拦截——它们只会解析到 `~/.dsh` 内部，不构成逃逸，属已评估的低危残余。
 4. 插件本身**不处理 `app.asar` 补丁**。第三方模型推理档位修复需在新机器上单独重放，见 `reasoning-effort-fix/README.md`。
-5. **版本检查走未认证 GitHub API，限额 60 次/小时（按 IP）**。每次检查约花 2~3 个请求，检查结果在进程内缓存 10 分钟；限额耗尽时界面会显示「GitHub API 限流（HTTP 403），请稍后重试」，稍等即可，不影响备份/恢复等其它功能。
+5. **版本检查优先走未认证 GitHub API，限额 60 次/小时（按 IP）**。每次成功的 API 检查约花 2~3 个请求，结果在进程内缓存 10 分钟。限额耗尽或 API 连不上时，会改用本机 `git ls-remote` 取 HEAD sha 和 tag，检查不会因此停摆；这时更新摘要可能为空。备份/恢复不依赖这条通道。
 6. **仓库改名自动跟随**：若本仓库日后再次改名，GitHub 会对旧地址返回 301。`git`/`pnpm` 会自动跟随（安装不受影响），插件的网络层也已实现 301 跟随（v0.2.1 起），老版本的升级检查不会因此失效。

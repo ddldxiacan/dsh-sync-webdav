@@ -15,6 +15,7 @@ import {
   isExcludedAppData, collectAppDataFiles, appDataAbsPath,
   bundleName, makeSnapshot, rollbackFromSnapshot, isExcluded,
   davRequest, ensureRemoteDir, parsePropfind, listRemoteBackups,
+  summarizePackedScope, pruneRemoteBackups, parseGitLsRemote,
   repoSpecFromUrl, depKind, collectInstallMeta, extractPayloadMeta,
   writeLastRestore, readLastRestore, planProfileInstall, findPnpmPath,
   createTestHarness,
@@ -226,6 +227,13 @@ try {
   // parsePropfind 单元
   const parsed = parsePropfind('<?xml version="1.0"?><D:multistatus xmlns:D="DAV:"><D:response><D:href>/dav/a.bundle</D:href><D:propstat><D:prop><D:getcontentlength>123</D:getcontentlength><D:getlastmodified>M</D:getlastmodified></D:prop></D:propstat></D:response></D:multistatus>')
   check('parsePropfind extracts name/size', parsed.length === 1 && parsed[0].name === 'a.bundle' && parsed[0].size === 123 && !parsed[0].isDir)
+  const cosXml = '<?xml version="1.0"?><D:multistatus xmlns:D="DAV:"><D:response><D:href>/dav/dsh-sync/</D:href><D:propstat><D:prop><D:resourcetype><D:collection xmlns:D="DAV:"/></D:resourcetype></D:prop><D:status>HTTP/1.1 200 OK</D:status></D:propstat><D:propstat><D:prop><D:getcontentlength></D:getcontentlength></D:prop><D:status>HTTP/1.1 404 Not Found</D:status></D:propstat></D:response><D:response><D:href>/dav/a.bundle</D:href><D:propstat><D:prop><D:getcontentlength>100</D:getcontentlength></D:prop></D:propstat></D:response></D:multistatus>'
+  const cosParsed = parsePropfind(cosXml)
+  const cosDir = cosParsed.find((e) => e.name === 'dsh-sync')
+  const cosFile = cosParsed.find((e) => e.name === 'a.bundle')
+  check('parsePropfind: 带属性的 collection 识别为目录', !!(cosDir && cosDir.isDir === true), JSON.stringify(cosDir))
+  check('parsePropfind: 空 getcontentlength 是未知大小而不是 0', !!(cosDir && cosDir.size === null), JSON.stringify(cosDir))
+  check('parsePropfind: 普通文件仍有大小且不是目录', !!(cosFile && cosFile.isDir === false && cosFile.size === 100))
 
   server.close()
 } finally {
@@ -359,8 +367,8 @@ check('depKind: registry 版本号', depKind('^0.4.6') === 'registry' && depKind
     check('client 契约: rewritten 是 包名→声明 映射', res.rewritten['dsh-sync-webdav'] === 'github:ddldxiacan/dsh-sync-release')
     check('client 契约: removed 是包名数组', Array.isArray(res.removed) && res.removed.length === 0)
     check('E2E: 命令行为 pnpm install（不带 lockfile 相关 flag）',
-      captured.args.length === 2 && captured.args[0] === 'C:/fake/pnpm.mjs' && captured.args[1] === 'install')
-    check('E2E: cwd 与 ELECTRON_RUN_AS_NODE 正确', captured.cwd === join(rootB, 'profiles', 'desktop') && captured.env.ELECTRON_RUN_AS_NODE === '1')
+      captured.args.length === 3 && captured.args[0] === '--expose-internals' && captured.args[1] === 'C:/fake/pnpm.mjs' && captured.args[2] === 'install')
+    check('E2E: cwd 与 ELECTRON_RUN_AS_NODE 正确', captured.cwd === join(rootB, 'profiles', 'desktop') && captured.env.ELECTRON_RUN_AS_NODE === '1' && captured.env.DSH_DESKTOP_NODE_EXECUTABLE === process.execPath)
     check('E2E: 超时为 15 分钟', captured.timeout === 15 * 60 * 1000)
     const pkgAfter = JSON.parse(readFileSync(join(rootB, 'profiles', 'desktop', 'package.json'), 'utf8'))
     check('E2E: package.json 里 link: 已改写为仓库地址', pkgAfter.dependencies['dsh-sync-webdav'] === 'github:ddldxiacan/dsh-sync-release')
@@ -405,7 +413,7 @@ check('depKind: registry 版本号', depKind('^0.4.6') === 'registry' && depKind
     check('不可推导的 link 依赖被移除', res.ok === true && res.removed.includes('ghost-plugin'))
     const pkg = JSON.parse(readFileSync(join(root, 'profiles', 'desktop', 'package.json'), 'utf8'))
     check('package.json 里该依赖已删除', pkg.dependencies['ghost-plugin'] === undefined)
-    check('移除依赖后 pnpm 仍能装（命令已下发）', captured.args[1] === 'install')
+    check('移除依赖后 pnpm 仍能装（命令已下发）', captured.args[0] === '--expose-internals' && captured.args[2] === 'install')
   } finally {
     try { rmSync(root, { recursive: true, force: true }) } catch (e) { /* ignore */ }
   }
@@ -558,13 +566,23 @@ check('depKind: registry 版本号', depKind('^0.4.6') === 'registry' && depKind
   // 网络失败：收敛成 error，绝不抛
   const offline = await performVersionCheck('0.1.0', 'ddldxiacan/dsh-sync-release', {
     httpsGet: async () => ({ status: null, body: '', error: 'getaddrinfo ENOTFOUND api.github.com' }), cache: new Map(), localSha: shaLocal,
+    gitLsRemote: false,
   })
   check('版本检查: 断网时返回 error 且不抛异常', offline.hasUpdate === false && /ENOTFOUND/.test(String(offline.error)), String(offline.error))
 
   const rate = await performVersionCheck('0.1.0', 'ddldxiacan/dsh-sync-release', {
     httpsGet: async () => ({ status: 403, body: '', error: null }), cache: new Map(), localSha: shaLocal,
+    gitLsRemote: false,
   })
   check('版本检查: GitHub 限流(403)给出可读错误', /限流/.test(String(rate.error)) && rate.hasUpdate === false, String(rate.error))
+
+  const rateRecovered = await performVersionCheck('0.1.0', 'ddldxiacan/dsh-sync-release', {
+    httpsGet: async () => ({ status: 403, body: '', error: null }), cache: new Map(), localSha: shaLocal,
+    gitLsRemote: async () => ({ head: shaRemote, tags: [{ name: 'v0.2.0', commit: { sha: shaRemote } }], error: null }),
+  })
+  check('版本检查: API 限流时用 git ls-remote 兜底出 sha 与 tag',
+    rateRecovered.error === null && rateRecovered.remoteSha === shaRemote && rateRecovered.hasUpdate === true && rateRecovered.latest === 'v0.2.0' && rateRecovered.source === 'git-ls-remote',
+    JSON.stringify({ error: rateRecovered.error, latest: rateRecovered.latest, source: rateRecovered.source, hasUpdate: rateRecovered.hasUpdate }))
 
   // 无 tag 时 latest 退化为 7 位 sha
   const noTags = await performVersionCheck('0.1.0', 'ddldxiacan/dsh-sync-release', {
@@ -670,7 +688,11 @@ check('depKind: registry 版本号', depKind('^0.4.6') === 'registry' && depKind
     let installArgs = null
     const u = await h.handleUpgrade({}, {}, {
       check: async () => ({ ...fakeCheck }),
-      install: async (runner, pnpmPath) => { installArgs = { runner, pnpmPath }; return { ok: true, exitCode: 0, log: 'Done in 7.4s' } },
+      install: async (runner, pnpmPath, op) => {
+        installArgs = { runner, pnpmPath, op }
+        writeFileSync(join(prof, 'node_modules', NAME, 'package.json'), JSON.stringify({ name: NAME, version: '0.2.0' }), 'utf8')
+        return { ok: true, exitCode: 0, log: 'Done in 7.4s' }
+      },
     })
     check('POST /upgrade: 成功路径 ok=true 且 upgraded=true', u.ok === true && u.upgraded === true, JSON.stringify({ ok: u.ok, err: u.error }))
     check('POST /upgrade: 新 spec 是 github:<slug>#<tag> 且与旧 spec 不同', u.spec === newSpec && u.spec !== oldSpec, String(u.spec))
@@ -683,19 +705,37 @@ check('depKind: registry 版本号', depKind('^0.4.6') === 'registry' && depKind
       JSON.stringify({ ...after, dependencies: { ...after.dependencies, [NAME]: oldSpec } }) === JSON.stringify(pkg0))
     check('POST /upgrade: 改写了真实 profile package.json 已生成备份', typeof u.backup === 'string' && existsSync(u.backup) && JSON.parse(readFileSync(u.backup, 'utf8')).dependencies[NAME] === oldSpec)
     check('POST /upgrade: 复用了既有安装路径（未自己拼 pnpm 命令）', installArgs !== null && installArgs.runner === undefined)
+    check('POST /upgrade: 升级安装带 --force', installArgs && installArgs.op && installArgs.op.force === true && installArgs.op.githubHttpsOnly === true)
 
-    // 已在目标 ref：不得白跑一次安装
+    // spec、已装版本、锁文件 sha 三者一致才跳过
+    writeFileSync(join(prof, 'pnpm-lock.yaml'), 'lockfileVersion: 9\nimporters:\n  .:\n    dependencies:\n      ' + NAME + ':\n        specifier: ' + newSpec + '\n        resolution: {commit: ' + 'b'.repeat(40) + ', type: git}\n', 'utf8')
     let ran = 0
     const u2 = await h.handleUpgrade({}, {}, { check: async () => ({ ...fakeCheck, latest: 'v0.2.0' }), install: async () => { ran++; return { ok: true, log: '' } } })
-    check('POST /upgrade: spec 未变时回报「已是最新」且不跑安装', u2.ok === true && u2.upgraded === false && ran === 0, JSON.stringify({ ok: u2.ok, upgraded: u2.upgraded, ran }))
+    check('POST /upgrade: spec 与内容都已对齐时不跑安装', u2.ok === true && u2.upgraded === false && u2.alreadyLatest === true && ran === 0, JSON.stringify({ ok: u2.ok, upgraded: u2.upgraded, already: u2.alreadyLatest, ran }))
+
+    // spec 相同但 node_modules 仍是旧版本：必须继续安装
+    writeFileSync(join(prof, 'node_modules', NAME, 'package.json'), JSON.stringify({ name: NAME, version: '0.1.0' }), 'utf8')
+    let ranMismatch = 0
+    const u2b = await h.handleUpgrade({}, {}, {
+      check: async () => ({ ...fakeCheck }),
+      install: async () => {
+        ranMismatch++
+        writeFileSync(join(prof, 'node_modules', NAME, 'package.json'), JSON.stringify({ name: NAME, version: '0.2.0' }), 'utf8')
+        return { ok: true, log: '' }
+      },
+    })
+    check('POST /upgrade: spec 相同但 node_modules 版本不符时必须继续安装', u2b.ok === true && u2b.upgraded === true && ranMismatch === 1, JSON.stringify({ ok: u2b.ok, upgraded: u2b.upgraded, err: u2b.error, ran: ranMismatch }))
 
     // 无更新
     const u3 = await h.handleUpgrade({}, {}, { check: async () => ({ hasUpdate: false, latest: null, error: null }), install: async () => { ran++; return { ok: true, log: '' } } })
     check('POST /upgrade: 无更新时不安装', u3.ok === true && u3.upgraded === false && ran === 0)
 
-    // 安装失败：ok=false，但 spec 已落地（如实回报，不谎报成功）
+    // 安装失败：ok=false，且 package.json 必须回到升级前的字节
+    const beforeFail = readFileSync(join(prof, 'package.json'))
     const u4 = await h.handleUpgrade({}, {}, { check: async () => ({ ...fakeCheck, latest: 'v0.3.0', latestTag: 'v0.3.0' }), install: async () => ({ ok: false, error: 'pnpm install 退出码 1', log: 'ERR' }) })
+    const afterFail = readFileSync(join(prof, 'package.json'))
     check('POST /upgrade: 安装失败时 ok=false 且带日志', u4.ok === false && /退出码 1/.test(u4.error) && /ERR/.test(String(u4.log)))
+    check('POST /upgrade: install 失败后 package.json 与升级前逐字节一致', u4.restored === true && beforeFail.equals(afterFail))
 
     // 安装后 package.json 未落地目标 spec：必须报错而不是谎报成功
     const u5 = await h.handleUpgrade({}, {}, {
@@ -822,6 +862,134 @@ check('depKind: registry 版本号', depKind('^0.4.6') === 'registry' && depKind
     request: (u, opts, cb) => { sawUA = opts.headers['User-Agent']; return makeRequest({ 'https://api.github.com/ua': { status: 200, body: '{}' } })(u, opts, cb) },
   })
   check('请求始终带 User-Agent（否则 GitHub 403）', !!sawUA, sawUA)
+}
+
+// ---------- 8. 302 跟随、pnpm 候选路径、远端轮转、git ls-remote ----------
+{
+  const scope = summarizePackedScope(['profiles/desktop/a.json', 'profiles/desktop/b.json', 'settings.yaml'], ['__appdata__/dsh-desktop/settings.json'])
+  check('summarizePackedScope: 顶层目录计数', scope.fileCount === 3 && scope.appDataFiles === 1 && scope.topLevel.some((t) => t.name === 'profiles' && t.files === 2) && scope.topLevel.some((t) => t.name === '(files)' && t.files === 1))
+
+  const ls = parseGitLsRemote([
+    'a'.repeat(40) + '\tHEAD',
+    'b'.repeat(40) + '\trefs/tags/v0.3.0',
+    'c'.repeat(40) + '\trefs/tags/v0.3.1',
+    'd'.repeat(40) + '\trefs/tags/v0.3.1^{}',
+  ].join('\n'))
+  const tag031 = ls.tags.find((t) => t.name === 'v0.3.1')
+  check('parseGitLsRemote: HEAD 与剥离开的 tag commit', ls.head === 'a'.repeat(40) && tag031 && tag031.commit.sha === 'd'.repeat(40) && ls.tags.length === 2)
+
+  const pnpmRoot = join(tmpdir(), 'dsh-sync-pnpm-' + Date.now())
+  try {
+    const modern = join(pnpmRoot, 'resources', 'runtime', 'primary-runtime', 'dependencies', 'pnpm', 'bin', 'pnpm.mjs')
+    const legacy = join(pnpmRoot, 'resources-old', 'runtime', 'pnpm', 'bin', 'pnpm.mjs')
+    const homePnpm = join(pnpmRoot, 'home-rt', '0.2.1', 'runtime', 'primary-runtime', 'dependencies', 'pnpm', 'bin', 'pnpm.mjs')
+    mkdirSync(join(pnpmRoot, 'resources', 'runtime', 'primary-runtime', 'dependencies', 'pnpm', 'bin'), { recursive: true })
+    mkdirSync(join(pnpmRoot, 'resources-old', 'runtime', 'pnpm', 'bin'), { recursive: true })
+    mkdirSync(join(pnpmRoot, 'home-rt', '0.2.1', 'runtime', 'primary-runtime', 'dependencies', 'pnpm', 'bin'), { recursive: true })
+    writeFileSync(modern, '// pnpm\n', 'utf8')
+    writeFileSync(legacy, '// pnpm\n', 'utf8')
+    writeFileSync(homePnpm, '// pnpm\n', 'utf8')
+    check('findPnpmPath: 优先当前桌面版布局', findPnpmPath(join(pnpmRoot, 'resources'), { homeRoot: null }) === modern)
+    check('findPnpmPath: 旧布局仍能找到', findPnpmPath(join(pnpmRoot, 'resources-old'), { homeRoot: null }) === legacy)
+    check('findPnpmPath: resources 没有时兜底 dsh-runtimes', findPnpmPath(join(pnpmRoot, 'missing'), { homeRoot: join(pnpmRoot, 'home-rt') }) === homePnpm)
+    check('findPnpmPath: 都没有返回 null', findPnpmPath(join(pnpmRoot, 'missing'), { homeRoot: join(pnpmRoot, 'empty-home') }) === null)
+  } finally {
+    try { rmSync(pnpmRoot, { recursive: true, force: true }) } catch (e) { /* ignore */ }
+  }
+
+  // 跨主机 302：第二跳不得带 Authorization
+  const blob = Buffer.from('DSHSYNC1-redirected')
+  const srvB = createServer((req, res) => {
+    srvB.__auth = req.headers.authorization || ''
+    srvB.__hits = (srvB.__hits || 0) + 1
+    res.writeHead(200, { 'Content-Type': 'application/octet-stream' })
+    res.end(blob)
+  })
+  const srvA = createServer((req, res) => {
+    srvA.__auth = req.headers.authorization || ''
+    if (req.method === 'PUT') {
+      res.writeHead(302, { Location: '/should-not-follow' })
+      return res.end()
+    }
+    const portB = srvB.address().port
+    res.writeHead(302, { Location: 'http://127.0.0.1:' + portB + '/blob' })
+    res.end()
+  })
+  await new Promise((r) => srvB.listen(0, '127.0.0.1', r))
+  await new Promise((r) => srvA.listen(0, '127.0.0.1', r))
+  try {
+    const urlA = 'http://127.0.0.1:' + srvA.address().port + '/dav/file.bundle'
+    const got = await davRequest(urlA, 'GET', { username: 'user', password: 'pw' })
+    check('davRequest: GET 跟随 302 拿到正文', got.status === 200 && got.body.equals(blob) && !got.error, 'status=' + got.status + ' err=' + got.error)
+    check('davRequest: 跨主机重定向去掉 Authorization', srvA.__auth.startsWith('Basic ') && srvB.__auth === '', 'A=' + srvA.__auth + ' B=' + srvB.__auth)
+    const put = await davRequest(urlA, 'PUT', { username: 'user', password: 'pw', body: Buffer.from('x') })
+    check('davRequest: PUT 不跟随 302', put.status === 302 && srvB.__hits === 1, 'status=' + put.status + ' hitsB=' + srvB.__hits)
+
+    // 同主机相对跳转仍带凭据
+    const srvC = createServer((req, res) => {
+      if (req.url === '/a') {
+        srvC.__authA = req.headers.authorization || ''
+        res.writeHead(302, { Location: '/b' })
+        return res.end()
+      }
+      srvC.__authB = req.headers.authorization || ''
+      res.writeHead(200)
+      res.end('ok-same-host')
+    })
+    await new Promise((r) => srvC.listen(0, '127.0.0.1', r))
+    try {
+      const same = await davRequest('http://127.0.0.1:' + srvC.address().port + '/a', 'GET', { username: 'user', password: 'pw' })
+      check('davRequest: 同主机重定向保留 Authorization', same.status === 200 && same.body.toString('utf8') === 'ok-same-host' && srvC.__authA.startsWith('Basic ') && srvC.__authB.startsWith('Basic '))
+    } finally { srvC.close() }
+  } finally {
+    srvA.close()
+    srvB.close()
+  }
+
+  const dav = createServer((req, res) => {
+    const u = new URL(req.url, 'http://127.0.0.1')
+    const path = u.pathname
+    if (req.headers.authorization !== 'Basic ' + Buffer.from('user:pw').toString('base64')) {
+      res.writeHead(401); return res.end()
+    }
+    if (req.method === 'PROPFIND') {
+      const names = [...dav.__files.keys()].sort()
+      const rows = names.map((n) => '<D:response><D:href>/dav/' + n + '</D:href><D:propstat><D:prop><D:getcontentlength>' + dav.__files.get(n).length + '</D:getcontentlength></D:prop></D:propstat></D:response>')
+      res.writeHead(207, { 'Content-Type': 'application/xml' })
+      return res.end('<?xml version="1.0"?><D:multistatus xmlns:D="DAV:">' + rows.join('') + '</D:multistatus>')
+    }
+    if (req.method === 'DELETE') {
+      const name = path.split('/').pop()
+      dav.__files.delete(name)
+      res.writeHead(204)
+      return res.end()
+    }
+    res.writeHead(405); res.end()
+  })
+  dav.__files = new Map()
+  for (const n of ['dsh-sync-20261016-010000.bundle', 'dsh-sync-20261017-010000.bundle', 'dsh-sync-20261018-010000.bundle', 'dsh-sync-20261018-020000.bundle']) {
+    dav.__files.set(n, Buffer.from(n))
+  }
+  await new Promise((r) => dav.listen(0, '127.0.0.1', r))
+  try {
+    const cfg = { url: 'http://127.0.0.1:' + dav.address().port + '/dav/', username: 'user', password: 'pw', remoteDir: '' }
+    const pruned = await pruneRemoteBackups(cfg, 2)
+    check('pruneRemoteBackups: 只删最旧的、保留最近 N 份',
+      pruned.deleted.length === 2 && pruned.deleted[0].includes('20261016') && pruned.kept.length === 2 && pruned.kept[1].includes('020000') && dav.__files.size === 2,
+      JSON.stringify(pruned))
+  } finally { dav.close() }
+
+  const forceRoot = join(tmpdir(), 'dsh-sync-force-' + Date.now())
+  try {
+    mkdirSync(join(forceRoot, 'profiles', 'desktop'), { recursive: true })
+    writeFileSync(join(forceRoot, 'profiles', 'desktop', 'package.json'), JSON.stringify({ dependencies: {} }), 'utf8')
+    const h = createTestHarness({ root: forceRoot, profile: 'desktop' })
+    let seen = null
+    await h.runProfileInstall(async (opt) => { seen = opt.args; return { status: 0, stdout: '', stderr: '' } }, 'C:/fake/pnpm.mjs', { force: true })
+    check('runProfileInstall: force 追加 --force', Array.isArray(seen) && seen[0] === '--expose-internals' && seen[seen.length - 1] === '--force' && seen.includes('install'))
+  } finally {
+    try { rmSync(forceRoot, { recursive: true, force: true }) } catch (e) { /* ignore */ }
+  }
 }
 
 console.log('\n==== ' + pass + ' passed, ' + fail + ' failed ====')

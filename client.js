@@ -10,15 +10,15 @@
  * 与 Host 半区（index.js）通过 HTTP 端点通信，契约冻结：
  *   GET  /dsh-sync/status                          -> { configured, remote:{reachable,backups[],latest?}, lastLocalSnapshot?, error? }
  *   POST /dsh-sync/config   {url,username,password,remoteDir} -> { ok:true } | { ok:false, error }
- *   POST /dsh-sync/backup   {passphrase}            -> { ok:true, name, size, fileCount } | { ok:false, error }
+ *   POST /dsh-sync/backup   {passphrase}            -> { ok:true, name, size, fileCount, scope, pruned } | { ok:false, error }
  *   POST /dsh-sync/restore  {name?, passphrase}     -> { ok:true, restored, snapshot }    | { ok:false, error }
  *   POST /dsh-sync/rollback {snapshot}              -> { ok:true, restored }              | { ok:false, error }
  *   GET  /dsh-sync/plugins                          -> { ok:true, profile, deps[], missing[], needsInstall, pnpm }
  *   POST /dsh-sync/plugins/install {}               -> { ok:true, installed[], rewritten{}, removed[], durationMs, log } | { ok:false, error, log }
  *   GET  /dsh-sync/version[?force=1]                -> { ok:true, current, mode:'dev'|'managed', kind, spec, repo, hasUpdate,
  *                                                        latest, changelog[], checkedAt, checked, currentSha, latestSha, error }
- *   POST /dsh-sync/upgrade  {}                      -> { ok:true, from, to, upgraded, spec, exitCode, durationMs, needRestart,
- *                                                        before, backup, log, error } | { ok:false, error, log? }
+ *   POST /dsh-sync/upgrade  {}                      -> { ok:true, from, to, upgraded, alreadyLatest?, spec, exitCode, durationMs, needRestart,
+ *                                                        before, backup, log, error } | { ok:false, error, log?, restored? }
  * 所有响应 HTTP 200，按 `ok` 字段判断成败；错误统一在 `error` 字段。
  *
  * version 端点两条语义约定（宿主以 git commit sha 比较为主，不靠 semver）：
@@ -62,6 +62,7 @@ window.__ModuleLoader__.load({
 
     /** 字节数的可读展示。 */
     function formatSize(bytes) {
+      if (bytes === null || bytes === undefined || bytes === '') return '—';
       const n = Number(bytes);
       if (!isFinite(n) || n < 0) return '—';
       if (n < 1024) return n + ' B';
@@ -453,7 +454,11 @@ window.__ModuleLoader__.load({
         setBusy('');
         if (consume(res, null)) {
           const d = res.data || {};
-          setMsg({ kind: 'ok', text: '备份成功：' + (d.name || '') + '（' + formatSize(d.size) + '，' + (d.fileCount || 0) + ' 个文件）' });
+          const tops = (d.scope && Array.isArray(d.scope.topLevel) && d.scope.topLevel.length)
+            ? '；范围 ' + d.scope.topLevel.map((t) => t.name + '×' + t.files).join('、')
+            : '';
+          const prunedNote = (Array.isArray(d.pruned) && d.pruned.length) ? '；已清理 ' + d.pruned.length + ' 份旧备份' : '';
+          setMsg({ kind: 'ok', text: '备份成功：' + (d.name || '') + '（' + formatSize(d.size) + '，' + (d.fileCount || 0) + ' 个文件' + tops + prunedNote + '）' });
         }
         await refresh({ silent: true });
       };
@@ -621,7 +626,11 @@ window.__ModuleLoader__.load({
         if (data && data.ok) {
           setOffline(false);
           if (data.upgraded === false) {
-            setMsg({ kind: 'error', text: pickError(data, '未执行升级'), log: data.log || '' });
+            if (data.alreadyLatest) {
+              setMsg({ kind: 'ok', text: '已是最新版本 ' + (data.to || data.from || '') });
+            } else {
+              setMsg({ kind: 'error', text: pickError(data, '未执行升级'), log: data.log || '' });
+            }
           } else {
             setUpgraded({ to: data.to || '', log: data.log || '' });
             if (data.error) setMsg({ kind: 'error', text: data.error });
