@@ -1,12 +1,12 @@
 # dsh-sync -> GitHub 推送脚本
 #
 # 用法（在 PowerShell 里执行）：
-#   cd "E:\Users\Administrator\Documents\deepseek-harness\commonl-workspace\dsh-sync-release"
+#   cd "E:\Users\Administrator\Documents\deepseek-harness\commonl-workspace\dsh-sync-webdav"
 #   powershell -ExecutionPolicy Bypass -File .\push-to-github.ps1
 #
 # 前置条件（只需一次）：
 #   1. 已在 GitHub 网页上创建空仓库：https://github.com/new
-#      仓库名 dsh-sync-release，选 Private，不要勾选 README/.gitignore/License（保持空仓库）
+#      仓库名 dsh-sync-webdav，选 Private，不要勾选 README/.gitignore/License（保持空仓库）
 #   2. 首次推送会弹出凭据窗口；用户名填 ddldxiacan，密码填 Personal Access Token
 #      （GitHub 已不支持账号密码。Token 生成：Settings -> Developer settings ->
 #        Personal access tokens -> Tokens (classic) -> 勾选 repo 权限）
@@ -112,7 +112,7 @@ Client 半区（client.js）
 
 安全设计：恢复与回滚都只覆盖、不删除，避免误删 dsh-runtimes 导致宿主无法启动。
 
-安装：DSH 插件管理器中安装 github:ddldxiacan/dsh-sync-release，或 dsh plugin --profile desktop install github:ddldxiacan/dsh-sync-release
+安装：DSH 插件管理器中安装 github:ddldxiacan/dsh-sync-webdav，或 dsh plugin --profile <你的profile> install github:ddldxiacan/dsh-sync-webdav
 
 自测：node tools-selftest.mjs  ->  37 passed, 0 failed
 '@
@@ -142,10 +142,10 @@ Write-Host '    首次推送会弹出凭据窗口：用户名 ddldxiacan，密�
 & $GitExe push -u origin $Branch 2>&1 | ForEach-Object { Write-Host "    $_" }
 
 if ($LASTEXITCODE -eq 0) {
-    Write-Host "`n完成！仓库地址：https://github.com/ddldxiacan/dsh-sync-release" -ForegroundColor Green
+    Write-Host "`n完成！仓库地址：https://github.com/ddldxiacan/dsh-sync-webdav" -ForegroundColor Green
 } else {
     Write-Host "`n推送失败。常见原因：" -ForegroundColor Red
-    Write-Host '  1) GitHub 上还没有创建 dsh-sync-release 仓库 -> 去 https://github.com/new 创建（Private，留空）'
+    Write-Host '  1) GitHub 上还没有创建 dsh-sync-webdav 仓库 -> 去 https://github.com/new 创建（Private，留空）'
     Write-Host '  2) 凭据错误 -> 密码必须用 Personal Access Token，不是账号密码'
     Write-Host '  3) 网络问题 -> 需要代理时先配置：git config --global http.proxy http://127.0.0.1:端口'
     exit 1

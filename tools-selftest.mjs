@@ -6,9 +6,9 @@
  */
 import { createHash } from 'node:crypto'
 import { createServer } from 'node:http'
-import { mkdirSync, readFileSync, readdirSync, rmSync, writeFileSync, existsSync } from 'node:fs'
+import { mkdirSync, readFileSync, readdirSync, rmSync, statSync, writeFileSync, existsSync } from 'node:fs'
 import { tmpdir } from 'node:os'
-import { join } from 'node:path'
+import { dirname, join } from 'node:path'
 import {
   buildPayload, collectFiles, encryptBundle, decryptBundle, extractPayload,
   extractPayloadDetailed, applyPayloadMirror,
@@ -26,6 +26,8 @@ import {
   queryFlag, nonTargetFieldsIntact, selfPackageName, selfRepoSlug, selfVersion,
   performVersionCheck, parseRepoSlug, githubHttpsOnlyEnv,
   defaultHttpsGet, nextRedirectUrl,
+  isNativeExecutable, findPnpmOnPath, resolvePnpmInvocation, buildPnpmCommand, describeScope,
+  parseIgnoredBuildScripts, parsePnpmAllowBuilds, readAllowBuilds, approveBuilds, isLoopbackRequest,
 } from './index.js'
 
 let pass = 0, fail = 0
@@ -49,6 +51,19 @@ check('exclude: node_modules (任意深度)', isExcluded('profiles/desktop/node_
 check('exclude: sessions', isExcluded('sessions/abc/session.v4.jsonl.zstd'))
 check('keep: profile 配置不受 node_modules 排除影响', !isExcluded('profiles/desktop/cordis.patch.yml'))
 check('keep: settings 与凭据', !isExcluded('settings.yaml') && !isExcluded('.credentials.yaml'))
+
+// 0.4.1 备份策略：除「聊天数据 + 可重建产物 + 日志缓存」外全同步
+check('exclude: attachments（聊天文件，与 sessions 一致）', isExcluded('attachments/v1/objects/ab/cdef'))
+check('exclude: session_projcache（聊天派生：会话标题与首条输入）', isExcluded('storages/session_projcache/sessions/x.json'))
+check('exclude: storages/workspace.json（含 archivedSessionIds）', isExcluded('storages/workspace.json'))
+check('keep: 凭据', !isExcluded('.credentials.yaml'))
+check('keep: 任务板', !isExcluded('task-board/ledger-v2.json') && !isExcluded('task-board/scheduler-v2.json'))
+check('keep: 皮肤（含素材，实测 skins/ 有 6MB 的 mp4）',
+  !isExcluded('skins/orca-link/assets/x.webp') && !isExcluded('skins/whale-fantasy/assets/loop.mp4', 6 * 1024 * 1024))
+check('keep: 智能体预设', !isExcluded('agent-presets/roleplay-chengwei/preset.yml'))
+check('keep: 插件本地包', !isExcluded('local-packages/foo.tgz'))
+check('keep: 用量与会话归档', !isExcluded('dsh-usage/x.json') && !isExcluded('dsh-session-archive/state.json'))
+check('keep: 会话未触及的新目录默认进备份', !isExcluded('brand-new-feature/data.json'))
 
 // ---------- 1b. AppData 排除规则 ----------
 check('appdata exclude: Local Storage', isExcludedAppData('dsh-desktop/Local Storage/leveldb/000003.log'))
@@ -1238,11 +1253,13 @@ check('depKind: registry 版本号', depKind('^0.4.6') === 'registry' && depKind
     }), 'utf8')
     const hs = createTestHarness({ root: statusRoot, profile: 'desktop' })
     const st = await hs.handleStatus()
-    check('status: 远端连不上也回显已保存的配置',
+    // 状态接口不再回传明文密码（只回 hasPassword），留空表示沿用已保存的那份
+    check('status: 远端连不上也回显已保存的配置（不含明文密码）',
       st.configured === true && st.config && st.config.url === 'http://127.0.0.1:1/' &&
-      st.config.username === 'alice' && st.config.password === 's3cret' &&
+      st.config.username === 'alice' && st.config.password === '' &&
       st.config.remoteDir === 'dsh-sync' && st.config.hasPassword === true &&
-      st.config.hasPassphrase === true && !JSON.stringify(st).includes('hidden-pass'),
+      st.config.hasPassphrase === true && !JSON.stringify(st).includes('hidden-pass') &&
+      !JSON.stringify(st).includes('s3cret'),
       JSON.stringify(st.config) + ' err=' + st.error)
     const savedPass = await hs.handlePassphrase({ passphrase: 'another-pass' })
     const onDisk = readFileSync(join(statusRoot, 'dsh-sync.json'), 'utf8')
@@ -1266,6 +1283,374 @@ check('depKind: registry 版本号', depKind('^0.4.6') === 'registry' && depKind
     clientSrc.includes('listAccountBackups') === false && clientSrc.includes('backupSummary') && clientSrc.includes('已加密') && clientSrc.includes('locationLabel'))
   check('client: 口令可在本机记住', clientSrc.includes("request('/passphrase'") && clientSrc.includes('在本机记住口令'))
   check('client: 远程目录未保存时会拦住备份', clientSrc.includes('远程目录已改成'))
+  check('client: 不再回显明文密码', clientSrc.includes("password: '',") && !clientSrc.includes("c.password : ''"))
+  check('client: 手动安装命令带真实 profile 名', clientSrc.includes('manualInstallCommand') && clientSrc.includes("'dsh plugin --profile '"))
+  check('client: 401/403 有独立提示（不当成插件未就绪）', clientSrc.includes('res.status === 401') && clientSrc.includes('rejected:'))
+  check('client: 构建审批失败可「允许并重试」', clientSrc.includes('pendingBuilds') && clientSrc.includes('允许并重试'))
+  check('client: 展示备份范围（已同步/已排除）',
+    clientSrc.includes('ScopeCard') && clientSrc.includes('scopeSummary') &&
+    clientSrc.includes('本次同步范围') && clientSrc.includes('已排除'))
+  check('client: 恢复提示里写明聊天数据不被删除',
+    clientSrc.includes('聊天记录、聊天文件、运行时和插件代码和缓存不在备份范围里') ||
+    clientSrc.includes('聊天记录、聊天文件、运行时、插件代码和缓存不在备份范围里'))
+  // engines 下限必须接受当前实际运行时（0.2.1-rc.2）；写 >=0.2.1 会让 rc 机器判为 incompatible-version
+  {
+    const pkgJson = JSON.parse(readFileSync(new URL('./package.json', import.meta.url), 'utf8'))
+    check('package.json: engines.dsh 下限接受预发布运行时',
+      /^>=0\.2\.1-rc\.2$/.test(pkgJson.dsh.engines.dsh), pkgJson.dsh.engines.dsh)
+    check('package.json: 版本号已随发布推进', /^0\.4\.\d+$/.test(pkgJson.version), pkgJson.version)
+  }
+}
+
+
+// ---------- 9. v0.4.0：PATH 兜底、宿主 profile、端点栅栏、allowBuilds、失败还原 ----------
+{
+  const pathRoot = join(tmpdir(), 'dsh-sync-path-' + Date.now())
+  try {
+    // 9.1 PATH 兜底：只有原生启动器时直接执行，且不带 --expose-internals
+    const binDir = join(pathRoot, 'bin')
+    mkdirSync(binDir, { recursive: true })
+    const isWin = process.platform === 'win32'
+    const nativeLauncher = join(binDir, isWin ? 'pnpm.exe' : 'pnpm')
+    writeFileSync(nativeLauncher, Buffer.from([0x7f, 0x45, 0x4c, 0x46, 0x02, 0x01]))
+    check('isNativeExecutable: ELF 头识别为原生', isNativeExecutable(nativeLauncher) === true)
+    const scriptLauncher = join(binDir, 'pnpm-script')
+    writeFileSync(scriptLauncher, '#!/usr/bin/env node\n', 'utf8')
+    check('isNativeExecutable: 脚本不当作原生', isNativeExecutable(scriptLauncher) === false)
+
+    const pathEnv = { PATH: binDir, PATHEXT: '.EXE;.CMD;.BAT;.COM' }
+    const same = (a, b) => String(a).toLowerCase() === String(b).toLowerCase()
+    check('findPnpmOnPath: 在 PATH 里找到 pnpm', same(findPnpmOnPath(pathEnv), nativeLauncher),
+      String(findPnpmOnPath(pathEnv)))
+
+    const v1 = resolvePnpmInvocation(join(pathRoot, 'no-resources'), { homeRoot: null, env: pathEnv })
+    check('resolvePnpmInvocation: 只有原生启动器时直接执行（Web 版回归）',
+      v1 && v1.via === 'path-binary' && same(v1.cmd, nativeLauncher) && v1.args.length === 0,
+      JSON.stringify(v1))
+
+    // 9.2 旁边有 bin/pnpm.mjs 时优先走脚本 + node
+    const npmPkg = join(pathRoot, 'lib', 'node_modules', 'pnpm')
+    mkdirSync(join(npmPkg, 'bin'), { recursive: true })
+    const runnerScript = join(npmPkg, 'bin', 'pnpm.mjs')
+    writeFileSync(runnerScript, '// pnpm\n', 'utf8')
+    writeFileSync(join(npmPkg, isWin ? 'pnpm.exe' : 'pnpm'), Buffer.from([0x7f, 0x45, 0x4c, 0x46]))
+    const v2 = resolvePnpmInvocation(join(pathRoot, 'no-resources'), { homeRoot: null, env: { PATH: npmPkg, PATHEXT: '.EXE' } })
+    check('resolvePnpmInvocation: 旁有 bin/pnpm.mjs 时用 node 跑脚本',
+      v2 && v2.via === 'path-script' && v2.cmd === process.execPath &&
+      v2.args[0] === '--expose-internals' && v2.args[1] === join(npmPkg, 'bin', 'pnpm.mjs'),
+      JSON.stringify(v2))
+
+    // 9.2b Windows 上 npm/corepack 装的 pnpm 是 .CMD 外壳：spawn 直接跑会 EINVAL，必须经 cmd.exe
+    if (isWin) {
+      // corepack / npm 的实际布局：目录里只有 pnpm.CMD（没有 pnpm.EXE），所以用独立目录
+      const shimDir = join(pathRoot, 'shim')
+      mkdirSync(shimDir, { recursive: true })
+      const cmdShim = join(shimDir, 'pnpm.CMD')
+      writeFileSync(cmdShim, '@echo off\r\n', 'utf8')
+      const vShim = resolvePnpmInvocation(join(pathRoot, 'no-resources'), { homeRoot: null, env: { PATH: shimDir, PATHEXT: '.EXE;.CMD' } })
+      check('resolvePnpmInvocation: .CMD 外壳识别为 path-cmd-shim',
+        vShim && vShim.via === 'path-cmd-shim', JSON.stringify(vShim))
+      const built = buildPnpmCommand(vShim, ['install'])
+      check('buildPnpmCommand: .CMD 外壳经 cmd.exe 且带 windowsVerbatimArguments',
+        !!built && built.cmd === (process.env.ComSpec || 'cmd.exe') &&
+        built.windowsVerbatimArguments === true &&
+        built.args[0] === '/d' && built.args[1] === '/s' && built.args[2] === '/c' &&
+        built.args[3].startsWith('"') && built.args[3].endsWith(' install"') &&
+        built.args[3].includes('pnpm.CMD'),
+        JSON.stringify(built))
+      try { rmSync(cmdShim, { force: true }) } catch (e) { /* ignore */ }
+    } else {
+      console.log('SKIP  .CMD 外壳（非 Windows）')
+    }
+    const builtScript = buildPnpmCommand({ cmd: process.execPath, args: ['--expose-internals', '/x/pnpm.mjs'], via: 'path-script' }, ['install', '--force'])
+    check('buildPnpmCommand: 脚本入口直接拼参数，不经 cmd.exe',
+      builtScript.cmd === process.execPath && builtScript.args[2] === 'install' && builtScript.args[3] === '--force' &&
+      builtScript.windowsVerbatimArguments === undefined, JSON.stringify(builtScript))
+
+    // 9.3 PATH 里完全没有 pnpm：返回 null，错误文案要给「npm i -g pnpm」
+    const v3 = resolvePnpmInvocation(join(pathRoot, 'no-resources'), { homeRoot: null, env: { PATH: join(pathRoot, 'empty'), PATHEXT: '.EXE' } })
+    check('resolvePnpmInvocation: 找不到 pnpm 时返回 null', v3 === null)
+    const hNoPnpm = createTestHarness({ root: join(pathRoot, 'root-none'), profile: 'web' })
+    const rNoPnpm = await hNoPnpm.handlePluginInstall({}, () => ({ status: 0, stdout: '', stderr: '' }), null)
+    check('安装: 无 pnpm 时提示 npm i -g pnpm',
+      rNoPnpm.ok === false && /npm i -g pnpm/.test(rNoPnpm.error), rNoPnpm.error)
+
+    // 9.4 宿主给的 packageManager 优先
+    const hPm = createTestHarness({ root: join(pathRoot, 'root-pm'), profile: 'web', __test: true })
+    check('resolvePnpmInvocation: 宿主 packageManager 优先',
+      JSON.stringify(resolvePnpmInvocation(join(pathRoot, 'no-resources'), { packageManager: { command: 'C:/host/pnpm.cmd', args: ['--x'] } })) ===
+        JSON.stringify({ cmd: 'C:/host/pnpm.cmd', args: ['--x'], env: undefined, via: 'host' }))
+    check('宿主 packageManager 存在时 /plugins 认为 pnpm 可用', typeof hPm.handlePlugins === 'function')
+  } finally {
+    try { rmSync(pathRoot, { recursive: true, force: true }) } catch (e) { /* ignore */ }
+  }
+
+  // 9.5 resolveProfile 优先采信 profileContext.name
+  const profRoot = join(tmpdir(), 'dsh-sync-prof-' + Date.now())
+  try {
+    for (const name of ['desktop', 'web']) {
+      mkdirSync(join(profRoot, 'profiles', name), { recursive: true })
+      writeFileSync(join(profRoot, 'profiles', name, 'package.json'),
+        JSON.stringify({ name: 'p-' + name, dependencies: {}, dsh: { profile: { bundles: ['@deepseek-ai/dsh-base'] } } }), 'utf8')
+    }
+    // 默认（无 profileContext）时按配置走
+    const hDefault = createTestHarness({ root: profRoot, profile: 'desktop' })
+    check('resolveProfile: 没有宿主信息时用配置的 profile', hDefault.resolveProfile().name === 'desktop')
+    // 注入宿主 profileContext 后必须听宿主的，哪怕 cfg.profile 写的是 desktop
+    const fakeCtx = {
+      inject: () => () => {},
+      effect: () => () => {},
+      get: (n) => (n === 'profileContext' ? { name: 'web', dir: join(profRoot, 'profiles', 'web') } : undefined),
+    }
+    const mod = await import('./index.js')
+    mod.apply(fakeCtx, { root: profRoot, profile: 'desktop' })
+    check('resolveProfile: profileContext.name 优先于 cfg.profile 与默认值', mod.apply._internals.resolveProfile().name === 'web')
+  } finally {
+    try { rmSync(profRoot, { recursive: true, force: true }) } catch (e) { /* ignore */ }
+  }
+}
+
+
+// ---------- 10. v0.4.0：端点栅栏（P0-2）、失败还原（P1-2）、构建审批（P2-3） ----------
+{
+  // 10.1 connection.requestRejection 返回 401 时，所有端点都不得进入业务逻辑
+  const guardRoot = join(tmpdir(), 'dsh-sync-guard-' + Date.now())
+  mkdirSync(guardRoot, { recursive: true })
+  const routes = new Map()
+  const calls = []
+  const injectDeps = []
+  const guardCtx = {
+    inject: (deps, fn) => { injectDeps.push(deps); fn(guardCtx); return () => {} },
+    effect: () => () => {},
+    get: (n) => {
+      if (n === 'webServer') return { register: (r) => { routes.set(r.path, r.handler); return () => {} }, protocol: 'http:' }
+      if (n === 'connection') return {
+        requestRejection: (req) => (req.headers['x-test-reject'] ? Number(req.headers['x-test-reject']) : undefined),
+      }
+      return undefined
+    },
+  }
+  const mod = await import('./index.js')
+  mod.apply(guardCtx, { root: guardRoot, profile: 'web', __test: true })
+  check('路由: 只注入 webServer（connection 延迟解析，缺服务时端点不会整块消失）',
+    JSON.stringify(injectDeps) === JSON.stringify([['webServer']]), JSON.stringify(injectDeps))
+  check('路由: 11 个端点全部注册', routes.size === 11, [...routes.keys()].join(','))
+
+  /** 造一个最小 req/res，跑一次 handler */
+  const invoke = (path, opts) => new Promise((resolve) => {
+    const o = opts || {}
+    const req = new (require_events().EventEmitter)()
+    req.method = o.method || 'GET'
+    req.headers = o.headers || {}
+    req.url = path
+    req.socket = { remoteAddress: o.remote || '127.0.0.1' }
+    const chunks = []
+    const res = {
+      statusCode: 0,
+      headers: {},
+      setHeader(k, v) { this.headers[k.toLowerCase()] = v },
+      writeHead(code, h) { this.statusCode = code; Object.assign(this.headers, h || {}); return this },
+      end(body) { chunks.push(body || ''); resolve({ status: this.statusCode, body: chunks.join(''), headers: this.headers }) },
+    }
+    const handler = routes.get(path)
+    if (!handler) return resolve({ status: 0, body: 'no-route' })
+    Promise.resolve(handler(req, res)).then(() => {
+      // handler 只在内部调 json()/res.end 时 resolve；这里兜底超时
+    }, (e) => resolve({ status: -1, body: 'throw:' + e.message }))
+    setTimeout(() => resolve({ status: res.statusCode, body: chunks.join(''), headers: res.headers }), 2000)
+  })
+  // node:events 的轻量替代（避免再引一个 import）
+  function require_events() {
+    return { EventEmitter: class { on() { return this } } }
+  }
+
+  const all = [...routes.keys()]
+  const rejected = []
+  for (const p of all) {
+    const r = await invoke(p, { method: p.startsWith('POST') ? 'POST' : 'GET', headers: { 'x-test-reject': '401' } })
+    if (r.status === 401 && r.body === 'unauthorized') rejected.push(p)
+  }
+  check('栅栏: requestRejection=401 时 11 个端点全部 401，不进入业务逻辑',
+    rejected.length === 11, rejected.length + '/' + all.length + ' rejected')
+
+  const forbidden = await invoke('/dsh-sync/status', { headers: { 'x-test-reject': '403' } })
+  check('栅栏: requestRejection=403 时回 403 forbidden', forbidden.status === 403 && forbidden.body === 'forbidden', JSON.stringify(forbidden))
+
+  // 10.2 connection 服务缺失时必须 fail-closed
+  const noConnCtx = {
+    inject: (deps, fn) => { fn(noConnCtx); return () => {} },
+    effect: () => () => {},
+    get: (n) => (n === 'webServer' ? { register: (r) => { routes2.set(r.path, r.handler); return () => {} } } : undefined),
+  }
+  const routes2 = new Map()
+  const root2 = join(tmpdir(), 'dsh-sync-noconn-' + Date.now())
+  mkdirSync(root2, { recursive: true })
+  mod.apply(noConnCtx, { root: root2, profile: 'web', __test: true })
+  const invoke2 = (path, opts) => new Promise((resolve) => {
+    const o = opts || {}
+    const req = new (require_events().EventEmitter)()
+    req.method = o.method || 'GET'
+    req.headers = o.headers || {}
+    req.socket = { remoteAddress: o.remote || '127.0.0.1' }
+    const res = {
+      statusCode: 0, headers: {},
+      setHeader(k, v) { this.headers[k.toLowerCase()] = v },
+      writeHead(code, h) { this.statusCode = code; Object.assign(this.headers, h || {}); return this },
+      end(body) { resolve({ status: this.statusCode, body: body || '', headers: this.headers }) },
+    }
+    const handler = routes2.get(path)
+    if (!handler) return resolve({ status: 0, body: 'no-route' })
+    Promise.resolve(handler(req, res)).catch((e) => resolve({ status: -1, body: 'throw:' + e.message }))
+    setTimeout(() => resolve({ status: res.statusCode, body: '', headers: res.headers }), 2000)
+  })
+  const forged = await invoke2('/dsh-sync/status', { headers: { host: 'evil.example.com' } })
+  check('栅栏: connection 缺失且 Host 是伪造域名时 fail-closed',
+    forged.status === 403, JSON.stringify(forged))
+  check('isLoopbackRequest: 伪造 Host 判为非本机', isLoopbackRequest({ headers: { host: 'evil.example.com' }, socket: { remoteAddress: '127.0.0.1' } }) === false)
+  check('isLoopbackRequest: 本机直连放行',
+    isLoopbackRequest({ headers: { host: '127.0.0.1:3080' }, socket: { remoteAddress: '127.0.0.1' } }) === true)
+
+  // 10.3 方法不匹配 405、body 解析失败 400（有 connection 时才会走到这两条）
+  const wrongMethod = await invoke('/dsh-sync/status', { method: 'POST' })
+  check('状态码: 方法不匹配回 405', wrongMethod.status === 405 && wrongMethod.headers.allow === 'GET', JSON.stringify(wrongMethod))
+
+  // 10.4 dsh-sync.json 落盘权限收紧
+  const modeRoot = join(tmpdir(), 'dsh-sync-mode-' + Date.now())
+  mkdirSync(modeRoot, { recursive: true })
+  const hMode = createTestHarness({ root: modeRoot, profile: 'web' })
+  await hMode.handlePassphrase({ passphrase: 'x' })   // 没有配置时是 no-op，改用 configForDisk 路径
+  const cfgFile = join(modeRoot, 'dsh-sync.json')
+  writeFileSync(cfgFile, '{}', { encoding: 'utf8', mode: 0o664 })
+  await hMode.handleConfig({ url: 'http://127.0.0.1:1/', username: 'u', password: 'p', remoteDir: 'dsh-sync' })
+  const mode = process.platform === 'win32' ? null : (statSync(cfgFile).mode & 0o777)
+  check('配置: dsh-sync.json 权限收紧到 0600', mode === null || mode === 0o600, mode === null ? 'Windows 跳过' : '0' + mode.toString(8))
+
+  // 10.5 安装失败必须还原 package.json（P1-2）
+  const restoreRoot = join(tmpdir(), 'dsh-sync-restore-' + Date.now())
+  const restoreProf = join(restoreRoot, 'profiles', 'web')
+  mkdirSync(join(restoreProf, 'node_modules', 'good-one'), { recursive: true })
+  writeFileSync(join(restoreProf, 'node_modules', 'good-one', 'package.json'),
+    JSON.stringify({ name: 'good-one', repository: { url: 'git+https://github.com/acme/good-one.git' } }), 'utf8')
+  const beforePkg = {
+    name: 'dsh-profile-web',
+    dependencies: { 'good-one': 'link:E:/A-only/good-one', 'gone-one': 'link:E:/A-only/gone-one' },
+  }
+  writeFileSync(join(restoreProf, 'package.json'), JSON.stringify(beforePkg, null, 2) + '\n', 'utf8')
+  writeFileSync(join(restoreProf, 'pnpm-lock.yaml'), 'lockfileVersion: 9\n', 'utf8')
+  const hRestore = createTestHarness({ root: restoreRoot, profile: 'web' })
+  const rFail = await hRestore.handlePluginInstall({}, () => ({ status: 1, stdout: '', stderr: 'ERR_PNPM_FETCH_404' }), 'C:/fake/pnpm.mjs')
+  const afterPkg = JSON.parse(readFileSync(join(restoreProf, 'package.json'), 'utf8'))
+  check('安装失败: 返回 restored=true', rFail.ok === false && rFail.restored === true, JSON.stringify({ ok: rFail.ok, restored: rFail.restored }))
+  check('安装失败: package.json 已还原到改写前',
+    JSON.stringify(afterPkg.dependencies) === JSON.stringify(beforePkg.dependencies), JSON.stringify(afterPkg.dependencies))
+
+  // 10.6 构建审批：认出被拦下的包名，并写进 allowBuilds 后重试
+  const pending = parseIgnoredBuildScripts('...\nIgnored build scripts: esbuild@0.21.5, @scope/pkg. Run "pnpm approve-builds" to pick.')
+  check('parseIgnoredBuildScripts: 抓到包名并去掉版本号',
+    pending.length === 2 && pending[0] === 'esbuild' && pending[1] === '@scope/pkg', JSON.stringify(pending))
+  check('parseIgnoredBuildScripts: 没有该行时是空数组', parseIgnoredBuildScripts('all good').length === 0)
+  const wsFile = join(restoreProf, 'pnpm-workspace.yaml')
+  writeFileSync(wsFile, 'storeDir: /x\.pnpm-store\n', 'utf8')
+  const ap = approveBuilds(restoreProf, ['esbuild'])
+  check('approveBuilds: 写进 allowBuilds 且保留原有键',
+    ap.ok === true && ap.added[0] === 'esbuild' && readFileSync(wsFile, 'utf8').includes('storeDir') &&
+    readAllowBuilds(restoreProf).includes('esbuild'), readFileSync(wsFile, 'utf8'))
+  const ap2 = approveBuilds(restoreProf, ['esbuild'])
+  check('approveBuilds: 重复写入不产生重复条目', ap2.added.length === 0 &&
+    parsePnpmAllowBuilds(readFileSync(wsFile, 'utf8')).filter((n) => n === 'esbuild').length === 1)
+  check('approveBuilds: 行内数组写法也能读出来',
+    parsePnpmAllowBuilds('allowBuilds: ["a", "b"]\n').join(',') === 'a,b')
+
+  const rBuild = await hRestore.handlePluginInstall({}, () => ({ status: 1, stdout: '', stderr: 'Ignored build scripts: esbuild' }), 'C:/fake/pnpm.mjs')
+  check('安装失败: pendingBuilds 回传，错误文案指向「允许并重试」',
+    Array.isArray(rBuild.pendingBuilds) && rBuild.pendingBuilds[0] === 'esbuild' && /允许并重试|allowBuilds/.test(rBuild.error),
+    rBuild.error)
+  const approveCall = await hRestore.handlePluginInstall({ approve: ['esbuild'] }, () => ({ status: 0, stdout: 'ok', stderr: '' }), 'C:/fake/pnpm.mjs')
+  check('POST /plugins/install {approve}: 先写 allowBuilds 再重跑安装', approveCall.ok === true)
+}
+
+
+// ---------- 11. 备份范围报告（describeScope）与恢复不误删聊天数据 ----------
+{
+  const scopeRoot = join(tmpdir(), 'dsh-sync-scope-' + Date.now())
+  try {
+    const put = (rel, content) => {
+      const abs = join(scopeRoot, rel)
+      mkdirSync(dirname(abs), { recursive: true })
+      writeFileSync(abs, content, 'utf8')
+    }
+    put('settings.yaml', 'x')
+    put('.credentials.yaml', 'x')
+    put('task-board/ledger-v2.json', '{}')
+    put('skins/a/x.webp', 'x')
+    put('agent-presets/p/preset.yml', 'x')
+    put('storages/workspace.json', '{}')
+    put('storages/session_projcache/sessions/a.json', '{}')
+    put('storages/plugin-store/plugins-status.json', '{}')
+    put('sessions/ws/session-1/session.v4.jsonl.zstd', 'x')
+    put('attachments/v1/objects/ab/x', 'x')
+    put('dsh-runtimes/rt/bin.js', 'x')
+    put('profiles/web/node_modules/pkg/package.json', '{}')
+    put('profiles/web/package.json', '{}')
+    put('cache/foo', 'x')
+    put('tmp-x.mjs', 'x')
+
+    const d = describeScope(scopeRoot)
+    const names = (rows) => rows.map((r) => r.name)
+    check('describeScope: 已同步清单含配置类目录',
+      names(d.included).includes('skins') && names(d.included).includes('task-board') &&
+      names(d.included).includes('agent-presets') && names(d.included).includes('profiles') &&
+      names(d.included).includes('(files)'), JSON.stringify(names(d.included)))
+    check('describeScope: 排除清单含聊天与可重建产物',
+      names(d.excluded).includes('sessions') && names(d.excluded).includes('attachments') &&
+      names(d.excluded).includes('dsh-runtimes') && names(d.excluded).includes('storages') &&
+      names(d.excluded).includes('cache'), JSON.stringify(names(d.excluded)))
+    const reasonOf = (n) => (d.excluded.find((r) => r.name === n) || {}).reason
+    check('describeScope: 排除原因分类正确',
+      reasonOf('sessions') === '聊天记录' && reasonOf('attachments') === '聊天文件' &&
+      reasonOf('dsh-runtimes') === '可重建：DSH 运行时',
+      JSON.stringify({ sessions: reasonOf('sessions'), att: reasonOf('attachments'), rt: reasonOf('dsh-runtimes') }))
+    check('describeScope: 汇总数只统计真正会打包的文件',
+      d.totals.files === collectFiles(scopeRoot).length, d.totals.files + ' vs ' + collectFiles(scopeRoot).length)
+    check('describeScope: 默认不递归量排除项体积（status 热路径要快）',
+      d.totals.excludedFiles === undefined && d.totals.excludedCount === 7 && d.totals.excludedBytes === undefined,
+      JSON.stringify(d.totals))
+    const measured = describeScope(scopeRoot, { measureExcluded: true })
+    check('describeScope: 显式要求时才量排除项体积',
+      measured.totals.excludedFiles > 0 && measured.totals.excludedBytes > 0,
+      JSON.stringify(measured.totals))
+    check('describeScope: profiles 的排除原因取占主导的「插件依赖」而不是「日志/缓存」',
+      (d.excluded.find((r) => r.name === 'profiles') || {}).reason === '可重建：插件依赖',
+      JSON.stringify((d.excluded.find((r) => r.name === 'profiles') || {}).reason))
+
+    // 恢复对齐不得删除被排除的聊天数据
+    const payload = buildPayload(scopeRoot, collectFiles(scopeRoot))
+    const mirror = applyPayloadMirror(payload, scopeRoot, { pruneAppData: false })
+    check('恢复: 配置范围内多出来的文件会被删掉（对齐语义仍生效）',
+      mirror.removed.length === 0, JSON.stringify(mirror.removed))
+    check('恢复: 聊天记录与聊天文件不会被删',
+      existsSync(join(scopeRoot, 'sessions/ws/session-1/session.v4.jsonl.zstd')) &&
+      existsSync(join(scopeRoot, 'attachments/v1/objects/ab/x')))
+    check('恢复: 可重建产物与缓存同样保留',
+      existsSync(join(scopeRoot, 'dsh-runtimes/rt/bin.js')) &&
+      existsSync(join(scopeRoot, 'cache/foo')))
+
+    // 配置范围内、备份里没有的文件仍然会被删掉
+    put('settings.old.yaml', 'x')
+    const mirror2 = applyPayloadMirror(payload, scopeRoot, { pruneAppData: false })
+    check('恢复: 配置范围内多出的文件仍被删除',
+      mirror2.removed.includes('settings.old.yaml') && !existsSync(join(scopeRoot, 'settings.old.yaml')),
+      JSON.stringify(mirror2.removed))
+
+    // /status 必须带上备份范围
+    const hScope = createTestHarness({ root: scopeRoot, profile: 'web' })
+    const st = await hScope.handleStatus()
+    check('status: 带 coverage（已同步 + 排除 + 总计）',
+      st.coverage && Array.isArray(st.coverage.included) && Array.isArray(st.coverage.excluded) &&
+      st.coverage.totals.files > 0, JSON.stringify(st.coverage && st.coverage.totals))
+  } finally {
+    try { rmSync(scopeRoot, { recursive: true, force: true }) } catch (e) { /* ignore */ }
+  }
 }
 
 console.log('\n==== ' + pass + ' passed, ' + fail + ' failed ====')

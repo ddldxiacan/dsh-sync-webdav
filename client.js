@@ -8,7 +8,7 @@
  * 配置文件名、快照目录名仍沿用 `dsh-sync`，改名不影响接口与磁盘布局。
  *
  * 与 Host 半区（index.js）通过 HTTP 端点通信，契约冻结：
- *   GET  /dsh-sync/status                          -> { configured, config:{url,username,password,remoteDir,hasPassword,hasPassphrase}|null,
+ *   GET  /dsh-sync/status                          -> { configured, config:{url,username,password:'',remoteDir,hasPassword,hasPassphrase}|null,
  *                                                        remote:{reachable,backups[{name,size,modified,remoteDir,encrypted}],latest?}, lastLocalSnapshot?, error? }
  *   POST /dsh-sync/config   {url,username,password,remoteDir} -> { ok:true } | { ok:false, error }
  *   POST /dsh-sync/passphrase {passphrase}|{clear:true} -> { ok:true, hasPassphrase } | { ok:false, error }
@@ -22,7 +22,10 @@
  *                                                        latest, changelog[], checkedAt, checked, currentSha, latestSha, error }
  *   POST /dsh-sync/upgrade  {}                      -> { ok:true, from, to, upgraded, alreadyLatest?, spec, exitCode, durationMs, needRestart,
  *                                                        before, backup, log, error } | { ok:false, error, log?, restored? }
- * 所有响应 HTTP 200，按 `ok` 字段判断成败；错误统一在 `error` 字段。
+ * 业务层响应 HTTP 200，按 `ok` 字段判断成败；错误统一在 `error` 字段。
+ * 传输层状态码与宿主 /api 对齐：401/403 被栅栏拦下（未登录或非本页面来源）、405 方法不允许、
+ * 400 请求体不是合法 JSON、500 内部异常。
+ * 密码不再回传明文：status.config.password 恒为空串，留空表示沿用已保存的那份。
  *
  * version 端点两条语义约定（宿主以 git commit sha 比较为主，不靠 semver）：
  *   - `hasUpdate` 是唯一权威判据，客户端不自行比较版本大小；
@@ -55,7 +58,7 @@ window.__ModuleLoader__.load({
     const CONFIG_FIELDS = [
       { key: 'url', label: 'WebDAV URL', placeholder: '例如 https://dav.example.com/dav/', type: 'text' },
       { key: 'username', label: '用户名', placeholder: '例如 user', type: 'text' },
-      { key: 'password', label: '密码', placeholder: '保存后会回显为圆点', type: 'password' },
+      { key: 'password', label: '密码', placeholder: '留空=沿用已保存的密码', type: 'password' },
       { key: 'remoteDir', label: '远程目录', placeholder: '建议 dsh-sync；留空是网盘根目录，改完要点保存', type: 'text' },
     ];
 
@@ -102,6 +105,17 @@ window.__ModuleLoader__.load({
     /** 与 Host 一致：空字符串表示网盘根目录。 */
     function normalizeDir(dir) {
       return String(dir || '').trim().replace(/\\/g, '/').replace(/^\/+|\/+$/g, '');
+    }
+
+    /** 备份范围一句话摘要：「同步 N 个文件（X MB），已排除 M 个（Y MB）」。 */
+    function scopeSummary(totals) {
+      if (!totals) return '';
+      const inc = '将同步 ' + (totals.files || 0) + ' 个文件（' + formatSize(totals.bytes || 0) + '）';
+      // excludedFiles 只有备份结果才量得出来；状态接口为了速度不统计，此时只报项数
+      if (typeof totals.excludedFiles === 'number') {
+        return inc + '，已排除 ' + totals.excludedFiles + ' 个（' + formatSize(totals.excludedBytes || 0) + '）';
+      }
+      return inc + '，另有 ' + (totals.excludedCount || 0) + ' 类内容按策略不同步';
     }
 
     function locationLabel(remoteDir) {
@@ -160,6 +174,14 @@ window.__ModuleLoader__.load({
       return fallback || '未知错误';
     }
 
+    /** 让用户手动装插件时用的命令行。
+     *  实测 \`dsh plugin install\` 会直接报错「required option '--profile <name>' not specified」，
+     *  而桌面版的 \`--profile desktop\` 在 Web 版机器上又不一定存在，所以 profile 名必须取自状态接口。 */
+    function manualInstallCommand(plugins) {
+      const profile = (plugins && typeof plugins.profile === 'string' && plugins.profile) ? plugins.profile : 'web';
+      return 'dsh plugin --profile ' + profile + ' install';
+    }
+
     /**
      * 安装结果摘要：装了什么、改写了哪些来源、跳过了哪些、耗时，并提醒重启。
      * rewritten 是 { 包名: 改写后的依赖声明 } 映射。
@@ -178,6 +200,19 @@ window.__ModuleLoader__.load({
       const ms = Number(data.durationMs);
       if (isFinite(ms) && ms >= 0) parts.push('耗时 ' + (ms / 1000).toFixed(1) + ' 秒');
       return '插件重装完成：' + parts.join('；') + '。请重启 DeepSeek Harness 使插件生效。';
+    }
+
+    /** 安装失败时的补充说明：package.json 是否已回滚、是否卡在构建审批上。 */
+    function installFailureNote(d) {
+      const data = d || {};
+      const notes = [];
+      if (data.restored === true) notes.push('profile 的 package.json 与 lock 已还原到本次安装前');
+      const pending = Array.isArray(data.pendingBuilds) ? data.pendingBuilds : [];
+      if (pending.length) {
+        notes.push('pnpm 拦下了 ' + pending.join('、') + ' 的安装脚本（git 插件靠 prepare 构建）。' +
+          '点「允许并重试」会把它们写进 profile 的 pnpm-workspace.yaml 的 allowBuilds 后再装一次。');
+      }
+      return notes.join('。');
     }
 
     /**
@@ -200,6 +235,18 @@ window.__ModuleLoader__.load({
         return { ok: false, offline: true, error: NOT_READY };
       }
       if (res.status === 404) return { ok: false, offline: true, error: NOT_READY };
+      // 401/403 是宿主的 Host/Origin 栅栏或登录态判定，不是业务失败：
+      // 说明这次请求不是从 dsh 页面里发出来的（或会话已过期），照实告诉用户。
+      if (res.status === 401 || res.status === 403) {
+        return {
+          ok: false,
+          offline: false,
+          rejected: res.status,
+          error: res.status === 401
+            ? '这个请求被 Host 拒绝了（401 未登录）：请确认是在 dsh 的页面里打开设置，并已登录本机实例。'
+            : '这个请求被 Host 拒绝了（403 来源不合法）：插件端点只接受来自 dsh 页面本身的调用。',
+        };
+      }
       let payload = null;
       try {
         payload = await res.json();
@@ -360,6 +407,39 @@ window.__ModuleLoader__.load({
     // 主组件
     // ============================================================
 
+    /**
+     * 备份范围卡片：默认收起成一行摘要，展开后逐项列出「已同步」与「已排除」。
+     * 为什么要给用户看：策略是「除聊天数据和可重建产物外全同步」，不给清单就只能靠信。
+     */
+    function ScopeCard(props) {
+      const coverage = props.coverage;
+      if (!coverage || !coverage.totals) return null;
+      const included = Array.isArray(coverage.included) ? coverage.included : [];
+      const excluded = Array.isArray(coverage.excluded) ? coverage.excluded : [];
+      const totals = coverage.totals || {};
+      const rows = (list, cls) => list.slice(0, 12).map((r) =>
+        h('div', { key: cls + r.name, className: PREFIX + '-row' },
+          h('span', { className: PREFIX + '-badge' }, r.name),
+          h('span', { className: PREFIX + '-hint' },
+            (r.files ? r.files + ' 个 · ' + formatSize(r.bytes || 0) : '体积未统计') +
+            (r.reason ? ' · ' + r.reason : '')),
+        ));
+      return h('details', { className: PREFIX + '-log' },
+        h('summary', null, '本次同步范围：' + scopeSummary(totals)),
+        h('div', { className: PREFIX + '-hint' },
+          '策略：除「工作区聊天数据」和「可重建产物」外，~/.dsh 里的一切都会加密上传。'),
+        h('div', { className: PREFIX + '-card-title' }, h('span', null, '会同步')),
+        rows(included, 'in-'),
+        included.length > 12
+          ? h('div', { className: PREFIX + '-hint' }, '… 还有 ' + (included.length - 12) + ' 项')
+          : null,
+        h('div', { className: PREFIX + '-card-title' }, h('span', null, '已排除')),
+        rows(excluded, 'ex-'),
+        h('div', { className: PREFIX + '-hint' },
+          '排除项在恢复/回滚时也不会被删除——换机不会误删目标机上的聊天记录。'),
+      );
+    }
+
     function DshSyncSection() {
       // 表单：打开页面时从 Host 已保存的配置回填。用户开始改之后不再被刷新覆盖。
       const [form, setForm] = useState({ url: '', username: '', password: '', remoteDir: '' });
@@ -390,14 +470,15 @@ window.__ModuleLoader__.load({
         setForm((f) => ({ ...f, [key]: e.target.value }));
       };
 
-      /** 用状态接口带回的已保存配置填表。用户正在编辑时不覆盖。 */
+      /** 用状态接口带回的已保存配置填表。用户正在编辑时不覆盖。
+       *  密码不回显（Host 也不再回传明文）：留空即沿用已保存的那份。 */
       const applySavedConfig = (data) => {
         const c = data && data.config;
         if (!c || typeof c !== 'object' || formDirtyRef.current) return;
         setForm({
           url: typeof c.url === 'string' ? c.url : '',
           username: typeof c.username === 'string' ? c.username : '',
-          password: typeof c.password === 'string' ? c.password : '',
+          password: '',
           remoteDir: typeof c.remoteDir === 'string' ? c.remoteDir : '',
         });
       };
@@ -526,7 +607,10 @@ window.__ModuleLoader__.load({
             ? '；范围 ' + d.scope.topLevel.map((t) => t.name + '×' + t.files).join('、')
             : '';
           const prunedNote = (Array.isArray(d.pruned) && d.pruned.length) ? '；已清理 ' + d.pruned.length + ' 份旧备份' : '';
-          setMsg({ kind: 'ok', text: '备份成功：' + (d.name || '') + '（' + formatSize(d.size) + '，' + (d.fileCount || 0) + ' 个文件' + tops + prunedNote + '）' });
+          const skipNote = (d.coverage && d.coverage.totals && d.coverage.totals.excludedFiles)
+            ? '；按策略跳过 ' + d.coverage.totals.excludedFiles + ' 个聊天/可重建文件'
+            : '';
+          setMsg({ kind: 'ok', text: '备份成功：' + (d.name || '') + '（' + formatSize(d.size) + '，' + (d.fileCount || 0) + ' 个文件' + tops + skipNote + prunedNote + '）' });
         }
         await refresh({ silent: true });
       };
@@ -567,7 +651,7 @@ window.__ModuleLoader__.load({
             name ? h('div', { className: PREFIX + '-hint' }, '位置：' + locationLabel(backup.remoteDir)) : null,
             h('div', null, encrypted ? '这份备份已用口令加密。留空并勾选记住时，使用本机已保存的口令。' : '这份备份没有口令。'),
             h('div', null, '恢复前会自动为当前配置创建一份本地快照，可用它回滚。'),
-            h('div', null, '当前配置会对齐到这份备份：备份里的配置覆盖现有文件，备份里没有的配置文件会删掉。运行时、插件代码、聊天会话和缓存会保留。'),
+            h('div', null, '当前配置会对齐到这份备份：备份里的配置覆盖现有文件，备份里没有的配置文件会删掉。聊天记录、聊天文件、运行时、插件代码和缓存不在备份范围里，恢复时一律保留。'),
             h('div', { className: PREFIX + '-warn' },
               h('div', { className: PREFIX + '-warn-title' }, '恢复完成后必须重启 DeepSeek Harness 才会生效'),
               h('div', null, '备份不含插件代码。恢复后会把源机器的本机路径改成这台电脑可用的路径，并自动安装缺失的插件。安装结束前请不要重启。'),
@@ -752,14 +836,16 @@ window.__ModuleLoader__.load({
         });
       };
 
-      /** POST /dsh-sync/plugins/install —— 重装插件依赖（失败也可能带 log）。quiet 时由调用方自己组提示。 */
+      /** POST /dsh-sync/plugins/install —— 重装插件依赖（失败也可能带 log）。quiet 时由调用方自己组提示。
+       *  opts.approve 是「允许并重试」要写进 allowBuilds 的包名。 */
       const doInstall = async (opts) => {
         const quiet = opts && opts.quiet;
+        const approve = (opts && Array.isArray(opts.approve)) ? opts.approve : [];
         if (installLock.current) return null;
         installLock.current = true;
         setBusy('install');
         if (!quiet) setMsg(null);
-        const res = await api.pluginsInstall({});
+        const res = await api.pluginsInstall(approve.length ? { approve } : {});
         if (!mountedRef.current) { installLock.current = false; return null; }
         setBusy('');
         setConfirm(null);
@@ -778,7 +864,15 @@ window.__ModuleLoader__.load({
           return { ok: false, error: NOT_READY };
         }
         setOffline(false);
-        if (!quiet) setMsg({ kind: 'error', text: pickError(data, '安装失败'), log: (data && data.log) || '' });
+        const note = installFailureNote(data);
+        if (!quiet) {
+          setMsg({
+            kind: 'error',
+            text: pickError(data, '安装失败') + (note ? '（' + note + '）' : ''),
+            log: (data && data.log) || '',
+            approve: (data && Array.isArray(data.pendingBuilds)) ? data.pendingBuilds : null,
+          });
+        }
         return data && typeof data === 'object' ? data : { ok: false, error: pickError(data, '安装失败') };
       };
 
@@ -852,6 +946,9 @@ window.__ModuleLoader__.load({
       const reachable = !!(status && status.remote && status.remote.reachable);
       const lastLocalSnapshot = status && status.lastLocalSnapshot;
       const anyBusy = !!busy;
+      // 备份范围：Host 每次 /status 都会实时统计一遍，这里只负责展示
+      const coverage = (status && status.coverage) ? status.coverage : null;
+      const coverageTotals = (coverage && coverage.totals) ? coverage.totals : null;
 
       const pluginDeps = (plugins && Array.isArray(plugins.deps)) ? plugins.deps : [];
       const missingPlugins = (plugins && Array.isArray(plugins.missing)) ? plugins.missing : [];
@@ -1000,7 +1097,7 @@ window.__ModuleLoader__.load({
             h(Button, { variant: 'primary', disabled: anyBusy, onClick: onSaveConfig },
               busy === 'config' ? '测试中…' : '保存并测试连接'),
           ),
-          h('div', { className: PREFIX + '-hint' }, '密码会随配置保存在本机 ~/.dsh/dsh-sync.json，用于访问该 WebDAV。列表会同时看根目录和 dsh-sync，所以以前写到根目录的备份也不会丢。'),
+          h('div', { className: PREFIX + '-hint' }, '密码保存在本机 ~/.dsh/dsh-sync.json（文件权限 0600），用于访问该 WebDAV，页面上不再回显明文。留空保存就是沿用已保存的密码。列表会同时看根目录和 dsh-sync，所以以前写到根目录的备份也不会丢。'),
         ),
 
         // ---- 备份 ----
@@ -1045,6 +1142,7 @@ window.__ModuleLoader__.load({
               ? h(Button, { small: true, disabled: anyBusy, onClick: onClearPassphrase }, '清除本机口令')
               : null,
           ),
+          h(ScopeCard, { coverage }),
         ),
 
         // ---- 回滚 ----
@@ -1093,9 +1191,11 @@ window.__ModuleLoader__.load({
                       )
                     : null,
                   pnpmAvailable
-                    ? h('div', { className: PREFIX + '-hint' }, '安装由 pnpm 完成，装好后需要重启 DeepSeek Harness 才会生效。')
-                    : h('div', { className: PREFIX + '-hint' }, '找不到 pnpm，无法自动安装，请手动执行 ',
-                        h('span', { className: PREFIX + '-item-name' }, 'dsh plugin install')),
+                    ? h('div', { className: PREFIX + '-hint' }, '安装由 pnpm' +
+                        ((plugins.pnpm && plugins.pnpm.via) ? '（' + plugins.pnpm.via + '）' : '') +
+                        ' 完成，装好后需要重启 DeepSeek Harness 才会生效。')
+                    : h('div', { className: PREFIX + '-hint' }, '找不到 pnpm，无法自动安装。Web 版 / CLI 安装需要自己在 PATH 里装好 pnpm（npm i -g pnpm），然后手动执行 ',
+                        h('span', { className: PREFIX + '-item-name' }, manualInstallCommand(plugins))),
                 )
               : h('div', { className: PREFIX + '-hint' }, '插件依赖完整（' + pluginDeps.length + ' 个）'),
         ),
@@ -1136,6 +1236,13 @@ window.__ModuleLoader__.load({
         ),
 
         msg ? h(Message, { kind: msg.kind }, msg.text) : null,
+        // pnpm 因构建审批拦下了脚本：一键把它们写进 allowBuilds 再装一次（P2-3）
+        msg && Array.isArray(msg.approve) && msg.approve.length
+          ? h('div', { className: PREFIX + '-row' },
+              h(Button, { variant: 'primary', disabled: anyBusy, onClick: () => doInstall({ approve: msg.approve }) },
+                busy === 'install' ? '允许并重试中…' : '允许并重试'),
+            )
+          : null,
         // 安装日志可能几千字符：折叠 + 限高滚动，不铺在卡片上
         msg && msg.log
           ? h('details', { className: PREFIX + '-log' },

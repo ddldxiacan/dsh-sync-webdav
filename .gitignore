@@ -19,3 +19,6 @@ dsh-sync.json
 .DS_Store
 Thumbs.db
 desktop.ini
+
+# 发布辅助文件（不要入库）
+_commitmsg.txt

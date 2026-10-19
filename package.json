@@ -1,6 +1,6 @@
 {
   "name": "dsh-sync-webdav",
-  "version": "0.3.5",
+  "version": "0.4.1",
   "description": "DSH WebDAV 配置同步插件：把 ~/.dsh 与应用级设置加密备份到 WebDAV，恢复时按备份完整覆盖配置",
   "type": "module",
   "license": "MIT",
@@ -32,7 +32,7 @@
   },
   "dsh": {
     "engines": {
-      "dsh": ">=0.2.0-rc.2"
+      "dsh": ">=0.2.1-rc.2"
     },
     "bundle": {
       "patch": "./cordis.patch.yml"

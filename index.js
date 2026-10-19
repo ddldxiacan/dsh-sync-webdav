@@ -33,11 +33,11 @@ import {
   createCipheriv, createDecipheriv, createHash, randomBytes, scryptSync,
 } from 'node:crypto'
 import {
-  appendFileSync, copyFileSync, existsSync, mkdirSync, readdirSync, readFileSync,
-  rmdirSync, rmSync, statSync, writeFileSync,
+  appendFileSync, chmodSync, closeSync, copyFileSync, existsSync, mkdirSync, openSync, readdirSync,
+  readFileSync, readSync, realpathSync, renameSync, rmdirSync, rmSync, statSync, writeFileSync,
 } from 'node:fs'
 import { homedir } from 'node:os'
-import { dirname, isAbsolute, join, relative, resolve } from 'node:path'
+import { delimiter, dirname, isAbsolute, join, relative, resolve } from 'node:path'
 import http from 'node:http'
 import https from 'node:https'
 import { fileURLToPath } from 'node:url'
@@ -131,25 +131,154 @@ const LOG_TAIL_CHARS = 4000
 // 可注入内部实现（供 tools-selftest.mjs 复用）
 // ============================================================
 
-/** 是否应排除某个相对路径（posix 分隔）。规则：
- *  目录名：dsh-runtimes、node_modules、sessions、logs、npm-cache，以及 tmp 或 cache 开头的目录
- *  单个文件大于 50MB
- *
- * 为何排除 node_modules：`profiles/<name>/node_modules` 是插件依赖，实测占 ~800MB
- * 且可由 pnpm 重装，属可重建产物而非配置。若打包进去，base64 封装后 payload 达
- * 350MB+，加序列化副本会直接把 Node 堆撑爆（实测 OOM）。
- *
- * 为何排除 sessions：会话历史实测 ~27MB，属可再生的使用记录而非配置；
- * 且体积随使用持续增长，不适合每次全量上传。需要时单独同步。 */
+// 备份策略：**除「工作区聊天数据」和「可重建产物」之外，~/.dsh 里的一切都同步**。
+// 排除清单是白纸黑字的四类，其余一律收录——新增的目录默认进备份，不会静默漏掉。
+//
+// 1) 聊天数据（用户要求不同步）：sessions/（会话正文）、attachments/（聊天里上传的文件对象）。
+//    注意 attachments 在 0.4.1 之前是被打包的，这次一并排除。
+// 2) 可重建产物：dsh-runtimes/（DSH 运行时二进制，实测 257MB）、node_modules（插件依赖，实测 996MB）。
+//    两者都能靠重启/「重装插件」恢复，且全量打包会让 payload 达 1.25GB —— 当前实现把整个
+//    payload 读进内存再加密，实测 350MB 就 OOM。
+// 3) 日志与缓存：logs、npm-cache、tmp*/cache* 前缀目录，可再生且无配置价值。
+// 4) 单个文件大于 50MB。
+const CHAT_DIR_NAMES = new Set(['sessions', 'attachments'])
+const REBUILDABLE_DIR_NAMES = new Set(['dsh-runtimes', 'node_modules'])
+const EPHEMERAL_DIR_NAMES = new Set(['logs', 'npm-cache'])
+// 聊天派生数据：session_projcache 存每个会话的标题与首条输入原文，
+// workspace.json 的 archivedSessionIds 存会话 id 索引。都不属于「配置」，一并排除。
+const CHAT_DERIVED_PATHS = new Set([
+  'storages/session_projcache',
+  'storages/workspace.json',
+])
+
+/** 是否应排除某个相对路径（posix 分隔）。规则见上方注释的四类。 */
 export function isExcluded(relPosix, fileSizeBytes) {
-  const segs = relPosix.split('/')
+  const rel = String(relPosix || '')
+  if (CHAT_DERIVED_PATHS.has(rel)) return true
+  const segs = rel.split('/')
   for (const seg of segs) {
-    if (seg === 'dsh-runtimes' || seg === 'node_modules' || seg === 'sessions' ||
-        seg === 'logs' || seg === 'npm-cache') return true
+    if (CHAT_DIR_NAMES.has(seg) || REBUILDABLE_DIR_NAMES.has(seg) || EPHEMERAL_DIR_NAMES.has(seg)) return true
     if (seg.startsWith('tmp') || seg.startsWith('cache')) return true
   }
   if (fileSizeBytes !== undefined && fileSizeBytes > MAX_FILE_BYTES) return true
   return false
+}
+
+/** 某一类排除原因（无则 undefined）。供 describeScope 与界面文案共用。 */
+function exclusionReason(rel) {
+  if (CHAT_DERIVED_PATHS.has(rel)) return '聊天派生数据'
+  for (const seg of rel.split('/')) {
+    if (seg === 'sessions') return '聊天记录'
+    if (seg === 'attachments') return '聊天文件'
+    if (seg === 'dsh-runtimes') return '可重建：DSH 运行时'
+    if (seg === 'node_modules') return '可重建：插件依赖'
+    if (seg === 'logs' || seg === 'npm-cache') return '日志/缓存'
+    if (seg.startsWith('tmp') || seg.startsWith('cache')) return '临时/缓存'
+  }
+  return undefined
+}
+
+/**
+ * 让用户看清「这次到底同步了什么」：返回 { included, excluded, totals }。
+ * included/excluded 都是 [{ name, files, bytes, reason? }]，按体积倒序。
+ *
+ * opts.measureExcluded 默认 false：统计被排除目录的体积要递归整棵 node_modules
+ * （实测 5.8 万个文件、3.6 秒），不能放在每次 /status 都要跑的热路径上。
+ * 只有备份结果这类一次性展示才传 true。
+ */
+export function describeScope(root, opts) {
+  const o = opts || {}
+  const measureExcluded = o.measureExcluded === true;
+  const included = new Map()
+  const excluded = new Map()
+  // 同一个顶层项可能由多种原因拼成（如 profiles 下既有 node_modules 也有 logs），
+  // 归纳时按体积取占主导的那个原因，避免给出「日志/缓存」这种误导性的标签。
+  const bump = (map, name, files, bytes, reason) => {
+    let row = map.get(name)
+    if (!row) { row = { name, files: 0, bytes: 0, reasons: new Map() }; map.set(name, row) }
+    row.files += files
+    row.bytes += bytes
+    if (reason) row.reasons.set(reason, (row.reasons.get(reason) || 0) + bytes)
+    return row
+  }
+  const walk = (dir, prefix) => {
+    let entries
+    try { entries = readdirSync(dir, { withFileTypes: true }) } catch (e) { return }
+    for (const ent of entries) {
+      const rel = prefix ? prefix + '/' + ent.name : ent.name
+      const abs = join(dir, ent.name)
+      const top = rel.includes('/') ? rel.split('/')[0] : '(files)'
+      const reason = exclusionReason(rel)
+      if (ent.isDirectory()) {
+        if (reason) {
+          // 顶层目录整块排除时记一行；嵌套的（如 profiles/x/node_modules）折算到顶层。
+          // 只有显式要求时才递归量体积——见函数头注释。
+          const size = measureExcluded ? dirSize(abs) : { files: 0, bytes: 0 }
+          bump(excluded, prefix ? top : ent.name, size.files, size.bytes, prefix ? exclusionReason(top) || reason : reason)
+          continue
+        }
+        walk(abs, rel)
+      } else if (ent.isFile()) {
+        let size = 0
+        try { size = statSync(abs).size } catch (e) { continue }
+        const why = reason || (size > MAX_FILE_BYTES ? '单个文件 >50MB' : undefined)
+        if (why) { bump(excluded, top, 1, size, top === '(files)' ? why : (exclusionReason(top) || why)); continue }
+        bump(included, top, 1, size)
+      }
+    }
+  }
+  walk(root, '')
+  const bySize = (a, b) => b.bytes - a.bytes
+  const inc = [...included.values()].sort(bySize).map((r) => ({ name: r.name, files: r.files, bytes: r.bytes }))
+  const exc = [...excluded.values()].sort(bySize).map((r) => {
+    let top = null
+    let topScore = -1
+    for (const [reason, bytes] of r.reasons) {
+      // 没量体积（bytes 全是 0）时按固定优先级取原因，保证结果稳定可读：
+      // 聊天 > 可重建 > 日志缓存 > 单文件过大
+      const score = bytes * 1000 + REASON_PRIORITY(reason)
+      if (score > topScore) { top = reason; topScore = score }
+    }
+    return { name: r.name, files: r.files, bytes: r.bytes, reason: top || undefined }
+  })
+  return {
+    included: inc,
+    excluded: exc,
+    totals: {
+      files: inc.reduce((n, r) => n + r.files, 0),
+      bytes: inc.reduce((n, r) => n + r.bytes, 0),
+      excludedCount: exc.length,
+      // 未量体积时这两项为 undefined（客户端据此显示「未统计」而不是 0）
+      excludedFiles: measureExcluded ? exc.reduce((n, r) => n + r.files, 0) : undefined,
+      excludedBytes: measureExcluded ? exc.reduce((n, r) => n + r.bytes, 0) : undefined,
+    },
+  }
+}
+
+/** 排除原因的展示优先级（数值越大越优先），仅在没量体积时用来打破平局。 */
+function REASON_PRIORITY(reason) {
+  if (reason === '聊天记录' || reason === '聊天文件' || reason === '聊天派生数据') return 4
+  if (reason === '可重建：DSH 运行时' || reason === '可重建：插件依赖') return 3
+  if (reason === '日志/缓存' || reason === '临时/缓存') return 2
+  return 1
+}
+
+/** 递归统计一个目录的体积（excluded 清单用，不做 isExcluded 过滤）。 */
+function dirSize(dir) {
+  const out = { files: 0, bytes: 0 }
+  let entries
+  try { entries = readdirSync(dir, { withFileTypes: true }) } catch (e) { return out }
+  for (const ent of entries) {
+    const abs = join(dir, ent.name)
+    if (ent.isDirectory()) {
+      const sub = dirSize(abs)
+      out.files += sub.files
+      out.bytes += sub.bytes
+    } else if (ent.isFile()) {
+      try { out.bytes += statSync(abs).size; out.files++ } catch (e) { /* ignore */ }
+    }
+  }
+  return out
 }
 
 /** 遍历 root，收集全部应打包文件（返回 posix 相对路径列表，已排序） */
@@ -788,6 +917,83 @@ export function specFromInstalledPackage(pkgDir) {
     const spec = repoSpecFromUrl(url)
     return spec ? { spec, reason: 'repository.url' } : null
   } catch (e) { return null }
+}
+
+/** 读文件头判断是 JS 脚本还是原生可执行文件。
+ *  为什么必须判断：pnpm >= 10 的 npm 包里 \`pnpm\` 本体是原生启动器（ELF/Mach-O/PE），
+ *  只有 bin/pnpm.mjs 是脚本。用 node 去执行原生二进制必然 SyntaxError。 */
+export function isNativeExecutable(file) {
+  try {
+    const fd = openSync(file, 'r')
+    const head = Buffer.alloc(4)
+    const n = readSync(fd, head, 0, 4, 0)
+    closeSync(fd)
+    if (n < 2) return false
+    return head.equals(Buffer.from([0x7f, 0x45, 0x4c, 0x46])) ||        // ELF
+           (head[0] === 0x4d && head[1] === 0x5a)                       // MZ (PE)
+  } catch (e) { return false }
+}
+
+/** 在 PATH 里找 pnpm（Windows 补 PATHEXT）。返回真实路径或 null。
+ *  Web 版是纯 npm 安装的 CLI，没有 Electron 内置运行时，只有 PATH 这条路可用。 */
+export function findPnpmOnPath(env) {
+  const e = env || process.env
+  const exts = process.platform === 'win32'
+    ? String(e.PATHEXT || '.EXE;.CMD;.BAT;.COM').split(';').filter(Boolean)
+    : ['']
+  for (const dir of String(e.PATH || e.Path || '').split(delimiter)) {
+    if (!dir) continue
+    for (const ext of exts) {
+      const cand = join(dir, 'pnpm' + ext)
+      try {
+        if (statSync(cand).isFile()) return realpathSync(cand)
+      } catch (err) { /* 继续找 */ }
+    }
+  }
+  return null
+}
+
+/** 解析出「怎么调用 pnpm」。返回 { cmd, args, env?, via } 或 null。
+ *  关键约束：cmd 是 node 时 args 必须指向 .mjs/.cjs 脚本；cmd 是原生二进制时不得带 --expose-internals。
+ *  优先级：宿主给的 packageManager > 桌面版 resources 布局 > PATH。 */
+export function resolvePnpmInvocation(resourcesPath, opts) {
+  const o = opts || {}
+  // 1) 宿主提供的 packageManager（桌面版 Electron 内置运行时走这条）
+  const pm = o.packageManager
+  if (pm && typeof pm.command === 'string' && pm.command) {
+    return { cmd: pm.command, args: [...(pm.args || [])], env: pm.env, via: 'host' }
+  }
+  // 2) 桌面版 resources/ 布局（保持原有优先级，桌面版行为不变）
+  const bundled = findPnpmPath(resourcesPath, o)
+  if (bundled) return { cmd: process.execPath, args: ['--expose-internals', bundled], via: 'bundled' }
+  // 3) PATH 上的 pnpm（Web 版 / CLI 安装的正解）
+  const onPath = findPnpmOnPath(o.env)
+  if (!onPath) return null
+  // npm 安装的 pnpm 包里，启动器旁一定有 bin/pnpm.mjs，优先用它（脚本才认 --expose-internals）
+  const sibling = join(dirname(onPath), 'bin', 'pnpm.mjs')
+  if (existsSync(sibling)) return { cmd: process.execPath, args: ['--expose-internals', sibling], via: 'path-script' }
+  // Windows 上 npm / corepack 装的 pnpm 是 .CMD / .BAT 批处理外壳，spawn 直接跑会 EINVAL，
+  // 必须经 cmd.exe 转一手（见 buildPnpmCommand）。
+  if (process.platform === 'win32' && /\.(cmd|bat)$/i.test(onPath)) return { cmd: onPath, args: [], via: 'path-cmd-shim' }
+  if (!isNativeExecutable(onPath)) return { cmd: process.execPath, args: ['--expose-internals', onPath], via: 'path-script' }
+  return { cmd: onPath, args: [], via: 'path-binary' }   // 原生二进制：直接执行
+}
+
+/** 把 resolvePnpmInvocation 的结果 + 额外参数拼成可以真的 spawn 的命令行。
+ *  .CMD/.BAT 外壳走 cmd.exe /d /s /c ""<path>" <args>"，并置 windowsVerbatimArguments，
+ *  否则 node 的 spawn 要么 EINVAL，要么在带空格的路径上把 "C:\Program" 当成命令。 */
+export function buildPnpmCommand(inv, extraArgs) {
+  const extra = Array.isArray(extraArgs) ? extraArgs : []
+  if (!inv) return null
+  if (inv.via === 'path-cmd-shim') {
+    const quoted = [inv.cmd, ...extra].map((a) => (/[\s"]/.test(a) ? '"' + String(a).replace(/"/g, '') + '"' : a))
+    return {
+      cmd: process.env.ComSpec || 'cmd.exe',
+      args: ['/d', '/s', '/c', '"' + quoted.join(' ') + '"'],
+      windowsVerbatimArguments: true,
+    }
+  }
+  return { cmd: inv.cmd, args: [...inv.args, ...extra] }
 }
 
 /** 找 pnpm 的入口脚本。按候选列表探测，并兜底扫 ~/.dsh/dsh-runtimes/<版本>/。
@@ -1552,6 +1758,100 @@ export function writeLastRestore(dshRoot, info) {
   } catch (e) { return false }
 }
 
+/**
+ * 从 pnpm 输出里抓被拦下的构建脚本包名。
+ * 为什么必须处理：git 托管的插件靠 prepare 脚本构建，pnpm 默认拦下它们，
+ * 只报「退出码 1」。不把这层翻译给用户，恢复别人备份时就卡在这里无从下手。
+ * 实测输出形如：\`Ignored build scripts: esbuild@0.21.5, sharp.\`
+ */
+export function parseIgnoredBuildScripts(text) {
+  const m = /Ignored build scripts:([^\n]*)/i.exec(String(text || ''))
+  if (!m) return []
+  const seen = new Set()
+  for (const raw of m[1].split(/[,、]/)) {
+    // 每段先取第一个空白前的 token（pnpm 会在后面接 "Run pnpm approve-builds …" 这类注解），
+    // 再去掉结尾标点与 @版本号
+    const name = String(raw).trim().split(/\s+/)[0]
+      .replace(/[.。:;]+$/, '')
+      .replace(/@[^@/]+$/, '')
+    if (!name || !/^(@[\w.-]+\/)?[\w.-]+$/.test(name)) continue
+    seen.add(name)
+  }
+  return [...seen]
+}
+
+/** 读 profile 的 pnpm-workspace.yaml 里已经声明的 allowBuilds 包名（missing 时为空表）。 */
+export function readAllowBuilds(profileDir) {
+  try {
+    const file = join(profileDir, 'pnpm-workspace.yaml')
+    return parsePnpmAllowBuilds(readFileSync(file, 'utf8'))
+  } catch (e) { return [] }
+}
+
+/** 从 pnpm-workspace.yaml 文本解析 allowBuilds（支持块列表与行内数组两种写法）。 */
+export function parsePnpmAllowBuilds(text) {
+  const lines = String(text || '').split(/\r?\n/)
+  const out = []
+  let active = false
+  for (const line of lines) {
+    const block = /^allowBuilds\s*:\s*(.*)$/.exec(line)
+    if (block) {
+      const inline = block[1].trim()
+      if (inline.startsWith('[')) {
+        for (const raw of inline.replace(/^\[|\]$/g, '').split(',')) {
+          const name = yamlUnquote(raw.trim())
+          if (name) out.push(name)
+        }
+        active = false
+      } else {
+        active = inline === ''
+      }
+      continue
+    }
+    if (!active) continue
+    const item = /^\s+-\s*(.+)$/.exec(line)
+    if (item) {
+      const name = yamlUnquote(item[1].trim())
+      if (name) out.push(name)
+    } else if (/^\S/.test(line)) {
+      active = false        // 顶层另一个键，allowBuilds 块结束
+    }
+  }
+  return out
+}
+
+/**
+ * 把包名写进 profile 的 pnpm-workspace.yaml 的 allowBuilds，供「允许并重试」使用。
+ * 已有条目一律保留；写到临时文件再改名，避免半截文件把 profile 写坏。
+ */
+export function approveBuilds(profileDir, names) {
+  const wanted = (Array.isArray(names) ? names : []).filter((n) => typeof n === 'string' && n.trim())
+  if (!wanted.length) return { ok: true, added: [], allowBuilds: readAllowBuilds(profileDir) }
+  const file = join(profileDir, 'pnpm-workspace.yaml')
+  let text = ''
+  try { text = readFileSync(file, 'utf8') } catch (e) { text = '' }
+  const existing = parsePnpmAllowBuilds(text)
+  const added = wanted.filter((n) => !existing.includes(n))
+  if (!added.length) return { ok: true, added: [], allowBuilds: existing }
+  const block = 'allowBuilds:\n' +
+    [...existing, ...added].map((n) => '  - ' + yamlSingleQuote(n)).join('\n') + '\n'
+  // 已有 allowBuilds 就整段换成块列表（顺带把行内数组写法归一），否则追加到文件末尾
+  const next = /^allowBuilds\s*:/m.test(text)
+    ? text.replace(/^allowBuilds\s*:[^\n]*(?:\n[ \t]+[^\n]*)*\n?/m, block)
+    : (text ? (text.endsWith('\n') ? text : text + '\n') : '') + block
+  const tmp = file + '.tmp-dsh-sync'
+  writeFileSync(tmp, next, 'utf8')
+  renameSyncSafe(tmp, file)
+  return { ok: true, added, allowBuilds: [...existing, ...added] }
+}
+
+/** 改名失败的兜底（Windows 上目标被占用时先删再改）。 */
+function renameSyncSafe(from, to) {
+  try { renameSync(from, to) } catch (e) {
+    try { rmSync(to, { force: true }); renameSync(from, to) } catch (e2) { throw e }
+  }
+}
+
 /** 从明文 payload 里取出 meta（旧备份没有该字段时返回 null） */
 export function extractPayloadMeta(payload) {
   try {
@@ -1593,6 +1893,16 @@ export function collectInstallMeta(dshRoot, profileName) {
 // ============================================================
 // 插件入口
 // ============================================================
+
+/** 是否来自本机 loopback（connection 服务缺失时的 fail-closed 判据：只看 Host 与来源地址）。 */
+export function isLoopbackRequest(req) {
+  const host = String((req && req.headers && req.headers.host) || '')
+  const name = host.replace(/^\[|\](?=:)/, '').replace(/:\d+$/, '').replace(/^\[|\]$/g, '').toLowerCase()
+  if (name && name !== 'localhost' && name !== '127.0.0.1' && name !== '::1' && name !== '[::1]') return false
+  const remote = String((req && req.socket && req.socket.remoteAddress) || '')
+  if (!remote) return false
+  return remote === '127.0.0.1' || remote === '::1' || remote === '::ffff:127.0.0.1'
+}
 
 function resolveService(ctx, name) {
   try {
@@ -1641,12 +1951,16 @@ export function apply(ctx, config) {
       remoteDir: normalizeRemoteDir(c.remoteDir),
     }
     if (typeof c.passphrase === 'string' && c.passphrase) obj.passphrase = c.passphrase
-    writeFileSync(configFile, JSON.stringify(obj, null, 2), 'utf8')
+    // 文件里有 WebDAV 密码与（记住时的）备份口令，必须只有本用户可读：
+    // 默认 umask 落盘实测是 0664，同机其他用户能直接读走。
+    writeFileSync(configFile, JSON.stringify(obj, null, 2), { encoding: 'utf8', mode: 0o600 })
+    try { chmodSync(configFile, 0o600) } catch (e) { /* Windows 上 chmod 基本无效，忽略 */ }
   }
 
-  const json = (res, obj) => {
+  /** 统一出口。状态码与宿主 /api 对齐：方法不匹配 405、body 解析失败 400、内部异常 500。 */
+  const json = (res, obj, status) => {
     const body = JSON.stringify(obj)
-    res.writeHead(200, {
+    res.writeHead(Number.isFinite(status) ? status : 200, {
       'Content-Type': 'application/json; charset=utf-8',
       'Content-Length': String(Buffer.byteLength(body)),
       'Cache-Control': 'no-store',
@@ -1654,17 +1968,22 @@ export function apply(ctx, config) {
     res.end(body)
   }
 
+  /** 读请求体。解析失败时 parseFailed=true —— 调用方要回 400，不能当成空 body 继续。 */
   const readBody = (req) => new Promise((resolve) => {
     const chunks = []
     req.on('data', (c) => chunks.push(c))
     req.on('end', () => {
-      try { resolve(JSON.parse(Buffer.concat(chunks).toString('utf8') || '{}')) } catch (e) { resolve({}) }
+      const raw = Buffer.concat(chunks).toString('utf8').trim()
+      if (!raw) return resolve({ body: {}, parseFailed: false })
+      try { resolve({ body: JSON.parse(raw), parseFailed: false }) } catch (e) { resolve({ body: {}, parseFailed: true }) }
     })
-    req.on('error', () => resolve({}))
+    req.on('error', () => resolve({ body: {}, parseFailed: false }))
   })
 
   let lastLocalSnapshot = null
   let installing = false
+  // 路由注册时拿到的 ctx（fail-closed 兜底要用它再取一次 connection）
+  let routeCtxRef = ctx
   try {
     const olds = readdirSync(snapshotRoot).filter((n) => { try { return statSync(join(snapshotRoot, n)).isDirectory() } catch (e) { return false } }).sort()
     if (olds.length) lastLocalSnapshot = olds[olds.length - 1]
@@ -1672,27 +1991,35 @@ export function apply(ctx, config) {
 
   // ---- 各端点处理逻辑（与路由解耦，便于复用） ----
 
-  // 设置页要原样回显已保存的配置。密码本来就写在本机 dsh-sync.json 里，只回给本机页面。
+  // 设置页回显已保存的配置，但绝不回传明文密码：只回 hasPassword，页面留空表示「沿用已保存的」。
+  // 密码本来就在本机 dsh-sync.json 里，没有任何必要再经一次 HTTP 往返暴露。
   const savedConfigView = (c) => {
     if (!c) return null
     return {
       url: String(c.url || ''),
       username: String(c.username || ''),
-      password: String(c.password || ''),
+      password: '',
       remoteDir: normalizeRemoteDir(c.remoteDir),
       hasPassword: !!c.password,
       hasPassphrase: typeof c.passphrase === 'string' && !!c.passphrase,
     }
   }
 
+  /** 备份范围的实时快照（本地磁盘统计，不联网）。设置页与备份结果都用它。 */
+  const localCoverage = () => {
+    try { return describeScope(dshRoot) } catch (e) { return null }
+  }
+
   const handleStatus = async () => {
     const c = loadPluginConfig()
     const config = savedConfigView(c)
-    if (!c) return { configured: false, config, remote: { reachable: false, backups: [] }, lastLocalSnapshot: lastLocalSnapshot || undefined }
+    // 备份范围随状态一起给出：用户在点「立即备份」之前就能看到这次会同步什么、排除什么。
+    const coverage = localCoverage()
+    if (!c) return { configured: false, config, coverage, remote: { reachable: false, backups: [] }, lastLocalSnapshot: lastLocalSnapshot || undefined }
     try {
       const err = await ensureRemoteDir(c)
       if (err) {
-        return { configured: true, config, remote: { reachable: false, backups: [] }, lastLocalSnapshot: lastLocalSnapshot || undefined, error: err }
+        return { configured: true, config, coverage, remote: { reachable: false, backups: [] }, lastLocalSnapshot: lastLocalSnapshot || undefined, error: err }
       }
       const listed = await listAccountBackups(c)
       const backups = listed.backups
@@ -1702,6 +2029,7 @@ export function apply(ctx, config) {
       return {
         configured: true,
         config,
+        coverage,
         remote: {
           reachable: true,
           backups,
@@ -1712,7 +2040,7 @@ export function apply(ctx, config) {
       }
     } catch (e) {
       return {
-        configured: true, config, remote: { reachable: false, backups: [] },
+        configured: true, config, coverage, remote: { reachable: false, backups: [] },
         lastLocalSnapshot: lastLocalSnapshot || undefined,
         error: e && e.message ? e.message : String(e),
       }
@@ -1721,6 +2049,10 @@ export function apply(ctx, config) {
 
   const handleConfig = async (body) => {
     const prev = loadPluginConfig()
+    // 状态接口不再回传明文密码，所以页面留空表示「沿用已保存的」；点「清除密码」才会真的清空。
+    if (prev && prev.password && body && (body.password === undefined || body.password === null || body.password === '')) {
+      body = { ...body, password: prev.password }
+    }
     const c = configForDisk(prev, body)
     if (!c.url) return { ok: false, error: 'url 不能为空' }
     const err = await ensureRemoteDir(c)
@@ -1756,7 +2088,7 @@ export function apply(ctx, config) {
     }
     const relFiles = collectFiles(dshRoot)
     const appDataFiles = collectAppDataFiles()
-    const payload = buildPayload(dshRoot, relFiles, collectInstallMeta(dshRoot, cfg.profile), appDataFiles)
+    const payload = buildPayload(dshRoot, relFiles, collectInstallMeta(dshRoot, resolveProfile().name), appDataFiles)
     const bundle = encryptBundle(payload, passphrase)
     const name = bundleName()
     const url = remoteDirUrl(c, name)
@@ -1779,8 +2111,17 @@ export function apply(ctx, config) {
       pruneError = e && e.message ? e.message : String(e)
       log('remote prune failed: ' + pruneError)
     }
+    // 「到底同步了什么、排除了什么」要能被用户看见，否则「其他全部同步」只能靠信。
+    let coverage = null
+    // 备份结果是一次性展示，这里量出被排除目录的真实体积
+    try { coverage = describeScope(dshRoot, { measureExcluded: true }) } catch (e) { coverage = null }
     log('backup uploaded: ' + name + ' (' + bundle.length + ' bytes, ' + relFiles.length + ' files + ' + appDataFiles.length + ' appdata files; scope ' + scope.topLevel.map((t) => t.name + '=' + t.files).join(',') + ')')
-    return { ok: true, name, size: bundle.length, fileCount: relFiles.length, appDataCount: appDataFiles.length, scope, pruned, pruneError }
+    return {
+      ok: true, name, size: bundle.length, fileCount: relFiles.length, appDataCount: appDataFiles.length,
+      scope,
+      coverage: coverage ? { included: coverage.included, excluded: coverage.excluded, totals: coverage.totals } : undefined,
+      pruned, pruneError,
+    }
   }
 
   const handleRestore = async (body) => {
@@ -1920,6 +2261,8 @@ export function apply(ctx, config) {
       child = spawn(opt.cmd, opt.args, {
         cwd: opt.cwd, env: opt.env, timeout: opt.timeout,
         windowsHide: true, stdio: ['ignore', 'pipe', 'pipe'],
+        // .CMD/.BAT 外壳（Windows 上的 pnpm）必须原样透传已转义好的命令行
+        windowsVerbatimArguments: opt.windowsVerbatimArguments === true,
       })
     } catch (e) {
       resolve({ status: null, stdout: '', stderr: '', error: e })
@@ -1946,13 +2289,30 @@ export function apply(ctx, config) {
 
   // ---- 恢复后重装插件依赖 ----
 
-  /** 解析实际使用的 profile：优先 cfg.profile，其次看哪个 profiles/<n> 里有 bundle 配置 */
+  /** 宿主给的当前 profile 名（0.2.1 起所有 profile 都有 ctx.profileContext） */
+  const hostProfileName = () => {
+    try {
+      const pc = resolveService(ctx, 'profileContext')
+      const name = pc && typeof pc.name === 'string' ? pc.name.trim() : ''
+      return name || null
+    } catch (e) { return null }
+  }
+
+  /**
+   * 解析实际使用的 profile：宿主当前 profile > cfg.profile > 扫描 profiles/<n>。
+   *
+   * 为什么宿主优先：机器上同时有 profiles/desktop 和 profiles/web 时，Web 实例若按
+   * 默认值 'desktop' 直取，就会改写 desktop 的 package.json 并往那里装包——当前运行的
+   * web profile 一个都修不好，症状是「按钮说成功了，重启后插件还是不可用」。
+   */
   const resolveProfile = () => {
-    const wanted = String(cfg.profile || 'desktop')
+    const fromHost = hostProfileName()
+    const wanted = String(fromHost || cfg.profile || 'desktop')
     const direct = join(dshRoot, 'profiles', wanted)
     try {
       if (existsSync(join(direct, 'package.json'))) return { name: wanted, dir: direct }
     } catch (e) { /* ignore */ }
+    if (fromHost) return { name: wanted, dir: direct }   // 宿主说的就是它，不要再去猜别的 profile
     try {
       for (const n of readdirSync(join(dshRoot, 'profiles'))) {
         const dir = join(dshRoot, 'profiles', n)
@@ -1964,6 +2324,28 @@ export function apply(ctx, config) {
     } catch (e) { /* ignore */ }
     return { name: wanted, dir: direct }
   }
+
+  /** 宿主给的 pnpm 调用方式（桌面版 Electron 内置运行时通过它暴露） */
+  const hostPackageManager = () => {
+    try {
+      const pc = resolveService(ctx, 'profileContext')
+      const pm = pc && pc.packageManager
+      return pm && typeof pm.command === 'string' && pm.command ? pm : null
+    } catch (e) { return null }
+  }
+
+  /** 解析「怎么调用 pnpm」。测试可显式注入一份（传 null 表示强制找不到）。 */
+  const pnpmInvocation = (opts) => {
+    const o = opts || {}
+    return resolvePnpmInvocation(process.resourcesPath, {
+      packageManager: o.packageManager !== undefined ? o.packageManager : hostPackageManager(),
+      homeRoot: o.homeRoot,
+      env: o.env,
+    })
+  }
+
+  const PNPM_MISSING_HINT = '未找到 pnpm。请先安装 pnpm（npm i -g pnpm）并确保它在 PATH 中；' +
+    '桌面版应用自带运行时，Web 版需要自行安装。'
 
   /** 组合「插件依赖现状」：已装/缺失、可否改写、能否安装。
    *  字段形状遵循 client.js 头部契约：missing 是包名数组，deps[].installed 是布尔值。 */
@@ -1980,7 +2362,7 @@ export function apply(ctx, config) {
     // 恢复时记录的映射必须先读：B 机上 node_modules 尚未重建，只能靠备份里的 linkMap
     const last = readLastRestore(dshRoot)
     const plan = planProfileInstall(prof.dir, last && last.linkMap)
-    const pnpmPath = findPnpmPath(process.resourcesPath)
+    const inv = pnpmInvocation()
     const nodeModules = join(prof.dir, 'node_modules')
     const deps = []
     const missing = []
@@ -2000,7 +2382,6 @@ export function apply(ctx, config) {
     }
     return {
       profile: prof.name,
-      profileDir: prof.dir,
       found: plan.ok,
       error: plan.ok ? undefined : plan.error,
       deps,
@@ -2008,19 +2389,28 @@ export function apply(ctx, config) {
       missingCount: missing.length,
       needsInstall: missing.length > 0,
       mapped,
-      pnpm: { available: !!pnpmPath, path: pnpmPath || undefined },
+      // 注意：Web 版靠 PATH 上的 pnpm，available 必须反映「能不能真跑起来」，不能只看桌面版布局。
+      // profileDir 绝对路径不再回传（属不必要的暴露），需要时看 profile 名即可。
+      pnpm: { available: !!inv, path: inv ? (inv.args[inv.args.length - 1] || inv.cmd) : undefined, via: inv ? inv.via : undefined },
       lastRestore: last ? { at: last.at, bundle: last.bundle } : undefined,
     }
   }
 
-  /** 实测：改写 spec → 备份 package.json → 跑 pnpm install（可注入 runner 供测试） */
-  const runProfileInstall = async (runner, pnpmPathOpt, opts) => {
+  /**
+   * 实测：改写 spec → 备份 package.json → 跑 pnpm install（可注入 runner 供测试）
+   *
+   * pnpmInv 参数沿用旧签名的位置：调用方传 'C:/fake/pnpm.mjs' 这类路径时按「脚本入口」解释，
+   * 传 null 表示强制找不到 pnpm，传 undefined 表示自己解析。
+   */
+  const runProfileInstall = async (runner, pnpmInv, opts) => {
     if (installing) return { ok: false, error: '安装正在进行中，请稍候' }
     const prof = resolveProfile()
     const file = join(prof.dir, 'package.json')
     // 区分「未提供」与「显式传入空值」：测试用 null 模拟找不到 pnpm，不能被 || 吞掉
-    const pnpmPath = pnpmPathOpt === undefined ? findPnpmPath(process.resourcesPath) : pnpmPathOpt
-    if (!pnpmPath) return { ok: false, error: '未找到 pnpm（期望 resources/runtime/primary-runtime/dependencies/pnpm/bin/pnpm.mjs，或旧路径 runtime/pnpm/bin/pnpm.mjs）' }
+    const inv = pnpmInv === undefined
+      ? pnpmInvocation()
+      : (typeof pnpmInv === 'string' ? { cmd: process.execPath, args: ['--expose-internals', pnpmInv], via: 'injected' } : pnpmInv)
+    if (!inv) return { ok: false, error: PNPM_MISSING_HINT }
 
     // 0) 先把源机器的绝对路径改到这台电脑，再决定哪些依赖要改写成仓库地址
     try { portabilizeProfile(prof.dir, dshRoot) } catch (e) { /* 下面的 plan 仍会去掉装不上的 link: */ }
@@ -2043,10 +2433,20 @@ export function apply(ctx, config) {
     const mapped = (last && last.linkMap) || {}
 
     const changed = Object.keys(rewritten).length || Object.keys(removed).length
+    // 备份句柄提到外层：pnpm 失败时要靠它把 package.json 还原回去（见下）
+    let bak = null
+    const lockFile = join(prof.dir, 'pnpm-lock.yaml')
+    let lockBak = null
     if (changed) {
-      const bak = file + '.bak-dsh-sync-' + new Date().toISOString().replace(/[-:T]/g, '').slice(0, 14)
+      bak = file + '.bak-dsh-sync-' + new Date().toISOString().replace(/[-:T]/g, '').slice(0, 14)
       try {
         copyFileSync(file, bak)
+        // 锁文件也留一份：失败时它和 package.json 必须一起回到改动前，
+        // 否则 DSH 自己后续的 --frozen-lockfile 会因为两者不一致而整批失败。
+        if (existsSync(lockFile)) {
+          lockBak = lockFile + '.bak-dsh-sync-' + new Date().toISOString().replace(/[-:T]/g, '').slice(0, 14)
+          try { copyFileSync(lockFile, lockBak) } catch (e) { lockBak = null }
+        }
         writeJsonFile(file, pkg)
         log('plugin install: rewrote ' + Object.keys(rewritten).length + ' link deps, removed ' + Object.keys(removed).length + ' (backup ' + bak + ')')
       } catch (e) {
@@ -2056,22 +2456,42 @@ export function apply(ctx, config) {
       return { ok: false, error: 'profile 的 package.json 不存在' }
     }
 
+    /** 安装失败时把 package.json / pnpm-lock.yaml 还原到改写前（没有备份则什么也不做）。 */
+    const restoreProfileFiles = () => {
+      let restored = false
+      if (bak) {
+        try { copyFileSync(bak, file); restored = true } catch (e) { /* ignore */ }
+      }
+      if (lockBak) {
+        try { copyFileSync(lockBak, lockFile) } catch (e) { /* ignore */ }
+      }
+      if (restored) log('plugin install failed; package.json restored from ' + bak)
+      return restored
+    }
+
     // 2) 跑 pnpm install（普通模式：顺带把锁文件里遗留的 link: specifier 一并同步，否则后续
     //    DSH 自己的 pnpm install --frozen-lockfile 会因为 package.json 与锁文件不一致而失败）
-    // 对齐桌面版 runDesktopCli：electron 当 node 跑 pnpm.mjs，并带上 --expose-internals
-    const args = ['--expose-internals', pnpmPath, 'install']
-    if (opts && opts.force) args.push('--force')
+    // 调用方式由 resolvePnpmInvocation 决定：脚本入口用 node + --expose-internals，
+    // 原生启动器（pnpm >= 10 的 npm 包）必须直接执行，否则 node 会把 ELF 当 JS 解析。
+    const extra = opts && opts.force ? ['install', '--force'] : ['install']
+    const built = buildPnpmCommand(inv, extra) || { cmd: inv.cmd, args: [...inv.args, ...extra] }
+    const args = built.args
     installing = true
     const startedAt = Date.now()
     // 升级路径装的是 github: 依赖，必须把 git 的 SSH 回退拉回 HTTPS（见 githubHttpsOnlyEnv）
     const baseEnv = { ...process.env, ELECTRON_RUN_AS_NODE: '1', DSH_DESKTOP_NODE_EXECUTABLE: process.execPath }
-    const childEnv = opts && opts.githubHttpsOnly ? githubHttpsOnlyEnv(baseEnv) : baseEnv
+    const withGit = opts && opts.githubHttpsOnly ? githubHttpsOnlyEnv(baseEnv) : baseEnv
+    const childEnv = inv.env ? { ...withGit, ...inv.env } : withGit
     let r
     try {
-      r = await runner({ cmd: process.execPath, args, cwd: prof.dir, env: childEnv, timeout: INSTALL_TIMEOUT_MS })
+      r = await runner({
+        cmd: built.cmd, args, cwd: prof.dir, env: childEnv, timeout: INSTALL_TIMEOUT_MS,
+        windowsVerbatimArguments: built.windowsVerbatimArguments,
+      })
     } catch (e) {
       installing = false
-      return { ok: false, error: 'pnpm install 启动失败：' + (e && e.message ? e.message : String(e)), log: '' }
+      const restored = restoreProfileFiles()
+      return { ok: false, restored, error: 'pnpm install 启动失败：' + (e && e.message ? e.message : String(e)), log: '' }
     }
     installing = false
     const durationMs = Date.now() - startedAt
@@ -2099,10 +2519,23 @@ export function apply(ctx, config) {
     } else {
       log('plugin install failed: exit ' + r.status + ' / ' + (r.error ? String(r.error) : 'see log'))
     }
+    // 失败必须回滚 package.json：改写与删依赖是在跑 pnpm 之前做的，不还原就会留下一个
+    // 依赖被改坏/删掉的 profile，用户手上没有任何回滚点。
+    const restored = ok ? false : restoreProfileFiles()
+    // pnpm 因构建审批拦下的包名：不译出来的话用户只看到「退出码 1」，无从下手
+    const pendingBuilds = ok ? [] : parseIgnoredBuildScripts(tail)
+    if (pendingBuilds.length) log('plugin install blocked by build scripts: ' + pendingBuilds.join(', '))
     return {
-      ok, installed: installedNames, exitCode: r.status, durationMs,
+      ok, installed: installedNames, exitCode: r.status, durationMs, restored,
       rewritten: rewrittenOut, removed: removedOut, lockSynced: ok ? lockSynced : undefined,
-      log: tail, error: ok ? undefined : 'pnpm install 退出码 ' + r.status,
+      pendingBuilds: pendingBuilds.length ? pendingBuilds : undefined,
+      log: tail,
+      error: ok
+        ? undefined
+        : (pendingBuilds.length
+            ? 'pnpm 拦下了 ' + pendingBuilds.join('、') + ' 的安装脚本（git 插件靠 prepare 构建）。' +
+              '点「允许并重试」把它们写进 profile 的 pnpm-workspace.yaml 的 allowBuilds 后再装一次。'
+            : 'pnpm install 退出码 ' + r.status),
     }
   }
 
@@ -2120,9 +2553,16 @@ export function apply(ctx, config) {
     }
   }
 
-  const handlePluginInstall = async (body, runner, pnpmPathOpt) => {
+  const handlePluginInstall = async (body, runner, pnpmInvOpt) => {
     try {
-      return await runProfileInstall(runner || defaultRunner, pnpmPathOpt)
+      // 「允许并重试」：先把被拦下的包名写进 profile 的 pnpm-workspace.yaml，再跑一次安装
+      const approve = body && Array.isArray(body.approve) ? body.approve.filter((n) => typeof n === 'string' && n) : []
+      if (approve.length) {
+        const prof = resolveProfile()
+        const r = approveBuilds(prof.dir, approve)
+        log('approveBuilds: ' + (r.added.length ? r.added.join(', ') : '(already allowed) ' + approve.join(', ')))
+      }
+      return await runProfileInstall(runner || defaultRunner, pnpmInvOpt)
     } catch (e) {
       installing = false
       return { ok: false, error: e && e.message ? e.message : String(e) }
@@ -2343,11 +2783,30 @@ export function apply(ctx, config) {
   apply._internals = {
     handlePlugins, handlePluginInstall, buildPluginsReport, resolveProfile, defaultRunner,
     handleVersion, handleUpgrade, inspectSelf, versionCache, runProfileInstall,
-    handleStatus, handleDelete, handlePassphrase,
+    handleStatus, handleDelete, handlePassphrase, handleConfig, handleBackup,
+    describeScope, localCoverage,
+  }
+
+  /**
+   * 请求栅栏：与宿主 /api 同一套（Host/Origin 栅栏 + 浏览器 cookie / API 凭据）。
+   * 少了它，同网段任意主机、或用户浏览器里打开的任何网页，都能改写 WebDAV 指向并把 ~/.dsh 打包外传
+   * （POST + text/plain 是 CORS 简单请求，副作用照样发生）。
+   * connection 取不到时 fail-closed：只放过 loopback 直连。
+   */
+  // 注意：只 inject webServer。connection 在请求时才解析——若把它写进 inject，
+  // 一旦宿主的 composition 里没有这个服务，11 个端点会连注册都等不到，整块功能直接消失。
+  // 取不到 connection 时按 loopback 判据 fail-closed，安全性不因此下降。
+  const requestRejection = (req) => {
+    const connection = resolveService(routeCtxRef, 'connection') || resolveService(ctx, 'connection')
+    if (connection && typeof connection.requestRejection === 'function') {
+      try { return connection.requestRejection(req) } catch (e) { return 403 }
+    }
+    return isLoopbackRequest(req) ? undefined : 403
   }
 
   const setupRoutes = (routeCtx) => {
     try {
+      routeCtxRef = routeCtx
       const webServer = resolveService(routeCtx, 'webServer')
       if (!webServer || typeof webServer.register !== 'function') {
         log('webServer service unavailable; HTTP endpoints disabled')
@@ -2360,24 +2819,41 @@ export function apply(ctx, config) {
           path,
           handler: async (req, res) => {
             try {
-              if (req.method !== method) {
-                return json(res, { ok: false, error: '方法不允许：需要 ' + method })
+              const rejection = requestRejection(req)
+              if (rejection !== undefined) {
+                const body = rejection === 401 ? 'unauthorized' : 'forbidden'
+                res.writeHead(rejection, {
+                  'Content-Type': 'text/plain; charset=utf-8',
+                  'Content-Length': String(Buffer.byteLength(body)),
+                  'Cache-Control': 'no-store',
+                })
+                return res.end(body)
               }
-              const body = method === 'POST' ? await readBody(req) : {}
-              const result = await handler(body, req)
-              json(res, result)
+              if (req.method !== method) {
+                res.setHeader('Allow', method)
+                return json(res, { ok: false, error: '方法不允许：需要 ' + method }, 405)
+              }
+              const parsed = method === 'POST' ? await readBody(req) : { body: {}, parseFailed: false }
+              if (parsed.parseFailed) return json(res, { ok: false, error: '请求体不是合法 JSON' }, 400)
+              const result = await handler(parsed.body, req)
+              json(res, result, 200)
             } catch (e) {
-              json(res, { ok: false, error: e && e.message ? e.message : String(e) })
+              json(res, { ok: false, error: e && e.message ? e.message : String(e) }, 500)
             }
           },
         })
         if (typeof dispose === 'function') cleanupFns.push(dispose)
       }
-      log('HTTP endpoints ready: /dsh-sync/{status,config,passphrase,backup,restore,rollback,delete,plugins,plugins/install,version,upgrade}')
+      log('HTTP endpoints ready: /dsh-sync/{status,config,passphrase,backup,restore,rollback,delete,plugins,plugins/install,version,upgrade}' +
+        '（已套 Host/Origin 栅栏 + browser cookie 认证）')
     } catch (e) {
       log('route registration failed: ' + (e && e.message ? e.message : String(e)))
     }
   }
+
+  // 路由层句柄要在定义之后再挂（requestRejection / setupRoutes 是上面才声明的 const）
+  apply._internals.requestRejection = requestRejection
+  apply._internals.setupRoutes = setupRoutes
 
   try {
     if (ctx && typeof ctx.inject === 'function') {

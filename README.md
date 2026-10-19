@@ -6,6 +6,11 @@
 把 `~/.dsh` 的整体配置打包加密后备份到 WebDAV，在新机器上一键恢复——替代「手工搬运配置文件」的做法。
 
 > 适用于 [DeepSeek Harness](https://github.com/deepseek-ai) 的双半区插件（Host + Client），零 npm 依赖。
+>
+> 版本 **0.4.1**。要求 DSH **>= 0.2.1-rc.2**（端点栅栏用到 `connection.requestRejection`，profile 判定用到 `ctx.profileContext`）；已在 **0.2.1-rc.2 / Web 版**实测。
+>
+> 下限写 `0.2.1-rc.2` 而不是 `0.2.1` 是有意的：按 semver 规范，预发布版本 **不满足** `>=0.2.1` 这种不含预发布标识的范围，
+> 而下限若写 `>=0.2.1`，正在跑 `0.2.1-rc.2` 的机器会被宿主的 `engines.dsh` 校验判为 `incompatible-version`、直接装不上。
 
 ## 为什么需要它
 
@@ -15,7 +20,7 @@ dsh-sync 把这件事变成两个按钮：**备份**（加密上传）和**恢�
 
 ## 功能
 
-在**设置页**新增一张「配置同步（WebDAV）」卡片（与 general / account / models / plugins 并列，全新 id `sync`，不替换任何现有页面）。已保存的服务器地址、用户名、远程目录和密码会在下次打开时回填到输入框，并在卡片上写明「已保存：…」，避免只看到占位符、分不清有没有配置过。
+在**设置页**新增一张「配置同步（WebDAV）」卡片（与 general / account / models / plugins 并列，全新 id `sync`，不替换任何现有页面）。已保存的服务器地址、用户名和远程目录会在下次打开时回填到输入框，并在卡片上写明「已保存：…」，避免只看到占位符、分不清有没有配置过。**密码不再回显**（只显示「已填写」）：留空保存表示沿用已保存的那份。
 
 | 功能 | 说明 |
 |---|---|
@@ -52,7 +57,7 @@ dsh-sync 把这件事变成两个按钮：**备份**（加密上传）和**恢�
 
 `link:` / `file:` 指向 A 机独有目录、而这台电脑上没有对应文件时，会改写成备份里记录的仓库地址；推导不出仓库的条目会从依赖里去掉，避免一条坏依赖拖垮全部插件。
 
-第 4 步会自动处理 A 机的本地路径依赖：A 机若用 `link:E:\…\dsh-sync-release` 这种写法装了本插件，这个绝对路径在 B 机**并不存在**，直接 `pnpm install` 会失败。插件在**备份时**就把这类依赖的仓库地址采集进备份包，恢复时自动改写为 `github:ddldxiacan/dsh-sync-webdav` 之类的可移植 spec 再安装。
+第 4 步会自动处理 A 机的本地路径依赖：A 机若用 `link:E:\…\dsh-sync-webdav` 这种写法装了本插件，这个绝对路径在 B 机**并不存在**，直接 `pnpm install` 会失败。插件在**备份时**就把这类依赖的仓库地址采集进备份包，恢复时自动改写为 `github:ddldxiacan/dsh-sync-webdav` 之类的可移植 spec 再安装。
 
 > 恢复流程**不会**自动跑 pnpm install——重装由你点按钮触发，因为安装可能耗时数分钟且会改动 `package.json`。
 
@@ -138,31 +143,66 @@ git push origin main --tags
 
 ## 同步范围与排除规则
 
-打包 `~/.dsh` 下**除以下之外**的全部内容：
+**策略：`~/.dsh` 下除「工作区聊天数据」和「可重建产物」之外，全部同步。**
 
-- `dsh-runtimes/`（按目录名整棵排除。Node 运行时体积大且与机器架构相关，**不是**靠单文件大小上限排除的）
-- `node_modules/`（插件依赖，**实测 800MB+**，可由 pnpm 重装）
-- `sessions/`（会话历史，属可再生的使用记录，**这是唯一不同步的对话数据**）
-- `logs/`、`npm-cache/`、`tmp*/`、`cache*/`
-- 上述目录之外，单个大于 50MB 的文件
+| 类别 | 内容 | 实测体积 |
+|---|---|---|
+| ❌ 聊天记录 | `sessions/`（会话正文 `session.v4.jsonl.zstd`） | 51.2 MB |
+| ❌ 聊天文件 | `attachments/`（聊天里上传的文件对象） | 10.1 MB |
+| ❌ 聊天派生 | `storages/session_projcache/`（会话标题与首条输入原文）、`storages/workspace.json`（含 `archivedSessionIds`） | 1.9 MB |
+| ❌ 可重建 | `dsh-runtimes/`（DSH 运行时，架构相关）、`node_modules/`（插件依赖） | 257.2 MB + 991.7 MB |
+| ❌ 日志缓存 | `logs/`、`npm-cache/`、`tmp*/`、`cache*/`、单个 >50MB 的文件 | — |
+| ✅ **同步** | 其余一切：凭据、插件配置、profile、agent-presets、task-board、skins、local-packages、用量、会话归档… | **约 12.7 MB** |
 
-远端目录只保留最近 **5** 份 `.bundle`，更旧的在备份成功后自动 `DELETE`。备份结果会带上打包范围（每个顶层目录有多少文件），体积异常时能直接看出来。
+排除清单是**白名单式的显式四类**：新出现的目录默认进备份，不会被静默漏掉。
+
+> 为什么不做字面全量：全量是 1.33GB，而当前实现把整个 payload 读进内存再加密——实测 350MB 就会 **OOM**。
+> 排除的两块都是可重建产物（重启装运行时、点「重装插件」装依赖），不是用户数据。
+
+远端目录只保留最近 **5** 份 `.bundle`，更旧的在备份成功后自动 `DELETE`。
+
+**恢复/回滚时的对齐删除只作用于「配置范围」**，被排除的 `sessions/`、`attachments/` 等一律不动——
+换机恢复不会误删目标机上已有的聊天记录。
 
 **v0.3.0 起额外同步 Electron 应用级设置**：`%APPDATA%\@deepseek-ai\dsh-desktop\desktop\settings.json` 等用户配置文件，以 `__appdata__/` 前缀并入同一加密备份，恢复/回滚时自动写回原位（Chromium 缓存类目录与 >2MB 文件仍排除，不撑大备份）。
 
-账号凭据（`.credentials.yaml`）、各插件配置（`cordis.yml`/`package.json`/`.plugin-manager`）、agent-presets、task-board、skins、附件等**全部在同步范围内**——只有聊天对话（`sessions/`）与可重建产物（`node_modules/`、运行时）不打包。
+设置页的「备份」卡片里有一行「**本次同步范围**」，展开即可看到会同步哪些顶层项、排除了哪些以及排除原因；
+`/status` 的 `coverage` 字段、备份结果的 `coverage` 字段给出同样信息（机器可读）。
 
-> 排除 `node_modules` 与 `sessions` 不只是为了省空间：它们在 base64 封装后会让 payload 达到 350MB+，加上序列化副本会**直接把 Node 堆撑爆**（实测 OOM）。这两项都是可重建的产物，不属于配置。
+> `/status` 的 `coverage` **不统计被排除目录的体积**（递归量 5.8 万个文件要 3.6 秒，会拖慢每次轮询），
+> 只报 `excludedCount`（排除项个数）；备份结果里的 `coverage` 才带 `excludedFiles`/`excludedBytes`。
 
 > 备份**包含** `~/.dsh/dsh-sync.json` 自身（里面存着 WebDAV 的 url/username/password），这属有意设计——配置整体迁移。备份内容受口令加密保护。
 
 ## 安全模型
 
 - **加密**：`scrypt(passphrase, salt, 32)` 派生密钥 + `AES-256-GCM`；带 SHA-256 内容校验，篡改或口令错误都会明确报错
-- **口令**：只在内存中存在，绝不落盘、绝不写入日志
-- **覆盖策略**：恢复与回滚都会把**配置范围**对齐到所选备份或快照。备份里的文件覆盖现有文件；备份里没有的配置文件会删掉，因此变空的目录一并去掉。配置范围就是打包规则会收进去的路径。`dsh-runtimes/`、`node_modules/`、`sessions/`、日志、缓存和大于 50MB 的文件**不在备份里，恢复时也不删除**——否则会删掉运行时导致 DSH 起不来，或丢掉聊天记录。旧备份若完全没有应用级设置（没有 `__appdata__/` 条目，也没有 `meta.appDataIncluded`），不会据此清空本机 AppData 配置。
+- **口令**：只在内存中存在，绝不落盘、绝不写入日志（勾选「在本机记住」时才写进 `dsh-sync.json`）
+- **本机文件权限**：`~/.dsh/dsh-sync.json` 以 `0600` 落盘（里面有 WebDAV 密码与记住的口令），旧文件保存时同步收紧。
+  该权限在 POSIX 上直接生效；Windows 上由 NTFS 用户目录 ACL 兜底（`chmod` 基本无效，属平台限制）
+- **端点鉴权**：所有 `/dsh-sync/*` 走宿主的 Host/Origin 栅栏 + 浏览器 cookie 认证，与 `/api` 同一套；`connection` 缺失时只放行 loopback
+- **不回传明文密码**：`/status` 只回 `hasPassword`，设置页也不再回显密码（留空=沿用已保存的）
+- **覆盖策略**：恢复与回滚都会把**配置范围**对齐到所选备份或快照。备份里的文件覆盖现有文件；备份里没有的配置文件会删掉，因此变空的目录一并去掉。配置范围就是打包规则会收进去的路径。聊天记录（`sessions/`）、聊天文件（`attachments/`）、聊天派生数据、`dsh-runtimes/`、`node_modules/`、日志、缓存和大于 50MB 的文件**不在备份里，恢复时也不删除**——否则会删掉运行时导致 DSH 起不来，或丢掉聊天记录。旧备份若完全没有应用级设置（没有 `__appdata__/` 条目，也没有 `meta.appDataIncluded`），不会据此清空本机 AppData 配置。
 
 ## 安装
+
+### Web 版 / CLI 安装的前置条件：pnpm 必须在 `PATH` 里
+
+桌面版自带运行时（`resources/runtime/primary-runtime/dependencies/pnpm/`），插件直接用内置的那份；
+**Web 版（`dsh --profile web`）是纯 npm 安装的 CLI，没有内置运行时**，卡片上的「重装插件」「恢复后自动安装」都依赖系统里的 pnpm：
+
+```powershell
+npm i -g pnpm        # 或 corepack enable pnpm
+pnpm --version       # 必须能在 PATH 里被找到
+```
+
+插件的查找顺序是：宿主给的 `packageManager` → 桌面版 `resources/` 布局 → **`PATH` 上的 pnpm**。按找到的形态决定怎么调用：
+
+| `PATH` 上是 | 怎么跑 | 为什么 |
+|---|---|---|
+| `…/pnpm/bin/pnpm.mjs` 脚本 | `node --expose-internals <script>` | 脚本入口才认 `--expose-internals` |
+| 原生启动器（pnpm ≥ 10 的 ELF/Mach-O/PE） | 直接执行 | 交给 node 会 `SyntaxError: Invalid or unexpected token` |
+| Windows 的 `pnpm.CMD` 外壳（corepack/npm 装法） | `cmd.exe /d /s /c ""<path>" <args>"` + `windowsVerbatimArguments` | spawn 直接跑 `.CMD` 是 `EINVAL`，带空格的路径还会被截成 `'C:\Program'` |
 
 ### 方式一：通过 DSH 插件管理器安装（推荐）
 
@@ -175,7 +215,7 @@ github:ddldxiacan/dsh-sync-webdav
 或使用 CLI：
 
 ```powershell
-dsh plugin --profile desktop install github:ddldxiacan/dsh-sync-webdav
+dsh plugin --profile <你的profile> install github:ddldxiacan/dsh-sync-webdav   # Web 版通常是 --profile web
 ```
 
 DSH 会通过 pnpm 拉取本仓库，读取 `package.json` 里的 `dsh.bundle.patch`，自动把 `dsh-sync` 注册进 profile 的 `cordis.patch.yml`，**无需手工改配置**。
@@ -187,7 +227,7 @@ DSH 会通过 pnpm 拉取本仓库，读取 `package.json` 里的 `dsh.bundle.pa
 ### 方式二：本地目录安装（开发调试）
 
 ```powershell
-dsh plugin --profile desktop install "E:\完整路径\dsh-sync-release"
+dsh plugin --profile <你的profile> install "E:\完整路径\dsh-sync-webdav"
 ```
 
 插件管理器同样支持**绝对路径**安装，适合改完代码立刻验证。
@@ -199,10 +239,10 @@ dsh plugin --profile desktop install "E:\完整路径\dsh-sync-release"
 ### 仓库结构
 
 ```
-dsh-sync-release/
+dsh-sync-webdav/
 ├── package.json        # name: dsh-sync-webdav，声明 dsh.bundle.patch 与 dsh.client
 ├── cordis.patch.yml    # 注册 dsh-sync 服务（name 与 package.json 一致）
-├── index.js            # Host 半区：打包/加密/WebDAV/恢复/回滚/插件重装 + 7 个 HTTP 端点
+├── index.js            # Host 半区：打包/加密/WebDAV/恢复/回滚/插件重装 + 11 个 HTTP 端点
 ├── client.js           # Client 半区：设置页卡片
 └── tools-selftest.mjs  # 自测（含 mock WebDAV 服务器与 B 机恢复 E2E）
 ```
@@ -225,18 +265,29 @@ dsh-sync-release/
 
 ## HTTP 端点（供脚本/自动化调用）
 
-全部返回 HTTP 200，以 `ok` 字段判断成败；错误统一 `{ ok: false, error }`。
+业务结果返回 HTTP 200，以 `ok` 字段判断成败；错误统一 `{ ok: false, error }`。
+
+传输层状态码与宿主 `/api` 对齐：**401**（未登录）/ **403**（不是从 dsh 页面发起的请求，被 Host/Origin 栅栏拦下）、
+**405** 方法不允许（带 `Allow` 头）、**400** 请求体不是合法 JSON、**500** 内部异常。
+
+> **鉴权**：所有 `/dsh-sync/*` 端点都套与宿主 `/api` 同一套栅栏（`connection.requestRejection`）——
+> Host/Origin 校验 + 浏览器 cookie 认证。少了这层，任意网页里的 `fetch()`（`text/plain` 是 CORS 简单请求，
+> 不触发预检但副作用照样发生）就能改写 WebDAV 指向、种入攻击者已知的口令，并把 `~/.dsh` 打包外传。
+> `connection` 服务取不到时 fail-closed：只有本机 loopback 直连放行。
 
 | 方法与路径 | 请求体 | 成功响应 |
 |---|---|---|
-| `GET /dsh-sync/status` | — | `{ configured, config: { url, username, password, remoteDir, hasPassword } \| null, remote: { reachable, backups: [{name,size,modified}], latest? }, lastLocalSnapshot? }` |
-| `POST /dsh-sync/config` | `{ url, username, password, remoteDir }` | `{ ok: true }`（先做连通性测试，失败不保存） |
-| `POST /dsh-sync/backup` | `{ passphrase }` | `{ ok: true, name, size, fileCount, scope, pruned }` |
+| `GET /dsh-sync/status` | — | `{ configured, config: { url, username, password: '', remoteDir, hasPassword, hasPassphrase } \| null, coverage: { included[], excluded[], totals }, remote: { reachable, backups: [{name,size,modified}], latest? }, lastLocalSnapshot? }`（**不含明文密码**） |
+| `POST /dsh-sync/config` | `{ url, username, password, remoteDir }` | `{ ok: true }`（先做连通性测试，失败不保存；密码留空=沿用已保存的） |
+| `POST /dsh-sync/backup` | `{ passphrase }` | `{ ok: true, name, size, fileCount, scope, coverage, pruned }`（`coverage` 给出已同步/已排除的顶层清单） |
 | `POST /dsh-sync/restore` | `{ name?, passphrase }` | `{ ok: true, restored, verified, removedCount, snapshot, portability?, meta? }` |
 | `POST /dsh-sync/delete` | `{ name }` 或 `{ names: [] }` | `{ ok: true, deleted }`（只接受 `dsh-sync-YYYYMMDD-HHMMSS.bundle`） |
 | `POST /dsh-sync/rollback` | `{ snapshot }` | `{ ok: true, restored, removedCount }` |
-| `GET /dsh-sync/plugins` | — | `{ ok: true, profile, profileDir, deps: [{name, spec, kind, installed, rewrite?}], missing, needsInstall, mapped, pnpm: {available, path?}, lastRestore? }` |
-| `POST /dsh-sync/plugins/install` | `{}` | `{ ok: true, installed, exitCode, durationMs, rewritten, removed, lockSynced, log }` |
+| `GET /dsh-sync/plugins` | — | `{ ok: true, profile, deps: [{name, spec, kind, installed, rewrite?}], missing, needsInstall, mapped, pnpm: {available, path?, via?}, lastRestore? }` |
+| `POST /dsh-sync/plugins/install` | `{}` 或 `{ approve: ['pkg'] }` | `{ ok: true, installed, exitCode, durationMs, rewritten, removed, lockSynced, restored, log }`；失败时还带 `pendingBuilds`（被 pnpm 拦下的构建脚本包名） |
+
+`approve` 是「允许并重试」用的：先把包名写进 profile 的 `pnpm-workspace.yaml` 的 `allowBuilds`，再跑一次安装。
+安装失败时 `restored: true` 表示 `package.json` 与 `pnpm-lock.yaml` 已还原到本次安装前。
 
 备份文件名：`dsh-sync-<yyyymmdd-HHMMSS>.bundle`
 
@@ -256,13 +307,14 @@ header: { version, salt(b64), iv(b64), tag(b64), payloadSha256 }
 node tools-selftest.mjs
 ```
 
-预期自测全绿（`0 failed`）。覆盖：排除规则（含 `node_modules`/`sessions` 回归断言）、加解密往返、错误口令与篡改拒绝、打包/解包、备份 `meta` 与旧备份向后兼容、快照与回滚（含「`dsh-runtimes/` 必须在回滚后存活」的回归断言）、路径穿越防护、`link:` → 仓库 spec 改写、**B 机恢复 E2E**（A 机备份 → B 机恢复 → 重装插件依赖）、**异步 runner 不阻塞事件循环**（含「源码中不得出现 `spawnSync(`」防退化护栏），以及一个内置 mock WebDAV 服务器上的 Basic Auth / MKCOL / PUT / GET / PROPFIND 全链路。
+预期自测全绿（`0 failed`）。覆盖：排除规则（含 `node_modules`/`sessions` 回归断言）、加解密往返、错误口令与篡改拒绝、打包/解包、备份 `meta` 与旧备份向后兼容、快照与回滚（含「`dsh-runtimes/` 必须在回滚后存活」的回归断言）、路径穿越防护、`link:` → 仓库 spec 改写、**B 机恢复 E2E**（A 机备份 → B 机恢复 → 重装插件依赖）、**异步 runner 不阻塞事件循环**（含「源码中不得出现 `spawnSync(`」防退化护栏），一个内置 mock WebDAV 服务器上的 Basic Auth / MKCOL / PUT / GET / PROPFIND 全链路，以及 v0.4.0 新增的回归断言：`PATH` 兜底的各条分支（原生启动器直接执行 / 旁有 `bin/pnpm.mjs` 时用脚本 / Windows `.CMD` 外壳经 cmd.exe / 完全没有 pnpm 时给出「npm i -g pnpm」提示）、`resolveProfile` 优先采信 `profileContext.name`、`requestRejection` 返回 401/403 时 11 个端点全部不进入业务逻辑、`connection` 缺失时 fail-closed、安装失败还原 `package.json`、`parseIgnoredBuildScripts` 与 `allowBuilds` 写入。
 
 ## 已知限制
 
 1. **手动触发**，不会自动备份——改完配置记得点一次。
-2. **排除项不会被恢复对齐删掉**：`dsh-runtimes/`、`node_modules/`、`sessions/`、日志、缓存和大于 50MB 的文件在恢复/回滚后仍留在本机。配置范围内、备份里没有的文件则会删除。
-3. Windows 保留设备名（`CON`/`NUL`/`COM1` 等）未被路径校验拦截——它们只会解析到 `~/.dsh` 内部，不构成逃逸，属已评估的低危残余。
+2. **排除项不会被恢复对齐删掉**：`sessions/`、`attachments/`、聊天派生数据、`dsh-runtimes/`、`node_modules/`、日志、缓存和大于 50MB 的文件在恢复/回滚后仍留在本机。配置范围内、备份里没有的文件则会删除。
+3. **聊天记录与聊天文件不随备份迁移**：这是刻意的策略选择。需要在机器间搬聊天记录时，请单独复制 `~/.dsh/sessions` 与 `~/.dsh/attachments`。
+4. Windows 保留设备名（`CON`/`NUL`/`COM1` 等）未被路径校验拦截——它们只会解析到 `~/.dsh` 内部，不构成逃逸，属已评估的低危残余。
 4. 插件本身**不处理 `app.asar` 补丁**。第三方模型推理档位修复需在新机器上单独重放，见 `reasoning-effort-fix/README.md`。
 5. **版本检查优先走未认证 GitHub API，限额 60 次/小时（按 IP）**。每次成功的 API 检查约花 2~3 个请求，结果在进程内缓存 10 分钟。限额耗尽或 API 连不上时，会改用本机 `git ls-remote` 取 HEAD sha 和 tag，检查不会因此停摆；这时更新摘要可能为空。备份/恢复不依赖这条通道。
 6. **仓库改名自动跟随**：若本仓库日后再次改名，GitHub 会对旧地址返回 301。`git`/`pnpm` 会自动跟随（安装不受影响），插件的网络层也已实现 301 跟随（v0.2.1 起），老版本的升级检查不会因此失效。
