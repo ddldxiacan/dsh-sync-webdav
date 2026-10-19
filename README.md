@@ -22,7 +22,7 @@ dsh-sync 把这件事变成两个按钮：**备份**（加密上传）和**恢�
 | 服务器配置 | WebDAV URL、用户名、密码、远程目录；「保存并测试连接」会真实发起 PROPFIND/MKCOL 验证 |
 | 状态区 | 远端可达性、备份条目（名称/大小/时间）、最近一次本地快照 |
 | 备份 | 输入口令 → 打包 `~/.dsh` → AES-256-GCM 加密 → PUT 上传 |
-| 恢复 | 选一个备份（或「恢复最新」）→ 确认 → 自动先做本地快照 → 解密覆盖 → 改写源机器路径 → 自动安装缺失插件 |
+| 恢复 | 选一个备份（或「恢复最新」）→ 确认 → 自动先做本地快照 → 解密后把配置对齐到该备份（多出来的配置文件会删掉）→ 改写源机器路径 → 自动安装缺失插件 |
 | 删除 | 远端备份列表里每一份都可以单独删除 |
 | 回滚 | 从本地快照列表还原 |
 | 插件重装 | 恢复后检测到插件依赖缺失 → 点「重装插件」→ 自动改写 `link:` 依赖并执行 pnpm install |
@@ -160,7 +160,7 @@ git push origin main --tags
 
 - **加密**：`scrypt(passphrase, salt, 32)` 派生密钥 + `AES-256-GCM`；带 SHA-256 内容校验，篡改或口令错误都会明确报错
 - **口令**：只在内存中存在，绝不落盘、绝不写入日志
-- **覆盖策略**：恢复与回滚**都只覆盖、不删除**——备份里没有的现有文件（尤其 `dsh-runtimes/` 等排除项）一律原样保留。这是关键安全设计：否则一次回滚会删掉运行时导致 DSH 起不来。
+- **覆盖策略**：恢复与回滚都会把**配置范围**对齐到所选备份或快照。备份里的文件覆盖现有文件；备份里没有的配置文件会删掉，因此变空的目录一并去掉。配置范围就是打包规则会收进去的路径。`dsh-runtimes/`、`node_modules/`、`sessions/`、日志、缓存和大于 50MB 的文件**不在备份里，恢复时也不删除**——否则会删掉运行时导致 DSH 起不来，或丢掉聊天记录。旧备份若完全没有应用级设置（没有 `__appdata__/` 条目，也没有 `meta.appDataIncluded`），不会据此清空本机 AppData 配置。
 
 ## 安装
 
@@ -232,9 +232,9 @@ dsh-sync-release/
 | `GET /dsh-sync/status` | — | `{ configured, config: { url, username, password, remoteDir, hasPassword } \| null, remote: { reachable, backups: [{name,size,modified}], latest? }, lastLocalSnapshot? }` |
 | `POST /dsh-sync/config` | `{ url, username, password, remoteDir }` | `{ ok: true }`（先做连通性测试，失败不保存） |
 | `POST /dsh-sync/backup` | `{ passphrase }` | `{ ok: true, name, size, fileCount, scope, pruned }` |
-| `POST /dsh-sync/restore` | `{ name?, passphrase }` | `{ ok: true, restored, snapshot, portability?, meta? }` |
+| `POST /dsh-sync/restore` | `{ name?, passphrase }` | `{ ok: true, restored, verified, removedCount, snapshot, portability?, meta? }` |
 | `POST /dsh-sync/delete` | `{ name }` 或 `{ names: [] }` | `{ ok: true, deleted }`（只接受 `dsh-sync-YYYYMMDD-HHMMSS.bundle`） |
-| `POST /dsh-sync/rollback` | `{ snapshot }` | `{ ok: true, restored }` |
+| `POST /dsh-sync/rollback` | `{ snapshot }` | `{ ok: true, restored, removedCount }` |
 | `GET /dsh-sync/plugins` | — | `{ ok: true, profile, profileDir, deps: [{name, spec, kind, installed, rewrite?}], missing, needsInstall, mapped, pnpm: {available, path?}, lastRestore? }` |
 | `POST /dsh-sync/plugins/install` | `{}` | `{ ok: true, installed, exitCode, durationMs, rewritten, removed, lockSynced, log }` |
 
@@ -261,7 +261,7 @@ node tools-selftest.mjs
 ## 已知限制
 
 1. **手动触发**，不会自动备份——改完配置记得点一次。
-2. **恢复与回滚只覆盖不删除**：回滚不会清除「快照之后新增的文件」。这是为保护 `dsh-runtimes/` 等排除项而做的取舍。
+2. **排除项不会被恢复对齐删掉**：`dsh-runtimes/`、`node_modules/`、`sessions/`、日志、缓存和大于 50MB 的文件在恢复/回滚后仍留在本机。配置范围内、备份里没有的文件则会删除。
 3. Windows 保留设备名（`CON`/`NUL`/`COM1` 等）未被路径校验拦截——它们只会解析到 `~/.dsh` 内部，不构成逃逸，属已评估的低危残余。
 4. 插件本身**不处理 `app.asar` 补丁**。第三方模型推理档位修复需在新机器上单独重放，见 `reasoning-effort-fix/README.md`。
 5. **版本检查优先走未认证 GitHub API，限额 60 次/小时（按 IP）**。每次成功的 API 检查约花 2~3 个请求，结果在进程内缓存 10 分钟。限额耗尽或 API 连不上时，会改用本机 `git ls-remote` 取 HEAD sha 和 tag，检查不会因此停摆；这时更新摘要可能为空。备份/恢复不依赖这条通道。

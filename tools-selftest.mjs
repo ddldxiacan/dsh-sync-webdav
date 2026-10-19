@@ -11,7 +11,7 @@ import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import {
   buildPayload, collectFiles, encryptBundle, decryptBundle, extractPayload,
-  extractPayloadDetailed,
+  extractPayloadDetailed, applyPayloadMirror,
   isExcludedAppData, collectAppDataFiles, appDataAbsPath,
   bundleName, makeSnapshot, rollbackFromSnapshot, isExcluded,
   davRequest, ensureRemoteDir, parsePropfind, listRemoteBackups, listAccountBackups,
@@ -148,25 +148,88 @@ try {
   // 改动 root，再回滚
   writeFileSync(join(root, 'settings.json'), '{"a":999}')
   writeFileSync(join(root, 'added.txt'), 'new')
-  const { count: rcount, taken } = rollbackFromSnapshot(join(snapRoot, snap1), root, snapRoot, 5)
+  const { count: rcount, taken, removed } = rollbackFromSnapshot(join(snapRoot, snap1), root, snapRoot, 5, { pruneAppData: false })
   check('rollback restores content', readFileSync(join(root, 'settings.json'), 'utf8') === '{"a":1}')
-  // 语义已改为「只覆盖、不删除」：快照未覆盖的文件（新增文件、被排除的 dsh-runtimes/ 等）必须保留
-  check('rollback does NOT delete files outside snapshot', existsSync(join(root, 'added.txt')))
+  // 配置范围内、快照里没有的文件必须删掉，配置才回到快照当时的状态
+  check('rollback deletes config files absent from snapshot', !existsSync(join(root, 'added.txt')) && removed.includes('added.txt'))
   check('rollback preserves excluded dsh-runtimes (regression: ~/.dsh/dsh-runtimes must survive)', existsSync(join(root, 'dsh-runtimes', 'node.exe')) && readFileSync(join(root, 'dsh-runtimes', 'node.exe'), 'utf8') === 'fake-binary')
   check('rollback preserves excluded logs/', existsSync(join(root, 'logs', 'a.log')))
   // 有真实 AppData settings.json 的环境，快照里会多一条 __appdata__ 条目 —— 计数随环境变化，只断言主体文件数
   const expectedRollbackCount = 4 + collectAppDataFiles().length
   check('rollback returns file count', rcount === expectedRollbackCount, 'count=' + rcount + ' expected=' + expectedRollbackCount + ' snapBeforeRollback=' + taken)
 
-  // 只覆盖语义下，快照里的内容仍须被还原（再次改动后回滚）
+  // 对齐语义下，快照里的内容仍须被还原（再次改动后回滚）
   writeFileSync(join(root, 'settings.json'), '{"a":12345}')
-  const rb2 = rollbackFromSnapshot(join(snapRoot, snap1), root, snapRoot, 5)
+  const rb2 = rollbackFromSnapshot(join(snapRoot, snap1), root, snapRoot, 5, { pruneAppData: false })
   check('rollback re-overwrites modified file', readFileSync(join(root, 'settings.json'), 'utf8') === '{"a":1}', 'count=' + rb2.count)
 
   // 快照保留 5 份
   for (let i = 0; i < 8; i++) makeSnapshot(root, snapRoot, 5)
   const snaps = readdirSync(snapRoot).filter((n) => !n.startsWith('.'))
   check('snapshot retention keeps 5 (+rollback safety snaps can exceed momentarily)', snaps.length >= 1 && snaps.length <= 5, JSON.stringify(snaps))
+
+  // ---------- 4b. 恢复把配置对齐到所选备份 ----------
+  {
+    const mirrorRoot = join(tmpdir(), 'dsh-sync-mirror-' + Date.now())
+    const dsh = join(mirrorRoot, 'dsh')
+    const roaming = join(mirrorRoot, 'roaming')
+    const prevAppData = process.env.APPDATA
+    process.env.APPDATA = roaming
+    try {
+      mkdirSync(join(dsh, 'profiles', 'desktop', 'node_modules', 'plugin'), { recursive: true })
+      mkdirSync(join(dsh, 'sessions'), { recursive: true })
+      mkdirSync(join(dsh, 'dsh-runtimes'), { recursive: true })
+      mkdirSync(join(roaming, '@deepseek-ai', 'dsh-desktop', 'desktop'), { recursive: true })
+      mkdirSync(join(roaming, '@deepseek-ai', 'dsh-desktop', 'Cache'), { recursive: true })
+      writeFileSync(join(dsh, 'settings.json'), '{"v":1}')
+      writeFileSync(join(dsh, 'profiles', 'desktop', 'package.json'), '{"name":"desktop"}')
+      writeFileSync(join(dsh, 'profiles', 'desktop', 'node_modules', 'plugin', 'index.js'), 'code')
+      writeFileSync(join(dsh, 'sessions', 'chat.json'), 'hello')
+      writeFileSync(join(dsh, 'dsh-runtimes', 'node.exe'), 'bin')
+      writeFileSync(join(roaming, '@deepseek-ai', 'dsh-desktop', 'desktop', 'settings.json'), '{"theme":"dark"}')
+      writeFileSync(join(roaming, '@deepseek-ai', 'dsh-desktop', 'Cache', 'data'), 'cache')
+
+      const oldPayload = buildPayload(dsh, collectFiles(dsh))
+      writeFileSync(join(roaming, '@deepseek-ai', 'dsh-desktop', 'desktop', 'extra-old.json'), '{}')
+      applyPayloadMirror(oldPayload, dsh)
+      check('old backup does not delete appdata it never captured', existsSync(join(roaming, '@deepseek-ai', 'dsh-desktop', 'desktop', 'extra-old.json')))
+      rmSync(join(roaming, '@deepseek-ai', 'dsh-desktop', 'desktop', 'extra-old.json'), { force: true })
+
+      const payload = buildPayload(dsh, collectFiles(dsh), { appDataIncluded: true }, collectAppDataFiles())
+      writeFileSync(join(dsh, 'settings.json'), '{"v":2}')
+      writeFileSync(join(dsh, 'profiles', 'desktop', 'extra.json'), '{}')
+      mkdirSync(join(dsh, 'profiles', 'gone'), { recursive: true })
+      writeFileSync(join(dsh, 'profiles', 'gone', 'config.yml'), 'x')
+      writeFileSync(join(dsh, 'brand-new.txt'), 'nope')
+      writeFileSync(join(roaming, '@deepseek-ai', 'dsh-desktop', 'desktop', 'settings.json'), '{"theme":"light"}')
+      writeFileSync(join(roaming, '@deepseek-ai', 'dsh-desktop', 'desktop', 'extra.json'), '{}')
+
+      const result = applyPayloadMirror(payload, dsh)
+      check('mirror restores settings content', readFileSync(join(dsh, 'settings.json'), 'utf8') === '{"v":1}')
+      check('mirror restores profile package.json', readFileSync(join(dsh, 'profiles', 'desktop', 'package.json'), 'utf8') === '{"name":"desktop"}')
+      check('mirror removes config absent from backup', !existsSync(join(dsh, 'profiles', 'desktop', 'extra.json')) && !existsSync(join(dsh, 'brand-new.txt')) && !existsSync(join(dsh, 'profiles', 'gone', 'config.yml')))
+      check('mirror removes emptied config directory', !existsSync(join(dsh, 'profiles', 'gone')))
+      check('mirror keeps node_modules', readFileSync(join(dsh, 'profiles', 'desktop', 'node_modules', 'plugin', 'index.js'), 'utf8') === 'code')
+      check('mirror keeps sessions', readFileSync(join(dsh, 'sessions', 'chat.json'), 'utf8') === 'hello')
+      check('mirror keeps dsh-runtimes', readFileSync(join(dsh, 'dsh-runtimes', 'node.exe'), 'utf8') === 'bin')
+      check('mirror restores appdata settings', readFileSync(join(roaming, '@deepseek-ai', 'dsh-desktop', 'desktop', 'settings.json'), 'utf8') === '{"theme":"dark"}')
+      check('mirror removes appdata config absent from backup', !existsSync(join(roaming, '@deepseek-ai', 'dsh-desktop', 'desktop', 'extra.json')))
+      check('mirror keeps appdata cache', readFileSync(join(roaming, '@deepseek-ai', 'dsh-desktop', 'Cache', 'data'), 'utf8') === 'cache')
+      check('mirror reports removed paths',
+        result.removed.includes('brand-new.txt') &&
+        result.removed.includes('profiles/desktop/extra.json') &&
+        result.removed.includes('profiles/gone/config.yml') &&
+        result.removed.includes('__appdata__/dsh-desktop/desktop/extra.json') &&
+        result.failed.length === 0,
+        JSON.stringify(result.removed))
+      check('mirror verified all written files', result.verified === result.count && result.skipped.length === 0 && result.mismatches.length === 0,
+        'count=' + result.count + ' verified=' + result.verified)
+    } finally {
+      if (prevAppData === undefined) delete process.env.APPDATA
+      else process.env.APPDATA = prevAppData
+      try { rmSync(mirrorRoot, { recursive: true, force: true }) } catch (e) { /* ignore */ }
+    }
+  }
 
   // ---------- 5. WebDAV mock ----------
   const USER = 'u1', PASS = 'p1'
@@ -310,6 +373,7 @@ check('depKind: registry 版本号', depKind('^0.4.6') === 'registry' && depKind
       meta.linkMap['dsh-sync-webdav'].from === 'link:E:/somewhere/dsh-sync-release' &&
       meta.linkMap['dsh-sync-webdav'].reason === 'repository.url')
     check('collectInstallMeta: profile 名与时间戳', meta.profile === 'desktop' && typeof meta.createdAt === 'string')
+    check('collectInstallMeta: 标记已采集 AppData', meta.appDataIncluded === true)
 
     // node_modules 缺失时归入 unmapped，而不是猜一个 spec
     rmSync(join(prof, 'node_modules'), { recursive: true, force: true })

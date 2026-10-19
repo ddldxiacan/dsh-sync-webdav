@@ -567,6 +567,7 @@ window.__ModuleLoader__.load({
             name ? h('div', { className: PREFIX + '-hint' }, '位置：' + locationLabel(backup.remoteDir)) : null,
             h('div', null, encrypted ? '这份备份已用口令加密。留空并勾选记住时，使用本机已保存的口令。' : '这份备份没有口令。'),
             h('div', null, '恢复前会自动为当前配置创建一份本地快照，可用它回滚。'),
+            h('div', null, '当前配置会对齐到这份备份：备份里的配置覆盖现有文件，备份里没有的配置文件会删掉。运行时、插件代码、聊天会话和缓存会保留。'),
             h('div', { className: PREFIX + '-warn' },
               h('div', { className: PREFIX + '-warn-title' }, '恢复完成后必须重启 DeepSeek Harness 才会生效'),
               h('div', null, '备份不含插件代码。恢复后会把源机器的本机路径改成这台电脑可用的路径，并自动安装缺失的插件。安装结束前请不要重启。'),
@@ -612,6 +613,17 @@ window.__ModuleLoader__.load({
             else parts.push('恢复没有写入任何文件');
             parts.push('快照：' + (d.snapshot || '—'));
           }
+          const removedCount = Number.isFinite(d.removedCount) ? d.removedCount : (Array.isArray(d.removed) ? d.removed.length : 0);
+          const removeFailed = Array.isArray(d.removeFailed) ? d.removeFailed : [];
+          if (removedCount > 0) {
+            const sample = (Array.isArray(d.removed) ? d.removed : []).slice(0, 5).join('、');
+            parts.push('已删除备份中不存在的 ' + removedCount + ' 个配置文件' + (sample ? '：' + sample : '') + (removedCount > 5 ? ' 等' : ''));
+          }
+          if (removeFailed.length) {
+            parts.push('有 ' + removeFailed.length + ' 个配置文件未能删除：' +
+              removeFailed.slice(0, 5).map((s) => (s && s.path ? s.path : '?') + '（' + (s && s.reason ? s.reason : '?') + '）').join('、') +
+              (removeFailed.length > 5 ? ' 等' : ''));
+          }
           if (skipped.length) {
             parts.push('有 ' + skipped.length + ' 个条目被跳过：' +
               skipped.slice(0, 5).map((s) => (s && s.path ? s.path : '?') + '（' + (s && s.reason ? s.reason : '?') + '）').join('、') +
@@ -643,7 +655,7 @@ window.__ModuleLoader__.load({
           } else {
             parts.push('请重启 DeepSeek Harness 使恢复生效');
           }
-          setMsg({ kind: skipped.length || mismatch.length || installFailed || !(d.verified === d.restored) ? 'error' : 'ok', text: '恢复完成：' + parts.join('。') });
+          setMsg({ kind: skipped.length || mismatch.length || removeFailed.length || installFailed || !(d.verified === d.restored) ? 'error' : 'ok', text: '恢复完成：' + parts.join('。') });
         }
         await refresh({ silent: true });
       };
@@ -656,6 +668,7 @@ window.__ModuleLoader__.load({
             h('div', null, '将用本地快照覆盖当前配置：'),
             h('div', { className: PREFIX + '-item-name' }, snapshot),
             h('div', null, '回滚前会再创建一份当前状态的快照，因此可以再滚回来。'),
+            h('div', null, '配置会对齐到这份快照：快照里没有的配置文件会删掉。运行时、插件代码、聊天会话和缓存会保留。'),
           ),
           confirmLabel: '回滚',
           run: () => doRollback(snapshot),
@@ -673,7 +686,12 @@ window.__ModuleLoader__.load({
         setConfirm(null);
         if (consume(res, null)) {
           const d = res.data || {};
-          setMsg({ kind: 'ok', text: '已回滚，恢复 ' + (d.restored || 0) + ' 个文件' });
+          const removedCount = Number.isFinite(d.removedCount) ? d.removedCount : 0;
+          const removeFailed = Array.isArray(d.removeFailed) ? d.removeFailed : [];
+          let text = '已回滚，恢复 ' + (d.restored || 0) + ' 个文件';
+          if (removedCount > 0) text += '，并删除快照中不存在的 ' + removedCount + ' 个配置文件';
+          if (removeFailed.length) text += '。有 ' + removeFailed.length + ' 个配置文件未能删除';
+          setMsg({ kind: removeFailed.length ? 'error' : 'ok', text });
         }
         await refresh({ silent: true });
       };

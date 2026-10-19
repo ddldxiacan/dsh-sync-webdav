@@ -4,11 +4,14 @@
  * 把 ~/.dsh 打包加密备份到 WebDAV，支持恢复与回滚。纯手动触发，
  * Host 不做任何定时/自动行为。无 npm 依赖、fail-soft。
  *
- * 恢复/回滚都只覆盖：两者把备份（或快照）里实际存在的文件挨个拷进 ~/.dsh，
- * 绝不删除备份之外 ~/.dsh 里已有的文件。因此被排除项（dsh-runtimes/、node_modules/、
- * sessions/、logs/、npm-cache、tmp*、cache*、>50MB 文件）在恢复/回滚后原样保留 —— 这是刻意的，
- * 否则 ~/.dsh/dsh-runtimes/ 里的 node 运行时会随回滚被删掉，DSH 无法启动。
- * 同理，node_modules/（可重装的插件依赖）也不会因回滚而丢失。
+ * 恢复/回滚把「配置范围」对齐到所选备份或快照：范围内的文件按备份覆盖，
+ * 备份里没有的配置文件会删掉，因此变空的目录一并去掉。配置范围就是
+ * collectFiles / collectAppDataFiles 会打包的路径。
+ * 排除项一律不动：dsh-runtimes/、node_modules/、sessions/、logs/、npm-cache、
+ * tmp*、cache*、单文件 >50MB，以及 AppData 里的缓存目录。这些不在备份里，
+ * 删掉会让 DSH 无法启动，或丢掉聊天记录和可重装的插件代码。
+ * 旧备份若完全没有 __appdata__ 条目、也没有 meta.appDataIncluded，说明它没采集
+ * 应用级设置，恢复时不删除本机 AppData 配置。
  *
  * 备份包含 dsh-sync.json 自身的 WebDAV 凭据（url/username/password），属有意设计：
  * 用户要求配置整体同步，故清单与凭据一并进备份；备份本身已用口令加密。
@@ -31,7 +34,7 @@ import {
 } from 'node:crypto'
 import {
   appendFileSync, copyFileSync, existsSync, mkdirSync, readdirSync, readFileSync,
-  rmSync, statSync, writeFileSync,
+  rmdirSync, rmSync, statSync, writeFileSync,
 } from 'node:fs'
 import { homedir } from 'node:os'
 import { dirname, isAbsolute, join, relative, resolve } from 'node:path'
@@ -311,6 +314,93 @@ export function extractPayload(payload, root) {
   return extractPayloadDetailed(payload, root).count
 }
 
+/** payload 里路径合法的条目。这些路径构成恢复后应存在的配置集合。 */
+function payloadKeepPaths(payload) {
+  const parsed = JSON.parse(payload.toString('utf8'))
+  const files = Array.isArray(parsed.files) ? parsed.files : []
+  const keep = new Set()
+  for (const f of files) {
+    if (!f || typeof f.path !== 'string' || !isSafeRelPath(f.path)) continue
+    keep.add(f.path)
+  }
+  return keep
+}
+
+/** 这份备份是否声明了 AppData 应用设置。没声明的旧备份不能用来清空本机设置。 */
+function payloadIncludesAppData(payload, keep) {
+  for (const p of keep) {
+    if (p.startsWith(APPDATA_PREFIX)) return true
+  }
+  const meta = extractPayloadMeta(payload)
+  return !!(meta && meta.appDataIncluded)
+}
+
+/** 删掉文件后，向上移除已经空掉的目录，停在 stopDir（不含）本身。 */
+function pruneEmptyParents(absFile, stopDir) {
+  const stop = resolve(stopDir)
+  let dir = dirname(resolve(absFile))
+  while (dir !== stop) {
+    const rel = relative(stop, dir)
+    if (!rel || rel.startsWith('..') || isAbsolute(rel)) break
+    let names
+    try { names = readdirSync(dir) } catch (e) { break }
+    if (names.length) break
+    try { rmdirSync(dir) } catch (e) { break }
+    dir = dirname(dir)
+  }
+}
+
+/**
+ * 删除 root 配置范围内、不在 keep 里的文件，并清掉因此变空的目录。
+ * keep 使用与 collectFiles / collectAppDataFiles 相同的 posix 相对路径。
+ * 排除项不在 collect 结果里，因此运行时、插件代码、会话、日志和缓存不会被删。
+ * opts.pruneAppData === false 时不动 AppData（自测用来避开本机真实设置）。
+ * 返回 { removed, failed }。失败通常是文件被占用，调用方必须告诉用户对齐没有完成。
+ */
+export function removeConfigNotInSet(root, keep, opts) {
+  const o = opts || {}
+  const removed = []
+  const failed = []
+  const drop = (rel, abs, stopDir) => {
+    try {
+      rmSync(abs, { force: true })
+      removed.push(rel)
+      pruneEmptyParents(abs, stopDir)
+    } catch (e) {
+      failed.push({ path: rel, reason: e && e.message ? e.message : String(e) })
+    }
+  }
+  for (const rel of collectFiles(root)) {
+    if (keep.has(rel)) continue
+    drop(rel, join(root, rel), root)
+  }
+  if (o.pruneAppData !== false) {
+    const roaming = appDataRoamingRoot()
+    const stop = roaming ? join(roaming, APPDATA_ROOT_NAME) : null
+    for (const rel of collectAppDataFiles()) {
+      if (keep.has(rel)) continue
+      const abs = appDataAbsPath(rel)
+      if (!abs || !stop) continue
+      drop(rel, abs, stop)
+    }
+  }
+  return { removed, failed }
+}
+
+/**
+ * 把 root 的配置对齐到 payload：先写入备份里的文件，再删掉配置范围内多出来的文件。
+ * 排除项保持原样。返回 extractPayloadDetailed 的字段，外加 removed / failed。
+ */
+export function applyPayloadMirror(payload, root, opts) {
+  const written = extractPayloadDetailed(payload, root)
+  const keep = payloadKeepPaths(payload)
+  const pruneAppData = opts && opts.pruneAppData === false
+    ? false
+    : payloadIncludesAppData(payload, keep)
+  const pruned = removeConfigNotInSet(root, keep, { pruneAppData })
+  return { ...written, removed: pruned.removed, failed: pruned.failed }
+}
+
 /** 备份文件名 */
 export function bundleName(date) {
   const d = date || new Date()
@@ -351,12 +441,15 @@ export function makeSnapshot(root, snapshotRoot, keep, date) {
   return ts
 }
 
-/** 从快照目录回滚到 root：先快照现状，再只覆盖式还原快照里实际存在的文件。
- *  root 中不被快照覆盖的路径（dsh-runtimes/、logs/ 等排除项，以及快照之后新增的文件）
- *  一律原样保留 —— 绝不删除快照之外的文件。与 extractPayload 的“只覆盖”语义一致。 */
-export function rollbackFromSnapshot(snapshotDir, root, snapshotRoot, keep) {
+/** 从快照目录回滚到 root：先快照现状，再把配置范围对齐到该快照。
+ *  快照里的文件覆盖写回；配置范围内、快照里没有的文件删掉。
+ *  排除项（dsh-runtimes/、node_modules/、sessions/、logs/、缓存、超大文件）原样保留。
+ *  opts.pruneAppData === false 时不清理 AppData，避免自测误删本机设置。 */
+export function rollbackFromSnapshot(snapshotDir, root, snapshotRoot, keep, opts) {
+  const o = opts || {}
   const taken = makeSnapshot(root, snapshotRoot, keep)
   let count = 0
+  const keepSet = new Set()
   const walk = (dir, prefix) => {
     for (const ent of readdirSync(dir, { withFileTypes: true })) {
       const rel = prefix ? prefix + '/' + ent.name : ent.name
@@ -367,13 +460,20 @@ export function rollbackFromSnapshot(snapshotDir, root, snapshotRoot, keep) {
         const target = rel.startsWith(APPDATA_PREFIX) ? appDataAbsPath(rel) : join(root, rel)
         if (!target) continue
         mkdirSync(dirname(target), { recursive: true })
-        copyFileSync(abs, target)   // 已存在则覆盖；不存在则新建。root 里其余条目不动。
+        copyFileSync(abs, target)
+        keepSet.add(rel)
         count++
       }
     }
   }
   walk(snapshotDir, '')
-  return { count, taken }
+  let pruneAppData = false
+  for (const p of keepSet) {
+    if (p.startsWith(APPDATA_PREFIX)) { pruneAppData = true; break }
+  }
+  if (o.pruneAppData === false) pruneAppData = false
+  const pruned = removeConfigNotInSet(root, keepSet, { pruneAppData })
+  return { count, taken, removed: pruned.removed, failed: pruned.failed }
 }
 
 // ============================================================
@@ -1484,7 +1584,10 @@ export function collectInstallMeta(dshRoot, profileName) {
     if (v && v.length < 40) dshVersion = v
     pnpmVersion = JSON.parse(readFileSync(join(resDir, 'runtime', 'versions.json'), 'utf8')).pnpm || null
   } catch (e) { /* 版本信息缺失不影响安装，忽略 */ }
-  return { dshVersion, pnpmVersion, profile: name, createdAt: new Date().toISOString(), linkMap, unmapped }
+  return {
+    dshVersion, pnpmVersion, profile: name, createdAt: new Date().toISOString(), linkMap, unmapped,
+    appDataIncluded: true,
+  }
 }
 
 // ============================================================
@@ -1723,8 +1826,8 @@ export function apply(ctx, config) {
     }
     // 恢复前先本地快照（安全性快照，本身就是回滚目标）
     lastLocalSnapshot = makeSnapshot(dshRoot, snapshotRoot, SNAPSHOT_KEEP)
-    // 只覆盖：备份里没有的现有文件（含 dsh-runtimes/ 等排除项）一律保留
-    const r = extractPayloadDetailed(payload, dshRoot)
+    // 配置范围与这份备份对齐：覆盖同名文件，删掉备份里没有的配置。排除项保留。
+    const r = applyPayloadMirror(payload, dshRoot)
     // 源机器的 file: 绝对路径和 pnpm storeDir 在这台电脑上不存在。不改的话，
     // 接下来的 pnpm install 会整批失败，package.json 里的插件全部显示「包不可用」。
     let portability = { profiles: [] }
@@ -1742,6 +1845,8 @@ export function apply(ctx, config) {
     }
     const rewrittenN = (portability.profiles || []).reduce((n, p) => n + ((p.rewritten && p.rewritten.length) || 0), 0)
     log('restored ' + name + ': ' + r.count + ' files, verified ' + r.verified +
+        (r.removed.length ? ', removed ' + r.removed.length : '') +
+        (r.failed.length ? ', remove failed ' + r.failed.length : '') +
         (r.skipped.length ? ', skipped ' + r.skipped.length : '') +
         (r.mismatches.length ? ', mismatches ' + r.mismatches.length : '') +
         ' (snapshot ' + lastLocalSnapshot + ')' +
@@ -1749,6 +1854,9 @@ export function apply(ctx, config) {
         (rewrittenN ? ', retargeted ' + rewrittenN + ' local specs' : ''))
     return {
       ok: true, restored: r.count, verified: r.verified,
+      removedCount: r.removed.length,
+      removed: r.removed.slice(0, 30),
+      removeFailed: r.failed,
       skipped: r.skipped, mismatches: r.mismatches,
       snapshot: lastLocalSnapshot,
       portability,
@@ -1783,11 +1891,18 @@ export function apply(ctx, config) {
     }
     const dir = join(snapshotRoot, snapshot)
     if (!existsSync(dir)) return { ok: false, error: '快照不存在: ' + snapshot }
-    // 只覆盖式还原快照内的文件；快照未覆盖的现有文件（dsh-runtimes/ 等）原样保留
-    const { count } = rollbackFromSnapshot(dir, dshRoot, snapshotRoot, SNAPSHOT_KEEP)
+    // 配置范围对齐到该快照；排除项（dsh-runtimes/ 等）原样保留
+    const rolled = rollbackFromSnapshot(dir, dshRoot, snapshotRoot, SNAPSHOT_KEEP)
     lastLocalSnapshot = snapshot
-    log('rolled back to snapshot ' + snapshot + ': ' + count + ' files')
-    return { ok: true, restored: count }
+    log('rolled back to snapshot ' + snapshot + ': ' + rolled.count + ' files' +
+        (rolled.removed.length ? ', removed ' + rolled.removed.length : '') +
+        (rolled.failed.length ? ', remove failed ' + rolled.failed.length : ''))
+    return {
+      ok: true, restored: rolled.count,
+      removedCount: rolled.removed.length,
+      removed: rolled.removed.slice(0, 30),
+      removeFailed: rolled.failed,
+    }
   }
 
   /**
