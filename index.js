@@ -4,9 +4,15 @@
  * 把 ~/.dsh 打包加密备份到 WebDAV，支持恢复与回滚。纯手动触发，
  * Host 不做任何定时/自动行为。无 npm 依赖、fail-soft。
  *
- * 恢复/回滚把「配置范围」对齐到所选备份或快照：范围内的文件按备份覆盖，
- * 备份里没有的配置文件会删掉，因此变空的目录一并去掉。配置范围就是
- * collectFiles / collectAppDataFiles 会打包的路径。
+ * 恢复/回滚把「配置范围」对齐到所选备份或快照，但恢复有**三种模式**（0.4.2 起由用户在确认弹窗里选）：
+ *   merge（默认）  只补本机没有的文件；本机已有的配置一律不动，内容不同的列成「冲突」回报。
+ *   overwrite      备份里的文件全部覆盖写入，但本机多出来的配置不删。
+ *   mirror         覆盖写入 + 删掉备份里没有的配置（0.3.5~0.4.1 的旧行为，即「完全覆盖」）。
+ * 为什么默认 merge：换机场景里 B 机往往已经装好插件、配了皮肤，旧版一律对齐会把用户在 B 机的
+ * 改动默默冲掉，还会删掉备份里没有的配置文件。全新机器上 merge 与 mirror 结果相同（本机没有
+ * 多余配置可冲突），所以默认取保守的一端，由想「一模一样」的用户显式选完全覆盖。
+ * 回滚语义不变：仍是对齐到快照（快照是同一台机器的历史状态，保留冲突没有意义）。
+ * 配置范围就是 collectFiles / collectAppDataFiles 会打包的路径。
  * 排除项一律不动：dsh-runtimes/、node_modules/、sessions/、logs/、npm-cache、
  * tmp*、cache*、单文件 >50MB，以及 AppData 里的缓存目录。这些不在备份里，
  * 删掉会让 DSH 无法启动，或丢掉聊天记录和可重装的插件代码。
@@ -462,6 +468,179 @@ function payloadIncludesAppData(payload, keep) {
   }
   const meta = extractPayloadMeta(payload)
   return !!(meta && meta.appDataIncluded)
+}
+
+// ============================================================
+// 恢复模式：完全覆盖 / 只补缺失
+// ============================================================
+// 换机恢复的两种诉求互相冲突，必须由用户选，不能替用户猜：
+//   1) 「要一台和 A 机一模一样的机器」→ mirror：按备份对齐，备份里没有的配置删掉。
+//   2) 「B 机已经配好了皮肤/插件/自定义设置，别把我改过的覆盖掉」→ merge：只补本机没有的
+//      文件；本机已有且内容不同的文件原样保留，并在结果里列成「冲突」让用户自己看。
+// 中间态 overwrite 用于「要 A 机的官方配置，但保留我在 B 机额外装的插件配置」。
+export const RESTORE_MODES = ['merge', 'overwrite', 'mirror']
+/** 默认走保守策略：只补缺失。全新机器上它与 mirror 结果完全相同（本机没有多余配置可冲突）。 */
+export const DEFAULT_RESTORE_MODE = 'merge'
+export function normalizeRestoreMode(mode) {
+  const m = String(mode === undefined || mode === null ? '' : mode).trim().toLowerCase()
+  return RESTORE_MODES.includes(m) ? m : DEFAULT_RESTORE_MODE
+}
+
+/** 解析 payload 里路径合法、能落到本机的条目 [{ path, sha256, buffer, abs }]，附带非法条目清单。 */
+function payloadValidEntries(payload, root) {
+  const parsed = JSON.parse(payload.toString('utf8'))
+  const files = Array.isArray(parsed.files) ? parsed.files : []
+  const entries = []
+  const invalid = []
+  for (const f of files) {
+    if (!f || typeof f.path !== 'string' || !f.path) {
+      invalid.push({ path: (f && f.path) ? String(f.path) : '(无路径)', reason: '条目缺少有效路径' })
+      continue
+    }
+    if (!isSafeRelPath(f.path)) {
+      invalid.push({ path: f.path, reason: '路径不安全（含 ..、盘符或绝对路径）' })
+      continue
+    }
+    const abs = f.path.startsWith(APPDATA_PREFIX) ? appDataAbsPath(f.path) : join(root, f.path)
+    if (!abs) {
+      invalid.push({ path: f.path, reason: '无法解析到本地路径' })
+      continue
+    }
+    entries.push({ path: f.path, sha256: f.sha256, buffer: Buffer.from(f.data, 'base64'), abs })
+  }
+  return { entries, invalid }
+}
+
+/**
+ * 恢复预览（不写盘）：这份备份在这台电脑上会新增什么、和本机一致什么、冲突什么、本机多什么。
+ * 恢复确认弹窗用它把「会改动哪些配置」摊开给用户，让模式选择有依据。
+ * 冲突 = 本机已有该文件、但内容与备份不同；localOnly = 本机配置范围内、备份里没有的文件（mirror 会删掉它们）。
+ */
+export function planPayloadApply(payload, root, parsedEntries) {
+  const { entries, invalid } = parsedEntries || payloadValidEntries(payload, root)
+  const added = []
+  const unchanged = []
+  const conflicts = []
+  for (const e of entries) {
+    let onDisk = null
+    try { onDisk = readFileSync(e.abs) } catch (err) { onDisk = null }
+    if (onDisk === null) { added.push(e.path); continue }
+    // 插件自带配置（dsh-sync.json）在备份里被有意剥掉了口令：本机那份比备份多一个 passphrase 字段，
+    // 直接比字节会让「自己的备份恢复回自己机器」也报冲突。这里按「剥掉口令后」比较。
+    const cmp = redactBackupBytes(e.path, onDisk)
+    const sha = createHash('sha256').update(cmp).digest('hex')
+    if (sha === e.sha256) unchanged.push(e.path)
+    else conflicts.push({ path: e.path, localBytes: onDisk.length, bundleBytes: e.buffer.length })
+  }
+  const keep = new Set(entries.map((e) => e.path))
+  const localOnly = []
+  for (const rel of collectFiles(root)) {
+    if (!keep.has(rel)) localOnly.push(rel)
+  }
+  const appDataIncluded = payloadIncludesAppData(payload, keep)
+  if (appDataIncluded) {
+    for (const rel of collectAppDataFiles()) {
+      if (!keep.has(rel)) localOnly.push(rel)
+    }
+  }
+  return {
+    appDataIncluded,
+    added, unchanged, conflicts, localOnly, invalid,
+    totals: {
+      bundle: entries.length,
+      added: added.length,
+      unchanged: unchanged.length,
+      conflicts: conflicts.length,
+      localOnly: localOnly.length,
+      invalid: invalid.length,
+    },
+  }
+}
+
+/**
+ * 写 dsh-sync.json 时保留本机记住的口令。
+ * 备份里这份配置按设计是剥掉 passphrase 的（口令不进备份内容），直接覆盖会把用户
+ * 在这台电脑上记好的口令抹掉，下次备份/恢复又得重填。口令属于「这台电脑的东西」，
+ * 不属于从别的机器搬来的配置，所以始终以本机为准。
+ */
+function keepLocalPassphrase(rel, abs, incoming) {
+  if (rel !== CONFIG_FILE_NAME) return incoming
+  let local = null
+  try { local = JSON.parse(readFileSync(abs, 'utf8')) } catch (e) { return incoming }
+  const pass = local && typeof local.passphrase === 'string' ? local.passphrase : ''
+  if (!pass) return incoming
+  let next = null
+  try { next = JSON.parse(incoming.toString('utf8')) } catch (e) { return incoming }
+  if (!next || typeof next !== 'object' || Array.isArray(next)) return incoming
+  if (typeof next.passphrase === 'string' && next.passphrase) return incoming
+  next.passphrase = pass
+  return Buffer.from(JSON.stringify(next, null, 2) + '\n', 'utf8')
+}
+
+/**
+ * 按所选模式把 payload 落到本机。返回实际写入/冲突/删除明细。
+ *   merge     只写本机没有的文件；本机已有（内容相同或不同）一律不动 —— 冲突列进 keptConflicts
+ *   overwrite 备份里的文件全部覆盖写入，但**不删**本机多出来的配置
+ *   mirror    覆盖写入 + 删掉备份里没有的配置（v0.3.5~v0.4.1 的旧行为，界面标注为「完全覆盖」）
+ * 排除项（sessions/、node_modules/ 等）在任何模式下都不写也不删。
+ */
+export function applyPayloadMode(payload, root, mode, opts) {
+  const o = opts || {}
+  const m = normalizeRestoreMode(mode)
+  const parsed = payloadValidEntries(payload, root)
+  const entries = parsed.entries
+  const plan = planPayloadApply(payload, root, parsed)
+  const held = new Set()
+  if (m === 'merge') {
+    for (const p of plan.unchanged) held.add(p)
+    for (const c of plan.conflicts) held.add(c.path)
+  }
+  let count = 0
+  let verified = 0
+  const mismatches = []
+  for (const e of entries) {
+    if (held.has(e.path)) continue
+    try {
+      mkdirSync(dirname(e.abs), { recursive: true })
+      writeFileSync(e.abs, keepLocalPassphrase(e.path, e.abs, e.buffer))
+      count++
+    } catch (err) {
+      mismatches.push({ path: e.path, reason: '写入失败: ' + (err && err.message ? err.message : String(err)) })
+      continue
+    }
+    try {
+      const sha = createHash('sha256').update(readFileSync(e.abs)).digest('hex')
+      if (sha === e.sha256) verified++
+      else mismatches.push({ path: e.path, reason: '写入后内容不一致' })
+    } catch (err) {
+      mismatches.push({ path: e.path, reason: '回读失败: ' + (err && err.message ? err.message : String(err)) })
+    }
+  }
+  let removed = []
+  let failed = []
+  if (m === 'mirror') {
+    const keep = new Set(entries.map((e) => e.path))
+    const pruneAppData = o.pruneAppData === false ? false : payloadIncludesAppData(payload, keep)
+    const pruned = removeConfigNotInSet(root, keep, { pruneAppData })
+    removed = pruned.removed
+    failed = pruned.failed
+  }
+  return {
+    mode: m,
+    count,
+    verified,
+    // 非法条目与「因模式保留」是两件事：前者是备份异常，后者是用户选择的结果
+    skipped: plan.invalid,
+    mismatches,
+    removed,
+    failed,
+    conflicts: plan.conflicts,
+    keptConflicts: m === 'merge' ? plan.conflicts.map((c) => c.path) : [],
+    keptLocalOnly: m === 'mirror' ? [] : plan.localOnly,
+    unchanged: plan.unchanged,
+    added: plan.added,
+    totals: plan.totals,
+  }
 }
 
 /** 删掉文件后，向上移除已经空掉的目录，停在 stopDir（不含）本身。 */
@@ -2124,16 +2303,25 @@ export function apply(ctx, config) {
     }
   }
 
-  const handleRestore = async (body) => {
+  // 恢复缓存：预览与紧接着的恢复共用同一份已解密 payload，避免为同一份备份下载两次。
+  // 只留一份；键里含备份名、远程目录与口令，任何不一致都不算命中。
+  let restoreCache = null
+  const RESTORE_CACHE_TTL_MS = 2 * 60 * 1000
+  const restoreCacheKey = (name, remoteDir, passphrase) =>
+    createHash('sha256').update(String(name) + '\u0000' + String(remoteDir) + '\u0000' + String(passphrase)).digest('hex')
+
+  /**
+   * 恢复的公共前半段：定位备份 → 下载 → 解密。恢复与预览共用，保证两者判断的是同一份备份。
+   * 成功返回 { ok:true, payload, name, remoteDir, c }，失败返回 { ok:false, error }。
+   */
+  const fetchRestorePayload = async (body) => {
     const c = loadPluginConfig()
     if (!c) return { ok: false, error: '尚未配置 WebDAV' }
     const resolved = resolvePassphrase(c, body)
     const passphrase = resolved.passphrase
     if (!passphrase) return { ok: false, error: '请先输入口令。勾选「在本机记住」后，这台电脑以后可以留空。' }
-    if (resolved.typed && resolved.remember) {
-      c.passphrase = passphrase
-      savePluginConfig(c)
-    }
+    // 注意：这里**不能**先落盘。口令打错一次就覆盖掉本机记住的那份，会让后续每次恢复都失败，
+    // 用户还得重新输入正确的口令才能恢复。只在解密成功后持久化（见下方 rememberPassphrase）。
     let name = body.name ? String(body.name) : null
     const hasDir = body && Object.prototype.hasOwnProperty.call(body, 'remoteDir')
     let remoteDir = hasDir ? normalizeRemoteDir(body.remoteDir) : null
@@ -2152,6 +2340,11 @@ export function apply(ctx, config) {
     }
     if (!isSafeBackupName(name)) return { ok: false, error: '备份名称非法' }
     if (!isSafeRemoteDir(remoteDir)) return { ok: false, error: '远程目录非法' }
+    // 预览刚下载过、用户几秒内就点「开始恢复」：直接复用，不再下载一次（实测几十 MB）
+    const key = restoreCacheKey(name, remoteDir, passphrase)
+    if (restoreCache && restoreCache.key === key && (Date.now() - restoreCache.at) < RESTORE_CACHE_TTL_MS) {
+      return { ok: true, payload: restoreCache.payload, name, remoteDir, c, cached: true }
+    }
     const url = remoteDirUrl({ ...c, remoteDir }, name)
     const res = await davRequest(url, 'GET', { username: c.username, password: c.password, timeoutMs: 120000 })
     if (res.error) return { ok: false, error: '下载备份失败：' + res.error }
@@ -2165,10 +2358,58 @@ export function apply(ctx, config) {
     } catch (e) {
       return { ok: false, error: describeDecryptError(e) }
     }
-    // 恢复前先本地快照（安全性快照，本身就是回滚目标）
+    // 口令已被证明能解开这份备份，此时才值得存下来
+    if (resolved.typed && resolved.remember) {
+      c.passphrase = passphrase
+      savePluginConfig(c)
+    }
+    restoreCache = { key: restoreCacheKey(name, remoteDir, passphrase), payload, at: Date.now() }
+    return { ok: true, payload, name, remoteDir, c }
+  }
+
+  /**
+   * 恢复预览（不写盘）：把这份备份在当前机器上的差异摊开，供用户在恢复前选模式。
+   * 每个模式各自会做什么也一并算好，界面直接照着显示，避免文案与实现分叉。
+   */
+  const handleRestorePreview = async (body) => {
+    const got = await fetchRestorePayload(body)
+    if (!got.ok) return got
+    const plan = planPayloadApply(got.payload, dshRoot)
+    const meta = extractPayloadMeta(got.payload)
+    log('restore preview ' + got.name + ': ' + plan.totals.bundle + ' files, ' +
+        plan.totals.added + ' new, ' + plan.totals.conflicts + ' conflicts, ' + plan.totals.localOnly + ' local-only')
+    return {
+      ok: true,
+      name: got.name,
+      mode: normalizeRestoreMode(body && body.mode),
+      defaultMode: DEFAULT_RESTORE_MODE,
+      // 列表只给前 40 条：预览是给人看的，不是全量报告
+      added: plan.added.slice(0, 40),
+      conflicts: plan.conflicts.slice(0, 40).map((c) => c.path),
+      localOnly: plan.localOnly.slice(0, 40),
+      unchangedCount: plan.unchanged.length,
+      invalid: plan.invalid,
+      totals: plan.totals,
+      modes: [
+        { id: 'merge', label: '只补缺失（推荐）', effect: '本机已有的配置一律不动，只补本机没有的文件。' },
+        { id: 'overwrite', label: '覆盖同名配置', effect: '备份里的文件全部覆盖写入；本机多出来的配置保留不删。' },
+        { id: 'mirror', label: '完全覆盖（与备份一模一样）', effect: '覆盖写入，并删除本机多出来、备份里没有的配置。' },
+      ],
+      meta: meta ? { profile: meta.profile, createdAt: meta.createdAt } : undefined,
+    }
+  }
+
+  const handleRestore = async (body) => {
+    const got = await fetchRestorePayload(body)
+    if (!got.ok) return got
+    const payload = got.payload
+    const name = got.name
+    const c = got.c
+    const mode = normalizeRestoreMode(body && body.mode)
+    // 恢复前先本地快照（安全性快照，本身就是回滚目标）：任何模式都可回滚
     lastLocalSnapshot = makeSnapshot(dshRoot, snapshotRoot, SNAPSHOT_KEEP)
-    // 配置范围与这份备份对齐：覆盖同名文件，删掉备份里没有的配置。排除项保留。
-    const r = applyPayloadMirror(payload, dshRoot)
+    // 按模式落地：merge 只补缺失 / overwrite 覆盖但不删 / mirror 完全对齐。排除项一律不动。
+    const r = applyPayloadMode(payload, dshRoot, mode)
     // 源机器的 file: 绝对路径和 pnpm storeDir 在这台电脑上不存在。不改的话，
     // 接下来的 pnpm install 会整批失败，package.json 里的插件全部显示「包不可用」。
     let portability = { profiles: [] }
@@ -2180,12 +2421,14 @@ export function apply(ctx, config) {
     const meta = extractPayloadMeta(payload)
     if (meta) {
       writeLastRestore(dshRoot, {
-        at: new Date().toISOString(), bundle: name,
+        at: new Date().toISOString(), bundle: name, mode,
         profile: meta.profile || cfg.profile, linkMap: meta.linkMap || {},
       })
     }
     const rewrittenN = (portability.profiles || []).reduce((n, p) => n + ((p.rewritten && p.rewritten.length) || 0), 0)
-    log('restored ' + name + ': ' + r.count + ' files, verified ' + r.verified +
+    log('restored ' + name + ' [' + mode + ']: ' + r.count + ' files, verified ' + r.verified +
+        (r.keptConflicts.length ? ', kept ' + r.keptConflicts.length + ' local conflicts' : '') +
+        (r.keptLocalOnly.length ? ', kept ' + r.keptLocalOnly.length + ' local-only' : '') +
         (r.removed.length ? ', removed ' + r.removed.length : '') +
         (r.failed.length ? ', remove failed ' + r.failed.length : '') +
         (r.skipped.length ? ', skipped ' + r.skipped.length : '') +
@@ -2194,11 +2437,17 @@ export function apply(ctx, config) {
         (meta ? ', install meta captured' : ', no install meta in bundle') +
         (rewrittenN ? ', retargeted ' + rewrittenN + ' local specs' : ''))
     return {
-      ok: true, restored: r.count, verified: r.verified,
+      ok: true, mode, restored: r.count, verified: r.verified,
       removedCount: r.removed.length,
       removed: r.removed.slice(0, 30),
       removeFailed: r.failed,
       skipped: r.skipped, mismatches: r.mismatches,
+      // 冲突 = 本机改过、这次按你的选择保留的文件。必须显式回报，否则用户会以为「恢复没生效」
+      keptConflicts: r.keptConflicts.slice(0, 40),
+      keptConflictsCount: r.keptConflicts.length,
+      keptLocalOnlyCount: r.keptLocalOnly.length,
+      unchangedCount: r.unchanged.length,
+      totals: r.totals,
       snapshot: lastLocalSnapshot,
       portability,
       meta: meta ? { profile: meta.profile, linkCount: Object.keys(meta.linkMap || {}).length } : undefined,
@@ -2773,6 +3022,7 @@ export function apply(ctx, config) {
     'POST /dsh-sync/passphrase': handlePassphrase,
     'POST /dsh-sync/backup': handleBackup,
     'POST /dsh-sync/restore': handleRestore,
+    'POST /dsh-sync/restore/preview': handleRestorePreview,
     'POST /dsh-sync/rollback': handleRollback,
     'POST /dsh-sync/delete': handleDelete,
     'POST /dsh-sync/plugins/install': (body) => handlePluginInstall(body),
@@ -2784,6 +3034,7 @@ export function apply(ctx, config) {
     handlePlugins, handlePluginInstall, buildPluginsReport, resolveProfile, defaultRunner,
     handleVersion, handleUpgrade, inspectSelf, versionCache, runProfileInstall,
     handleStatus, handleDelete, handlePassphrase, handleConfig, handleBackup,
+    handleRestore, handleRestorePreview,
     describeScope, localCoverage,
   }
 
@@ -2844,7 +3095,7 @@ export function apply(ctx, config) {
         })
         if (typeof dispose === 'function') cleanupFns.push(dispose)
       }
-      log('HTTP endpoints ready: /dsh-sync/{status,config,passphrase,backup,restore,rollback,delete,plugins,plugins/install,version,upgrade}' +
+      log('HTTP endpoints ready: /dsh-sync/{status,config,passphrase,backup,restore,restore/preview,rollback,delete,plugins,plugins/install,version,upgrade}' +
         '（已套 Host/Origin 栅栏 + browser cookie 认证）')
     } catch (e) {
       log('route registration failed: ' + (e && e.message ? e.message : String(e)))

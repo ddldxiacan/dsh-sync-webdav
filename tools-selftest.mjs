@@ -28,6 +28,7 @@ import {
   defaultHttpsGet, nextRedirectUrl,
   isNativeExecutable, findPnpmOnPath, resolvePnpmInvocation, buildPnpmCommand, describeScope,
   parseIgnoredBuildScripts, parsePnpmAllowBuilds, readAllowBuilds, approveBuilds, isLoopbackRequest,
+  applyPayloadMode, planPayloadApply, normalizeRestoreMode, DEFAULT_RESTORE_MODE, RESTORE_MODES,
 } from './index.js'
 
 let pass = 0, fail = 0
@@ -1434,7 +1435,7 @@ check('depKind: registry 版本号', depKind('^0.4.6') === 'registry' && depKind
   mod.apply(guardCtx, { root: guardRoot, profile: 'web', __test: true })
   check('路由: 只注入 webServer（connection 延迟解析，缺服务时端点不会整块消失）',
     JSON.stringify(injectDeps) === JSON.stringify([['webServer']]), JSON.stringify(injectDeps))
-  check('路由: 11 个端点全部注册', routes.size === 11, [...routes.keys()].join(','))
+  check('路由: 12 个端点全部注册', routes.size === 12, [...routes.keys()].join(','))
 
   /** 造一个最小 req/res，跑一次 handler */
   const invoke = (path, opts) => new Promise((resolve) => {
@@ -1470,8 +1471,8 @@ check('depKind: registry 版本号', depKind('^0.4.6') === 'registry' && depKind
     const r = await invoke(p, { method: p.startsWith('POST') ? 'POST' : 'GET', headers: { 'x-test-reject': '401' } })
     if (r.status === 401 && r.body === 'unauthorized') rejected.push(p)
   }
-  check('栅栏: requestRejection=401 时 11 个端点全部 401，不进入业务逻辑',
-    rejected.length === 11, rejected.length + '/' + all.length + ' rejected')
+  check('栅栏: requestRejection=401 时 12 个端点全部 401，不进入业务逻辑',
+    rejected.length === 12, rejected.length + '/' + all.length + ' rejected')
 
   const forbidden = await invoke('/dsh-sync/status', { headers: { 'x-test-reject': '403' } })
   check('栅栏: requestRejection=403 时回 403 forbidden', forbidden.status === 403 && forbidden.body === 'forbidden', JSON.stringify(forbidden))
@@ -1650,6 +1651,275 @@ check('depKind: registry 版本号', depKind('^0.4.6') === 'registry' && depKind
       st.coverage.totals.files > 0, JSON.stringify(st.coverage && st.coverage.totals))
   } finally {
     try { rmSync(scopeRoot, { recursive: true, force: true }) } catch (e) { /* ignore */ }
+  }
+}
+
+
+// ---------- 11. v0.4.2：恢复方式（只补缺失 / 覆盖同名 / 完全覆盖）+ 差异预览 ----------
+{
+  const modeRoot = join(tmpdir(), 'dsh-sync-modes-' + Date.now())
+  try {
+    // A 机：一份完整配置（两个文件，其中 settings.json 在 B 机上会被改过）
+    const src = join(modeRoot, 'a')
+    mkdirSync(join(src, 'skins', 'whale'), { recursive: true })
+    writeFileSync(join(src, 'settings.json'), '{"theme":"A","skin":"whale"}', 'utf8')
+    writeFileSync(join(src, 'skins', 'whale', 'theme.css'), ':root{--x:1}', 'utf8')
+    const payloadA = buildPayload(src, collectFiles(src))
+
+    /** 造一台「已经装好插件、配了皮肤」的 B 机 */
+    const makeB = () => {
+      const b = join(modeRoot, 'b-' + Math.random().toString(36).slice(2))
+      mkdirSync(join(b, 'skins', 'orca'), { recursive: true })
+      writeFileSync(join(b, 'settings.json'), '{"theme":"B","skin":"orca"}', 'utf8')
+      writeFileSync(join(b, 'skins', 'orca', 'theme.css'), ':root{--y:2}', 'utf8')
+      return b
+    }
+
+    check('normalizeRestoreMode: 未知/空值一律回落到默认（只补缺失）',
+      normalizeRestoreMode('') === 'merge' && normalizeRestoreMode(undefined) === 'merge' &&
+      normalizeRestoreMode('乱写') === 'merge' && DEFAULT_RESTORE_MODE === 'merge')
+    check('normalizeRestoreMode: 三种模式原样接受且大小写无关',
+      normalizeRestoreMode('MIRROR') === 'mirror' && normalizeRestoreMode('overwrite') === 'overwrite' &&
+      normalizeRestoreMode(' merge ') === 'merge')
+
+    // 11.1 预览：不写盘，且把「新增 / 相同 / 冲突 / 本机独有」分开报
+    {
+      const b = makeB()
+      const before = readFileSync(join(b, 'settings.json'), 'utf8')
+      const plan = planPayloadApply(payloadA, b)
+      const t = plan.totals
+      check('preview: 备份共 2 个文件，1 个新增、1 个冲突、0 个相同',
+        t.bundle === 2 && t.added === 1 && t.conflicts === 1 && t.unchanged === 0,
+        JSON.stringify(t))
+      check('preview: 冲突名单点名 settings.json（B 机改过的那个）',
+        plan.conflicts.length === 1 && plan.conflicts[0].path === 'settings.json', JSON.stringify(plan.conflicts))
+      check('preview: 新增名单是 B 机缺的 skins/whale/theme.css',
+        plan.added.length === 1 && plan.added[0] === 'skins/whale/theme.css', JSON.stringify(plan.added))
+      check('preview: 本机独有名单含 B 机自己的 skins/orca/theme.css',
+        plan.localOnly.includes('skins/orca/theme.css'), JSON.stringify(plan.localOnly))
+      check('preview: 预览不写盘（settings.json 未被改动）',
+        readFileSync(join(b, 'settings.json'), 'utf8') === before)
+
+      // 内容完全相同的文件算 unchanged 而不是冲突
+      const same = join(modeRoot, 'same')
+      mkdirSync(same, { recursive: true })
+      writeFileSync(join(same, 'settings.json'), '{"theme":"A","skin":"whale"}', 'utf8')
+      const plan2 = planPayloadApply(payloadA, same)
+      check('preview: 内容一致的文件算「相同」而非「冲突」',
+        plan2.totals.unchanged === 1 && plan2.totals.conflicts === 0, JSON.stringify(plan2.totals))
+    }
+
+    // 11.2 merge：只补缺失。B 机改过的 settings.json 与自己的 orca 皮肤都保留
+    {
+      const b = makeB()
+      const r = applyPayloadMode(payloadA, b, 'merge')
+      check('merge: 只写本机缺少的文件（1 个）', r.count === 1 && r.verified === 1, 'count=' + r.count)
+      check('merge: 本机改过的 settings.json 原样保留（不被 A 覆盖）',
+        readFileSync(join(b, 'settings.json'), 'utf8') === '{"theme":"B","skin":"orca"}')
+      check('merge: 缺失的 skins/whale/theme.css 补上了',
+        existsSync(join(b, 'skins', 'whale', 'theme.css')))
+      check('merge: 本机独有的 orca 皮肤保留',
+        existsSync(join(b, 'skins', 'orca', 'theme.css')))
+      check('merge: 冲突文件列进 keptConflicts 供用户核对',
+        Array.isArray(r.keptConflicts) && r.keptConflicts.includes('settings.json'), JSON.stringify(r.keptConflicts))
+      check('merge: 不删任何文件', r.removed.length === 0, JSON.stringify(r.removed))
+    }
+
+    // 11.3 overwrite：覆盖同名（A 赢），但本机多出来的 orca 皮肤不删
+    {
+      const b = makeB()
+      const r = applyPayloadMode(payloadA, b, 'overwrite')
+      check('overwrite: 备份里的 2 个文件全部覆盖写入', r.count === 2, 'count=' + r.count)
+      check('overwrite: settings.json 回到 A 的状态',
+        readFileSync(join(b, 'settings.json'), 'utf8') === '{"theme":"A","skin":"whale"}')
+      check('overwrite: 本机独有的 orca 皮肤保留不删（区别于完全覆盖）',
+        existsSync(join(b, 'skins', 'orca', 'theme.css')))
+      check('overwrite: 不删任何文件', r.removed.length === 0 && r.keptLocalOnly.length === 1,
+        'removed=' + JSON.stringify(r.removed) + ' keptLocalOnly=' + JSON.stringify(r.keptLocalOnly))
+    }
+
+    // 11.4 mirror：完全覆盖（旧行为），A 的状态 + 删除本机多余配置
+    {
+      const b = makeB()
+      const r = applyPayloadMode(payloadA, b, 'mirror')
+      check('mirror: settings.json 回到 A 的状态',
+        readFileSync(join(b, 'settings.json'), 'utf8') === '{"theme":"A","skin":"whale"}')
+      check('mirror: 删除本机独有、备份里没有的 skins/orca/theme.css',
+        !existsSync(join(b, 'skins', 'orca', 'theme.css')))
+      check('mirror: 删掉的路径逐个回报', r.removed.includes('skins/orca/theme.css'), JSON.stringify(r.removed))
+    }
+
+    // 11.5 排除项在任何模式下都不动
+    {
+      const b = makeB()
+      mkdirSync(join(b, 'sessions', 'ws'), { recursive: true })
+      mkdirSync(join(b, 'dsh-runtimes'), { recursive: true })
+      writeFileSync(join(b, 'sessions', 'ws', 'c.jsonl'), 'chat', 'utf8')
+      writeFileSync(join(b, 'dsh-runtimes', 'node.exe'), 'bin', 'utf8')
+      for (const m of ['merge', 'overwrite', 'mirror']) {
+        const r = applyPayloadMode(payloadA, b, m)
+        check('排除项不被 ' + m + ' 模式删除（聊天记录与运行时留着）',
+          existsSync(join(b, 'sessions', 'ws', 'c.jsonl')) && existsSync(join(b, 'dsh-runtimes', 'node.exe')),
+          JSON.stringify(r.removed))
+      }
+    }
+
+    // 11.6 真实端到端：mock WebDAV 上 A 机备份 → B 机（已配皮肤）按不同 mode 恢复
+    {
+      const storeB = new Map()
+      const davGets = { count: 0 }
+      const dav = createServer((req, res) => {
+        const u = decodeURIComponent(new URL(req.url, 'http://x').pathname)
+        if (req.method === 'PROPFIND') {
+          const rows = [...storeB.keys()].filter((k) => k.startsWith(u) && k !== u).map((k) =>
+            '<D:response><D:href>' + k + '</D:href><D:propstat><D:prop><D:resourcetype/>' +
+            '<D:getcontentlength>' + storeB.get(k).length + '</D:getcontentlength>' +
+            '<D:getlastmodified>Thu, 16 Oct 2026 03:00:00 GMT</D:getlastmodified></D:prop></D:propstat></D:response>')
+          res.writeHead(207, { 'Content-Type': 'application/xml' })
+          return res.end('<?xml version="1.0"?><D:multistatus xmlns:D="DAV:">' + rows.join('') + '</D:multistatus>')
+        }
+        if (req.method === 'MKCOL') { storeB.set(u.endsWith('/') ? u : u + '/', Buffer.alloc(0)); res.writeHead(201); return res.end() }
+        if (req.method === 'PUT') {
+          const ch = []
+          req.on('data', (c) => ch.push(c))
+          req.on('end', () => { storeB.set(u, Buffer.concat(ch)); res.writeHead(201); res.end() })
+          return
+        }
+        if (req.method === 'GET') {
+          davGets.count++
+          if (!storeB.has(u)) { res.writeHead(404); return res.end() }
+          res.writeHead(200); return res.end(storeB.get(u))
+        }
+        res.writeHead(405); res.end()
+      })
+      await new Promise((r) => dav.listen(0, '127.0.0.1', r))
+      const davUrl = 'http://127.0.0.1:' + dav.address().port + '/dav/'
+      const bRoot = join(modeRoot, 'e2e-b')
+      try {
+        mkdirSync(bRoot, { recursive: true })
+        // B 机先存好 WebDAV 配置与口令（模拟真实「已装插件并配置好」的机器）
+        writeFileSync(join(bRoot, 'dsh-sync.json'), JSON.stringify({
+          url: davUrl, username: '', password: '', remoteDir: 'dsh-sync', passphrase: 'pw',
+        }), 'utf8')
+        // A 机状态：这套配置会被打包上传
+        writeFileSync(join(bRoot, 'settings.json'), '{"theme":"A","skin":"whale"}', 'utf8')
+        mkdirSync(join(bRoot, 'skins', 'whale'), { recursive: true })
+        writeFileSync(join(bRoot, 'skins', 'whale', 'theme.css'), ':root{--x:1}', 'utf8')
+        const hA = createTestHarness({ root: bRoot, profile: 'web' })
+        const up = await hA.handleBackup({})
+        check('E2E 备份: A 机备份上传成功（前端拿到文件名）', up.ok === true && !!up.name, JSON.stringify(up).slice(0, 160))
+
+        // 备份之后，这台 B 机自己改了皮肤：settings.json 与备份不同，另有自己的 skin 目录
+        writeFileSync(join(bRoot, 'settings.json'), '{"theme":"B","skin":"orca"}', 'utf8')
+        mkdirSync(join(bRoot, 'skins', 'orca'), { recursive: true })
+        writeFileSync(join(bRoot, 'skins', 'orca', 'theme.css'), ':root{--y:2}', 'utf8')
+        const bBefore = readFileSync(join(bRoot, 'settings.json'), 'utf8')
+
+        const hB = createTestHarness({ root: bRoot, profile: 'web' })
+        const pv = await hB.handleRestorePreview({})
+        check('E2E 预览: 报出这台 B 机的差异（有冲突、有本机独有）',
+          pv.ok === true && pv.totals && pv.totals.conflicts >= 1 && pv.totals.localOnly >= 1,
+          JSON.stringify(pv.totals))
+        check('E2E 预览: 给出三种方式与默认值，界面无需自己编文案',
+          Array.isArray(pv.modes) && pv.modes.length === 3 && pv.defaultMode === 'merge' &&
+          pv.modes.map((m) => m.id).join(',') === 'merge,overwrite,mirror', JSON.stringify(pv.modes))
+        check('E2E 预览: 预览不写盘（B 机的 settings.json 没被改）',
+          readFileSync(join(bRoot, 'settings.json'), 'utf8') === bBefore)
+
+        // 预览刚下载过，紧接着的恢复不该再下载一次（大备份下这能省几十 MB 流量与几十秒）
+        const getsBefore = davGets.count
+        const r0 = await hB.handleRestore({ mode: 'merge' })
+        check('E2E 缓存: 预览后立刻恢复复用已解密的 payload，不再下载',
+          r0.ok === true && davGets.count === getsBefore,
+          'GET 次数 ' + getsBefore + ' -> ' + davGets.count)
+        // 口令不同不能命中同一份缓存（否则会用旧口令解出的内容冒充这次的结果）
+        const wrongPassGets = davGets.count
+        const bad = await hB.handleRestore({ passphrase: 'not-the-same' })
+        check('E2E 缓存: 换了口令不会命中缓存（仍要重新下载并报口令错误）',
+          bad.ok === false && davGets.count === wrongPassGets + 1,
+          JSON.stringify({ ok: bad.ok, gets: davGets.count - wrongPassGets, err: (bad.error || '').slice(0, 40) }))
+        // 口令打错一次不能把本机记住的正确口令覆盖掉（否则以后每次恢复都失败）
+        const savedPass = JSON.parse(readFileSync(join(bRoot, 'dsh-sync.json'), 'utf8')).passphrase
+        check('E2E 口令: 错误口令不会覆盖本机已记住的正确口令',
+          savedPass === 'pw', 'saved=' + savedPass)
+
+        // 默认（不传 mode）必须是 merge：B 机改过的配置原样保留
+        const r1 = await hB.handleRestore({})
+        check('E2E 恢复: 不传 mode 时默认走 merge，且把 mode 回报给界面',
+          r1.ok === true && r1.mode === 'merge', JSON.stringify({ ok: r1.ok, mode: r1.mode, err: r1.error }))
+        check('E2E 恢复: merge 没有覆盖 B 机改过的 settings.json',
+          readFileSync(join(bRoot, 'settings.json'), 'utf8') === bBefore)
+        check('E2E 恢复: merge 保留了 B 机独有的 orca 皮肤',
+          existsSync(join(bRoot, 'skins', 'orca', 'theme.css')))
+        check('E2E 恢复: merge 把冲突文件回报为「已保留」',
+          r1.keptConflictsCount >= 1 && Array.isArray(r1.keptConflicts) && r1.keptConflicts.includes('settings.json'),
+          JSON.stringify(r1.keptConflicts))
+
+        // 显式完全覆盖：这次要被 A 的状态替换掉，且本机独有的 orca 被删
+        const hC = createTestHarness({ root: bRoot, profile: 'web' })
+        const r2 = await hC.handleRestore({ mode: 'mirror' })
+        check('E2E 恢复: mode=mirror 覆盖 B 机改过的 settings.json',
+          r2.ok === true && r2.mode === 'mirror' &&
+          readFileSync(join(bRoot, 'settings.json'), 'utf8') !== bBefore,
+          JSON.stringify({ mode: r2.mode, err: r2.error }))
+        check('E2E 恢复: mode=mirror 删掉备份里没有的 orca 皮肤',
+          !existsSync(join(bRoot, 'skins', 'orca', 'theme.css')) && r2.removedCount >= 1,
+          JSON.stringify(r2.removed))
+
+        // 恢复后仍写了 last-restore（带 mode），供插件依赖卡片展示
+        const last = readLastRestore(bRoot)
+        check('E2E 恢复: 上次恢复记录里带上 mode', last && last.mode === 'mirror', JSON.stringify(last))
+      } finally {
+        dav.close()
+      }
+    }
+
+    // 11.6b dsh-sync.json 的口令属于本机，不该被备份覆盖，也不该在预览里报成冲突
+    {
+      const own = join(modeRoot, 'own')
+      mkdirSync(own, { recursive: true })
+      writeFileSync(join(own, 'settings.json'), '{"v":1}', 'utf8')
+      writeFileSync(join(own, 'dsh-sync.json'), JSON.stringify({
+        url: 'https://dav.example.com/dav/', username: 'u', password: 'p', remoteDir: 'dsh-sync', passphrase: 'my-pass',
+      }), 'utf8')
+      // 备份时口令被剥掉（redactBackupBytes 的既有行为）
+      const ownPayload = buildPayload(own, collectFiles(own))
+      const packed = JSON.parse(ownPayload.toString('utf8')).files.find((f) => f.path === 'dsh-sync.json')
+      check('备份: dsh-sync.json 里不含本机口令', packed && !Buffer.from(packed.data, 'base64').toString('utf8').includes('my-pass'))
+
+      check('预览: 自己的备份恢复回本机不因口令差异误报冲突',
+        planPayloadApply(ownPayload, own).totals.conflicts === 0,
+        JSON.stringify(planPayloadApply(ownPayload, own).totals))
+
+      // 用另一个目录模拟「别的机器恢复过来」，本机已有记住的口令
+      const other = join(modeRoot, 'other')
+      mkdirSync(other, { recursive: true })
+      writeFileSync(join(other, 'dsh-sync.json'), JSON.stringify({
+        url: 'https://dav.example.com/dav/', username: 'u', password: 'p', remoteDir: 'dsh-sync', passphrase: 'local-pass',
+      }), 'utf8')
+      applyPayloadMode(ownPayload, other, 'mirror')
+      const after = JSON.parse(readFileSync(join(other, 'dsh-sync.json'), 'utf8'))
+      check('恢复: 覆盖 dsh-sync.json 时保留本机记住的口令（只会多不会丢）',
+        after.passphrase === 'local-pass', JSON.stringify(after))
+    }
+
+    // 11.7 client 契约：恢复必须带 mode，且弹窗里能选
+    const cSrc = readFileSync(new URL('./client.js', import.meta.url), 'utf8')
+    check('client: 恢复请求带上所选 mode', cSrc.includes('mode: restoreMode'))
+    check('client: 恢复前拉差异预览', cSrc.includes("request('/restore/preview'") && cSrc.includes('loadRestorePreview'))
+    check('client: 弹窗提供三种恢复方式供选择',
+      cSrc.includes('只补缺失') && cSrc.includes('覆盖同名配置') && cSrc.includes('完全覆盖'))
+    check('client: 恢复结果回报被保留的冲突文件', cSrc.includes('keptConflicts') && cSrc.includes('保留了本机'))
+    // React 闭包陷阱回归：弹窗 run 是打开那一刻的闭包，直接用 state 会「点了单选不生效」
+    check('client: 恢复模式走 ref（否则点单选无效、恢复用旧模式）',
+      cSrc.includes('restoreModeRef') && cSrc.includes('mode: restoreModeRef.current') &&
+      !/const body = \{ passphrase, remember, mode: restoreMode \}/.test(cSrc))
+    check('client: 弹窗正文支持函数形态（勾选状态要能随重渲染刷新）',
+      cSrc.includes("typeof body === 'function' ? body() : body"))
+    check('client: 模式单选的回调同步写 ref 与 state',
+      /const chooseRestoreMode = \(id\) => \{ restoreModeRef\.current = id; setRestoreMode\(id\); \}/.test(cSrc))
+  } finally {
+    try { rmSync(modeRoot, { recursive: true, force: true }) } catch (e) { /* ignore */ }
   }
 }
 

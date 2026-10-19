@@ -13,7 +13,9 @@
  *   POST /dsh-sync/config   {url,username,password,remoteDir} -> { ok:true } | { ok:false, error }
  *   POST /dsh-sync/passphrase {passphrase}|{clear:true} -> { ok:true, hasPassphrase } | { ok:false, error }
  *   POST /dsh-sync/backup   {passphrase?, remember?} -> { ok:true, name, size, fileCount, scope, pruned } | { ok:false, error }
- *   POST /dsh-sync/restore  {name?, remoteDir?, passphrase?, remember?} -> { ok:true, restored, snapshot, portability? } | { ok:false, error }
+ *   POST /dsh-sync/restore  {name?, remoteDir?, passphrase?, remember?, mode?} -> { ok:true, mode, restored, keptConflicts, snapshot, portability? } | { ok:false, error }
+ *   POST /dsh-sync/restore/preview {name?, remoteDir?, passphrase?, remember?} -> { ok:true, mode, defaultMode, added[], conflicts[], localOnly[],
+ *                                                        unchangedCount, totals, modes[{id,label,effect}], invalid[] } | { ok:false, error }
  *   POST /dsh-sync/rollback {snapshot}              -> { ok:true, restored }              | { ok:false, error }
  *   POST /dsh-sync/delete   {name, remoteDir?}|{names} -> { ok:true, deleted[] }          | { ok:false, error, deleted?, failed? }
  *   GET  /dsh-sync/plugins                          -> { ok:true, profile, deps[], missing[], needsInstall, pnpm }
@@ -269,6 +271,7 @@ window.__ModuleLoader__.load({
       backup: (body) => request('/backup', { method: 'POST', body }),
       passphrase: (body) => request('/passphrase', { method: 'POST', body }),
       restore: (body) => request('/restore', { method: 'POST', body }),
+      restorePreview: (body) => request('/restore/preview', { method: 'POST', body }),
       rollback: (body) => request('/rollback', { method: 'POST', body }),
       remove: (body) => request('/delete', { method: 'POST', body }),
       // 这两个端点的业务失败也是 HTTP 200，成败要看返回体里的 ok 字段
@@ -337,6 +340,14 @@ window.__ModuleLoader__.load({
   background: var(--dsw-alias-fill-l1); border-left: 3px solid var(--dsw-alias-state-error-primary); }
 .${PREFIX}-warn-title { color: var(--dsw-alias-state-error-primary); font-weight: 600; margin-bottom: 2px; }
 .${PREFIX}-log { font-size: 12px; color: var(--dsw-alias-label-tertiary); }
+/* 恢复方式单选：一行一个，选中态用强调色左边框，避免整块变色导致对比度不足 */
+.${PREFIX}-modes { display: flex; flex-direction: column; gap: 6px; }
+.${PREFIX}-mode { display: flex; align-items: flex-start; gap: 8px; padding: 8px 10px; border-radius: 6px; cursor: pointer;
+  border: 1px solid var(--dsw-alias-border-l2); background: var(--dsw-alias-bg-l2); }
+.${PREFIX}-mode input { margin: 2px 0 0; }
+.${PREFIX}-mode-on { border-color: var(--dsw-alias-brand-primary); background: var(--dsw-alias-fill-l1); }
+.${PREFIX}-mode-label { display: block; font-weight: 600; color: var(--dsw-alias-label-primary); }
+.${PREFIX}-mode .${PREFIX}-hint { display: block; }
 .${PREFIX}-log summary { cursor: pointer; }
 .${PREFIX}-log-pre { max-height: 200px; overflow: auto; margin: 6px 0 0; padding: 8px; border-radius: 6px; font-size: 12px;
   font-family: ui-monospace, SFMono-Regular, Menlo, monospace; white-space: pre-wrap; word-break: break-all;
@@ -377,7 +388,9 @@ window.__ModuleLoader__.load({
       return h('span', { className: PREFIX + '-spin', 'aria-hidden': true });
     }
 
-    /** 自写确认弹窗：沿用 Modal 的关键行为（焦点、Escape、遮罩点击不误关）。 */
+    /** 自写确认弹窗：沿用 Modal 的关键行为（焦点、Escape、遮罩点击不误关）。
+     *  body 允许传函数：恢复弹窗里有单选模式，勾选状态必须随组件重渲染刷新，
+     *  写成固定元素会把 checked 与文案固化在打开那一刻（React 闭包陷阱）。 */
     function ConfirmModal(props) {
       const { open, title, body, confirmLabel, onConfirm, onCancel, busy } = props;
       const ref = useRef(null);
@@ -391,10 +404,11 @@ window.__ModuleLoader__.load({
       }, [open, busy, onCancel]);
 
       if (!open) return null;
+      const bodyNode = typeof body === 'function' ? body() : body;
       return h('div', { className: PREFIX + '-modal-mask', onMouseDown: (e) => { if (e.target === e.currentTarget && !busy) onCancel(); } },
         h('div', { className: PREFIX + '-modal', role: 'dialog', 'aria-modal': 'true', 'aria-label': title },
           h('div', { className: PREFIX + '-modal-title' }, title),
-          h('div', { className: PREFIX + '-modal-body' }, body),
+          h('div', { className: PREFIX + '-modal-body' }, bodyNode),
           h('div', { className: PREFIX + '-modal-actions' },
             h(Button, { onClick: onCancel, disabled: busy }, '取消'),
             h(Button, { variant: props.confirmVariant || 'primary', onClick: onConfirm, disabled: busy, ref }, busy ? '处理中…' : confirmLabel),
@@ -461,6 +475,18 @@ window.__ModuleLoader__.load({
       const [msg, setMsg] = useState(null);           // { kind, text }
       const [offline, setOffline] = useState(false);
       const [confirm, setConfirm] = useState(null);   // { title, body, confirmLabel, run }
+      // 恢复方式：merge 只补缺失 / overwrite 覆盖同名 / mirror 完全覆盖。默认最保守的那个。
+      const [restoreMode, setRestoreMode] = useState('merge');
+      // 弹窗的 body/run 是打开那一刻的闭包，读不到之后 setState 的新值。
+      // 单选与真正发起恢复都必须取这份 ref，否则「点单选没反应」「恢复用了旧模式」。
+      const restoreModeRef = useRef('merge');
+      const chooseRestoreMode = (id) => { restoreModeRef.current = id; setRestoreMode(id); };
+      // 恢复预览：{ loading, error, data }。null = 还没打开恢复弹窗。
+      const [restorePreview, setRestorePreview] = useState(null);
+      // 同上的闭包问题：预览是异步回来的，弹窗正文那次渲染读不到。ref 与 state 双写，
+      // 正文从 ref 取最新值，state 只负责触发重渲染。
+      const restorePreviewRef = useRef(null);
+      const setPreview = (v) => { restorePreviewRef.current = v; setRestorePreview(v); };
 
       const mountedRef = useRef(true);
       useEffect(() => () => { mountedRef.current = false; }, []);
@@ -639,27 +665,123 @@ window.__ModuleLoader__.load({
         await refresh({ silent: true });
       };
 
-      /** 恢复入口：先弹确认（提示会先自动快照现有配置，恢复后需重启才生效） */
+      /**
+       * 恢复入口：先弹确认。弹窗里包含「恢复模式」三选一 + 这份备份在本机的差异预览
+       * （新增/冲突/本机独有），让用户决定是「只补缺失」还是「完全覆盖」。
+       * 这是本插件最容易造成误解的地方：B 机已经配好皮肤/插件时，完全覆盖会把这些改回来，
+       * 旧版本还会删掉备份里没有的配置文件——必须让用户在动手前看见并自己选。
+       */
       const askRestore = (backup) => {
+        if (busy) return;
         const name = backup && backup.name;
         const encrypted = !backup || backup.encrypted !== false;
+        const known = !!(status && status.config && status.config.hasPassphrase);
+        if (!passphrase && !(remember && known)) {
+          setMsg({ kind: 'error', text: '请先输入口令。勾选「在本机记住」后，这台电脑以后可以留空。' });
+          return;
+        }
+        setPreview({ loading: true, error: null, data: null });
         setConfirm({
           title: '确认恢复',
-          body: h(React.Fragment, null,
-            h('div', null, name ? '将从远端备份恢复：' : '将从同账号下最新的一份备份恢复（根目录和 dsh-sync 一起比较）。'),
-            name ? h('div', { className: PREFIX + '-item-name' }, name) : null,
-            name ? h('div', { className: PREFIX + '-hint' }, '位置：' + locationLabel(backup.remoteDir)) : null,
-            h('div', null, encrypted ? '这份备份已用口令加密。留空并勾选记住时，使用本机已保存的口令。' : '这份备份没有口令。'),
-            h('div', null, '恢复前会自动为当前配置创建一份本地快照，可用它回滚。'),
-            h('div', null, '当前配置会对齐到这份备份：备份里的配置覆盖现有文件，备份里没有的配置文件会删掉。聊天记录、聊天文件、运行时、插件代码和缓存不在备份范围里，恢复时一律保留。'),
-            h('div', { className: PREFIX + '-warn' },
-              h('div', { className: PREFIX + '-warn-title' }, '恢复完成后必须重启 DeepSeek Harness 才会生效'),
-              h('div', null, '备份不含插件代码。恢复后会把源机器的本机路径改成这台电脑可用的路径，并自动安装缺失的插件。安装结束前请不要重启。'),
-            ),
-          ),
-          confirmLabel: '恢复',
+          body: () => renderRestoreBody(backup, encrypted),
+          confirmLabel: '开始恢复',
           run: () => doRestore(backup),
         });
+        loadRestorePreview(backup);
+      };
+
+      /** 拉取恢复预览（不写盘）。失败只把错误放进弹窗，不关闭弹窗、不影响用户改用其它模式继续。 */
+      const loadRestorePreview = async (backup) => {
+        const body = { passphrase, remember };
+        if (backup && backup.name) {
+          body.name = backup.name;
+          body.remoteDir = normalizeDir(backup.remoteDir);
+        }
+        const res = await api.restorePreview(body);
+        if (!mountedRef.current) return;
+        const d = (res.ok && res.data && res.data.ok) ? res.data : null;
+        if (d) {
+          setPreview({ loading: false, error: null, data: d });
+          if (d.modes && d.modes.length && !d.modes.some((m) => m.id === restoreModeRef.current)) {
+            chooseRestoreMode(d.defaultMode || 'merge');
+          }
+        } else {
+          setPreview({ loading: false, error: pickError(res && res.data, res && res.offline ? NOT_READY : '无法预览这份备份的差异'), data: null });
+        }
+      };
+
+      /** 恢复确认弹窗正文（函数形态：模式单选与预览状态要能随重渲染刷新）。 */
+      const renderRestoreBody = (backup, encrypted) => {
+        const name = backup && backup.name;
+        const pv = restorePreviewRef.current || {};
+        // 这份正文函数是「打开弹窗那一刻」的闭包，state 在这里是旧值；
+        // 勾选状态必须读 ref，否则点单选后界面不动。
+        const picked = restoreModeRef.current;
+        const data = pv.data;
+        const totals = (data && data.totals) ? data.totals : null;
+        const modes = (data && Array.isArray(data.modes) && data.modes.length) ? data.modes : [
+          { id: 'merge', label: '只补缺失（推荐）', effect: '本机已有的配置一律不动，只补本机没有的文件。' },
+          { id: 'overwrite', label: '覆盖同名配置', effect: '备份里的文件全部覆盖写入；本机多出来的配置保留不删。' },
+          { id: 'mirror', label: '完全覆盖（与备份一模一样）', effect: '覆盖写入，并删除本机多出来、备份里没有的配置。' },
+        ];
+        const rows = (list, cls, limit) => {
+          const arr = Array.isArray(list) ? list : [];
+          if (!arr.length) return null;
+          return h('div', { className: PREFIX + '-hint' },
+            arr.slice(0, limit || 6).join('、') + (arr.length > (limit || 6) ? ' 等 ' + arr.length + ' 项' : ''));
+        };
+        return h(React.Fragment, null,
+          h('div', null, name ? '将从远端备份恢复：' : '将从同账号下最新的一份备份恢复（根目录和 dsh-sync 一起比较）。'),
+          name ? h('div', { className: PREFIX + '-item-name' }, name) : null,
+          name ? h('div', { className: PREFIX + '-hint' }, '位置：' + locationLabel(backup.remoteDir)) : null,
+          h('div', { className: PREFIX + '-hint' }, encrypted ? '这份备份已用口令加密。留空并勾选记住时，使用本机已保存的口令。' : '这份备份没有口令。'),
+
+          // ---- 差异预览：先说清这台电脑会被改动什么 ----
+          pv.loading
+            ? h('div', { className: PREFIX + '-hint' }, h(Spinner, null), ' 正在比对这份备份与本机配置…')
+            : null,
+          pv.error
+            ? h('div', { className: PREFIX + '-hint' }, '差异比对失败（' + pv.error + '），仍可按所选模式恢复。')
+            : null,
+          totals
+            ? h('div', { className: PREFIX + '-warn' },
+                h('div', { className: PREFIX + '-warn-title' }, '这份备份与本机的差异'),
+                h('div', null,
+                  '备份共 ' + totals.bundle + ' 个配置文件：本机缺少 ' + totals.added +
+                  ' 个、内容相同 ' + totals.unchanged + ' 个、与备份不同 ' + totals.conflicts +
+                  ' 个；本机另有 ' + totals.localOnly + ' 个配置是备份里没有的。'),
+                totals.conflicts ? h('div', null, '内容不同（本机改过）：', rows(data.conflicts, 'c')) : null,
+                totals.localOnly ? h('div', null, '本机独有：', rows(data.localOnly, 'l')) : null,
+              )
+            : null,
+
+          // ---- 模式单选 ----
+          h('div', { className: PREFIX + '-card-title' }, h('span', null, '恢复方式')),
+          h('div', { className: PREFIX + '-modes' },
+            modes.map((m) => h('label', {
+              key: m.id,
+              className: PREFIX + '-mode' + (picked === m.id ? ' ' + PREFIX + '-mode-on' : ''),
+            },
+              h('input', {
+                type: 'radio',
+                name: PREFIX + '-restore-mode',
+                value: m.id,
+                checked: picked === m.id,
+                disabled: busy,
+                onChange: () => chooseRestoreMode(m.id),
+              }),
+              h('span', null,
+                h('span', { className: PREFIX + '-mode-label' }, m.label),
+                h('span', { className: PREFIX + '-hint' }, m.effect)),
+            )),
+          ),
+
+          h('div', null, '恢复前会自动为当前配置创建一份本地快照，可用它回滚。聊天记录、聊天文件、运行时、插件代码和缓存不在备份范围里，恢复时一律保留。'),
+          h('div', { className: PREFIX + '-warn' },
+            h('div', { className: PREFIX + '-warn-title' }, '恢复完成后必须重启 DeepSeek Harness 才会生效'),
+            h('div', null, '备份不含插件代码。恢复后会把源机器的本机路径改成这台电脑可用的路径，并自动安装缺失的插件。安装结束前请不要重启。'),
+          ),
+        );
       };
 
       /** POST /dsh-sync/restore */
@@ -673,7 +795,8 @@ window.__ModuleLoader__.load({
         }
         setBusy('restore');
         setMsg(null);
-        const body = { passphrase, remember };
+        // 必须读 ref：弹窗 run 是打开那一刻的闭包，state 在这里是旧值
+        const body = { passphrase, remember, mode: restoreModeRef.current };
         if (backup && backup.name) {
           body.name = backup.name;
           body.remoteDir = normalizeDir(backup.remoteDir);
@@ -682,6 +805,7 @@ window.__ModuleLoader__.load({
         if (!mountedRef.current) return;
         setBusy('');
         setConfirm(null);
+        setRestorePreview(null);
         if (consume(res, null)) {
           const d = res.data || {};
           // 备份里没有 node_modules：恢复后插件只剩配置，这里立刻刷新插件状态
@@ -689,14 +813,26 @@ window.__ModuleLoader__.load({
           if (!mountedRef.current) return;
           const skipped = Array.isArray(d.skipped) ? d.skipped : [];
           const mismatch = Array.isArray(d.mismatches) ? d.mismatches : [];
+          const kept = Array.isArray(d.keptConflicts) ? d.keptConflicts : [];
+          const modeText = d.mode === 'mirror' ? '完全覆盖'
+            : d.mode === 'overwrite' ? '覆盖同名配置' : '只补缺失';
           const parts = [];
+          parts.push('方式：' + modeText);
           if (d.restored > 0 && d.verified === d.restored && !skipped.length && !mismatch.length) {
             parts.push('已恢复 ' + d.restored + ' 个文件（逐文件校验通过），快照：' + (d.snapshot || '—'));
           } else {
             if (d.restored > 0) parts.push('已写入 ' + d.restored + ' 个文件，校验通过 ' + (d.verified || 0) + ' 个');
-            else parts.push('恢复没有写入任何文件');
+            else parts.push('没有写入任何文件（本机已有配置保持不变）');
             parts.push('快照：' + (d.snapshot || '—'));
           }
+          // 「本机改过的配置被保留」必须显式说明，否则用户会以为恢复没生效
+          const keptCount = Number.isFinite(d.keptConflictsCount) ? d.keptConflictsCount : kept.length;
+          if (keptCount > 0) {
+            parts.push('按你的选择保留了本机 ' + keptCount + ' 个改过的配置' +
+              (kept.length ? '（' + kept.slice(0, 5).join('、') + (keptCount > 5 ? ' 等' : '') + '）' : ''));
+          }
+          const keptLocal = Number.isFinite(d.keptLocalOnlyCount) ? d.keptLocalOnlyCount : 0;
+          if (keptLocal > 0) parts.push('保留了本机独有的 ' + keptLocal + ' 个配置');
           const removedCount = Number.isFinite(d.removedCount) ? d.removedCount : (Array.isArray(d.removed) ? d.removed.length : 0);
           const removeFailed = Array.isArray(d.removeFailed) ? d.removeFailed : [];
           if (removedCount > 0) {
@@ -1258,7 +1394,7 @@ window.__ModuleLoader__.load({
           confirmLabel: confirm ? confirm.confirmLabel : '确定',
           confirmVariant: confirm ? confirm.confirmVariant : 'primary',
           busy: anyBusy,
-          onCancel: () => { if (!anyBusy) setConfirm(null); },
+          onCancel: () => { if (!anyBusy) { setConfirm(null); setPreview(null); } },
           onConfirm: () => { if (confirm && !anyBusy) confirm.run(); },
         }),
       );

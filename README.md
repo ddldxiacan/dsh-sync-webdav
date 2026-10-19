@@ -7,7 +7,7 @@
 
 > 适用于 [DeepSeek Harness](https://github.com/deepseek-ai) 的双半区插件（Host + Client），零 npm 依赖。
 >
-> 版本 **0.4.1**。要求 DSH **>= 0.2.1-rc.2**（端点栅栏用到 `connection.requestRejection`，profile 判定用到 `ctx.profileContext`）；已在 **0.2.1-rc.2 / Web 版**实测。
+> 版本 **0.4.2**。要求 DSH **>= 0.2.1-rc.2**（端点栅栏用到 `connection.requestRejection`，profile 判定用到 `ctx.profileContext`）；已在 **0.2.1-rc.2 / Web 版**实测。
 >
 > 下限写 `0.2.1-rc.2` 而不是 `0.2.1` 是有意的：按 semver 规范，预发布版本 **不满足** `>=0.2.1` 这种不含预发布标识的范围，
 > 而下限若写 `>=0.2.1`，正在跑 `0.2.1-rc.2` 的机器会被宿主的 `engines.dsh` 校验判为 `incompatible-version`、直接装不上。
@@ -27,9 +27,9 @@ dsh-sync 把这件事变成两个按钮：**备份**（加密上传）和**恢�
 | 服务器配置 | WebDAV URL、用户名、密码、远程目录；「保存并测试连接」会真实发起 PROPFIND/MKCOL 验证 |
 | 状态区 | 远端可达性、备份条目（名称/大小/时间）、最近一次本地快照 |
 | 备份 | 输入口令 → 打包 `~/.dsh` → AES-256-GCM 加密 → PUT 上传 |
-| 恢复 | 选一个备份（或「恢复最新」）→ 确认 → 自动先做本地快照 → 解密后把配置对齐到该备份（多出来的配置文件会删掉）→ 改写源机器路径 → 自动安装缺失插件 |
+| 恢复 | 选一个备份（或「恢复最新」）→ 看差异预览并选恢复方式（只补缺失 / 覆盖同名 / 完全覆盖）→ 确认 → 自动先做本地快照 → 解密后按所选方式落地 → 改写源机器路径 → 自动安装缺失插件 |
 | 删除 | 远端备份列表里每一份都可以单独删除 |
-| 回滚 | 从本地快照列表还原 |
+| 回滚 | 从本地快照列表还原（始终是对齐到快照，不提供「只补缺失」——快照是同一台机器的历史状态） |
 | 插件重装 | 恢复后检测到插件依赖缺失 → 点「重装插件」→ 自动改写 `link:` 依赖并执行 pnpm install |
 | 版本升级 | 打开设置页自动检查新版本；有新版时一键升级本插件自身（升级前自动备份，失败可回滚） |
 
@@ -47,8 +47,23 @@ dsh-sync 把这件事变成两个按钮：**备份**（加密上传）和**恢�
 1. **先装上本插件**（`github:ddldxiacan/dsh-sync-webdav`，或本地路径），重启 DSH
 2. 在设置卡片填入**同一套** WebDAV 配置
 3. 输入**同一个口令** → 选备份 → 点「恢复」
-4. 等卡片提示插件安装完成（备份不含 `node_modules`，插件代码要在这台电脑重新装）。安装结束前不要重启
-5. 重启 DSH
+4. 在确认弹窗里看差异预览，并选恢复方式（见下节）
+5. 等卡片提示插件安装完成（备份不含 `node_modules`，插件代码要在这台电脑重新装）。安装结束前不要重启
+6. 重启 DSH
+
+### B 机已经配好皮肤/插件，恢复会覆盖掉吗？
+
+**不会——默认就不会。** 恢复确认弹窗会先比对本机与这份备份，显示「本机缺少 N 个 / 内容相同 N 个 / 内容不同 N 个 / 本机独有 N 个」，并点出具体是哪些文件，然后让你选：
+
+| 恢复方式 | 备份里的文件 | 本机已有的同名配置 | 本机独有的配置（备份里没有） |
+|---|---|---|---|
+| **只补缺失**（默认） | 本机没有的才写入 | **原样保留**（内容不同的列进结果里「已保留」） | 保留 |
+| 覆盖同名配置 | 全部覆盖写入 | 被备份覆盖 | 保留 |
+| 完全覆盖 | 全部覆盖写入 | 被备份覆盖 | **删除**，与源机器一模一样 |
+
+想「B 机和 A 机完全一致」选**完全覆盖**；想「保留我在 B 机改的皮肤和设置、只把缺的补上」保持默认的**只补缺失**即可。内容是全新机器（`~/.dsh` 里没有多余配置）时，两者结果完全一样。
+
+被保留的冲突文件会在恢复结果里逐个列出，不会静默放过：看到「按你的选择保留了本机 N 个改过的配置」就说明这些文件没有被备份覆盖——想用备份版本，改选「覆盖同名配置」或「完全覆盖」再恢复一次即可（恢复前仍会自动快照，可回滚）。
 
 第 4 步会自动做两件事，否则另一台电脑上的插件会全部显示「包不可用」：
 
@@ -182,7 +197,7 @@ git push origin main --tags
   该权限在 POSIX 上直接生效；Windows 上由 NTFS 用户目录 ACL 兜底（`chmod` 基本无效，属平台限制）
 - **端点鉴权**：所有 `/dsh-sync/*` 走宿主的 Host/Origin 栅栏 + 浏览器 cookie 认证，与 `/api` 同一套；`connection` 缺失时只放行 loopback
 - **不回传明文密码**：`/status` 只回 `hasPassword`，设置页也不再回显密码（留空=沿用已保存的）
-- **覆盖策略**：恢复与回滚都会把**配置范围**对齐到所选备份或快照。备份里的文件覆盖现有文件；备份里没有的配置文件会删掉，因此变空的目录一并去掉。配置范围就是打包规则会收进去的路径。聊天记录（`sessions/`）、聊天文件（`attachments/`）、聊天派生数据、`dsh-runtimes/`、`node_modules/`、日志、缓存和大于 50MB 的文件**不在备份里，恢复时也不删除**——否则会删掉运行时导致 DSH 起不来，或丢掉聊天记录。旧备份若完全没有应用级设置（没有 `__appdata__/` 条目，也没有 `meta.appDataIncluded`），不会据此清空本机 AppData 配置。
+- **恢复方式（0.4.2 起由用户选）**：确认弹窗会先比对本机与备份，列出「本机缺少 / 内容相同 / 内容不同 / 本机独有」各有多少，再由你选一种方式：**只补缺失（默认）**——本机已有的配置一律不动，只补本机没有的文件；**覆盖同名配置**——备份里的文件全部覆盖写入，但本机多出来的配置保留；**完全覆盖**——覆盖写入并删掉备份里没有的配置，与源机器一模一样。被保留的冲突文件会在结果里逐个回报。全新机器上「只补缺失」与「完全覆盖」结果相同。配置范围就是打包规则会收进去的路径。聊天记录（`sessions/`）、聊天文件（`attachments/`）、聊天派生数据、`dsh-runtimes/`、`node_modules/`、日志、缓存和大于 50MB 的文件**不在备份里，恢复时也不删除**——否则会删掉运行时导致 DSH 起不来，或丢掉聊天记录。旧备份若完全没有应用级设置（没有 `__appdata__/` 条目，也没有 `meta.appDataIncluded`），不会据此清空本机 AppData 配置。
 
 ## 安装
 
@@ -242,7 +257,7 @@ dsh plugin --profile <你的profile> install "E:\完整路径\dsh-sync-webdav"
 dsh-sync-webdav/
 ├── package.json        # name: dsh-sync-webdav，声明 dsh.bundle.patch 与 dsh.client
 ├── cordis.patch.yml    # 注册 dsh-sync 服务（name 与 package.json 一致）
-├── index.js            # Host 半区：打包/加密/WebDAV/恢复/回滚/插件重装 + 11 个 HTTP 端点
+├── index.js            # Host 半区：打包/加密/WebDAV/恢复/回滚/插件重装 + 12 个 HTTP 端点
 ├── client.js           # Client 半区：设置页卡片
 └── tools-selftest.mjs  # 自测（含 mock WebDAV 服务器与 B 机恢复 E2E）
 ```
@@ -307,7 +322,7 @@ header: { version, salt(b64), iv(b64), tag(b64), payloadSha256 }
 node tools-selftest.mjs
 ```
 
-预期自测全绿（`0 failed`）。覆盖：排除规则（含 `node_modules`/`sessions` 回归断言）、加解密往返、错误口令与篡改拒绝、打包/解包、备份 `meta` 与旧备份向后兼容、快照与回滚（含「`dsh-runtimes/` 必须在回滚后存活」的回归断言）、路径穿越防护、`link:` → 仓库 spec 改写、**B 机恢复 E2E**（A 机备份 → B 机恢复 → 重装插件依赖）、**异步 runner 不阻塞事件循环**（含「源码中不得出现 `spawnSync(`」防退化护栏），一个内置 mock WebDAV 服务器上的 Basic Auth / MKCOL / PUT / GET / PROPFIND 全链路，以及 v0.4.0 新增的回归断言：`PATH` 兜底的各条分支（原生启动器直接执行 / 旁有 `bin/pnpm.mjs` 时用脚本 / Windows `.CMD` 外壳经 cmd.exe / 完全没有 pnpm 时给出「npm i -g pnpm」提示）、`resolveProfile` 优先采信 `profileContext.name`、`requestRejection` 返回 401/403 时 11 个端点全部不进入业务逻辑、`connection` 缺失时 fail-closed、安装失败还原 `package.json`、`parseIgnoredBuildScripts` 与 `allowBuilds` 写入。
+预期自测全绿（`0 failed`）。覆盖：排除规则（含 `node_modules`/`sessions` 回归断言）、加解密往返、错误口令与篡改拒绝、打包/解包、备份 `meta` 与旧备份向后兼容、快照与回滚（含「`dsh-runtimes/` 必须在回滚后存活」的回归断言）、路径穿越防护、`link:` → 仓库 spec 改写、**B 机恢复 E2E**（A 机备份 → B 机恢复 → 重装插件依赖）、**异步 runner 不阻塞事件循环**（含「源码中不得出现 `spawnSync(`」防退化护栏），一个内置 mock WebDAV 服务器上的 Basic Auth / MKCOL / PUT / GET / PROPFIND 全链路，以及 v0.4.0 新增的回归断言：`PATH` 兜底的各条分支（原生启动器直接执行 / 旁有 `bin/pnpm.mjs` 时用脚本 / Windows `.CMD` 外壳经 cmd.exe / 完全没有 pnpm 时给出「npm i -g pnpm」提示）、`resolveProfile` 优先采信 `profileContext.name`、`requestRejection` 返回 401/403 时 12 个端点全部不进入业务逻辑、`connection` 缺失时 fail-closed、安装失败还原 `package.json`、`parseIgnoredBuildScripts` 与 `allowBuilds` 写入，以及 v0.4.2 新增的**恢复方式**回归断言：`merge` 只写本机缺少的文件且保留本机改过的同名配置、`overwrite` 覆盖同名但保留本机独有配置、`mirror` 覆盖并删除本机独有配置、三种模式都不删聊天记录与运行时、`planPayloadApply` 预览不写盘且把「新增/相同/冲突/本机独有」分开报、未知 mode 回落默认 `merge`。
 
 ## 已知限制
 
