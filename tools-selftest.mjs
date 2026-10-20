@@ -30,6 +30,7 @@ import {
   parseIgnoredBuildScripts, parsePnpmAllowBuilds, readAllowBuilds, approveBuilds, isLoopbackRequest,
   applyPayloadMode, planPayloadApply, normalizeRestoreMode, DEFAULT_RESTORE_MODE, RESTORE_MODES,
   pathsEqual, isUnderDir, __setAppDataPlatformForTest,
+  planProfileRemap, remapPayloadPath, payloadProfileNames,
 } from './index.js'
 
 const APPDATA_PROBE = '__appdata__/dsh-desktop/desktop/settings.json'
@@ -192,7 +193,12 @@ try {
     const dsh = join(mirrorRoot, 'dsh')
     const roaming = join(mirrorRoot, 'roaming')
     const prevAppData = process.env.APPDATA
+    const prevXdg = process.env.XDG_CONFIG_HOME
+    // v0.4.4 起 Linux/macOS 不再读 APPDATA（Windows 专属），改按平台解析：Linux 走 XDG_CONFIG_HOME。
+    // 本用例验证的是「AppData 范围内的配置能被备份/恢复/删除」，与路径来源无关，
+    // 所以两个变量指向同一临时目录，任何平台都能真实跑到这条分支。
     process.env.APPDATA = roaming
+    process.env.XDG_CONFIG_HOME = roaming
     try {
       mkdirSync(join(dsh, 'profiles', 'desktop', 'node_modules', 'plugin'), { recursive: true })
       mkdirSync(join(dsh, 'sessions'), { recursive: true })
@@ -245,6 +251,8 @@ try {
     } finally {
       if (prevAppData === undefined) delete process.env.APPDATA
       else process.env.APPDATA = prevAppData
+      if (prevXdg === undefined) delete process.env.XDG_CONFIG_HOME
+      else process.env.XDG_CONFIG_HOME = prevXdg
       try { rmSync(mirrorRoot, { recursive: true, force: true }) } catch (e) { /* ignore */ }
     }
   }
@@ -1518,15 +1526,30 @@ check('depKind: registry 版本号', depKind('^0.4.6') === 'registry' && depKind
   check('状态码: 方法不匹配回 405', wrongMethod.status === 405 && wrongMethod.headers.allow === 'GET', JSON.stringify(wrongMethod))
 
   // 10.4 dsh-sync.json 落盘权限收紧
+  //
+  // 旧用例拿 http://127.0.0.1:1/ 当保存目标——那是个必然 ECONNREFUSED 的地址，
+  // handleConfig 在「先测连通性、连不上就不保存」这步就返回了，**根本没写文件**，
+  // 于是断言读到的还是用例自己预置的 0664。凡是跑不出 1 端口的主机（含 CI）都恒假失败。
+  // 这里改为起一个真实可达的 mock WebDAV，确保走到落盘分支。
   const modeRoot = join(tmpdir(), 'dsh-sync-mode-' + Date.now())
   mkdirSync(modeRoot, { recursive: true })
-  const hMode = createTestHarness({ root: modeRoot, profile: 'web' })
-  await hMode.handlePassphrase({ passphrase: 'x' })   // 没有配置时是 no-op，改用 configForDisk 路径
-  const cfgFile = join(modeRoot, 'dsh-sync.json')
-  writeFileSync(cfgFile, '{}', { encoding: 'utf8', mode: 0o664 })
-  await hMode.handleConfig({ url: 'http://127.0.0.1:1/', username: 'u', password: 'p', remoteDir: 'dsh-sync' })
-  const mode = process.platform === 'win32' ? null : (statSync(cfgFile).mode & 0o777)
-  check('配置: dsh-sync.json 权限收紧到 0600', mode === null || mode === 0o600, mode === null ? 'Windows 跳过' : '0' + mode.toString(8))
+  const modeSrv = createServer((req, res) => {
+    if (req.method === 'PROPFIND') { res.writeHead(207, { 'Content-Type': 'application/xml' }); return res.end('<?xml version="1.0"?><D:multistatus xmlns:D="DAV:"></D:multistatus>') }
+    res.writeHead(201); res.end()
+  })
+  await new Promise((r) => modeSrv.listen(0, '127.0.0.1', r))
+  const modeUrl = 'http://127.0.0.1:' + modeSrv.address().port + '/dav/'
+  try {
+    const hMode = createTestHarness({ root: modeRoot, profile: 'web' })
+    const cfgFile = join(modeRoot, 'dsh-sync.json')
+    writeFileSync(cfgFile, '{}', { encoding: 'utf8', mode: 0o664 })
+    const saved = await hMode.handleConfig({ url: modeUrl, username: 'u', password: 'p', remoteDir: 'dsh-sync' })
+    check('配置: 可达 WebDAV 时 handleConfig 真正保存成功（旧用例此处静默失败）', saved.ok === true, JSON.stringify(saved))
+    const mode = process.platform === 'win32' ? null : (statSync(cfgFile).mode & 0o777)
+    check('配置: dsh-sync.json 权限收紧到 0600', mode === null || mode === 0o600, mode === null ? 'Windows 跳过' : '0' + mode.toString(8))
+  } finally {
+    await new Promise((r) => modeSrv.close(r))
+  }
 
   // 10.5 安装失败必须还原 package.json（P1-2）
   const restoreRoot = join(tmpdir(), 'dsh-sync-restore-' + Date.now())
@@ -2208,6 +2231,94 @@ check('depKind: registry 版本号', depKind('^0.4.6') === 'registry' && depKind
   check('参数容错: planPayloadApply 收到无效的第三参数仍能工作（不退化成崩溃）',
     !crashed && out && out.totals && typeof out.totals.bundle === 'number',
     crashed ? crashed.message : JSON.stringify(out && out.totals))
+}
+
+// ---------- 16. profile 重映射：跨平台恢复（v0.4.6 回归） ----------
+//
+// 这一节锁死的是「数据丢失级」缺陷，删掉任何一条断言都会让旧行为回来：
+// Windows 桌面版固定 profiles/desktop，Linux 的 dsh web 固定 profiles/web。
+// 旧版把备份里 profiles/desktop/... 原样落地，于是：
+//   1) 目标机加载的是 web，配置「恢复了但没生效」；
+//   2) mirror 模式把目标机自己的 profiles/web/* 当成多余配置**整棵删除**
+//      —— 插件依赖、cordis.patch.yml 一起没了。
+{
+  const remapRoot = join(tmpdir(), 'dsh-sync-remap-' + Date.now())
+  try {
+    // --- 单元：映射决策 ---
+    const mkPayload = (files, profile) => {
+      const dir = join(remapRoot, 'src-' + Math.random().toString(36).slice(2))
+      mkdirSync(dir, { recursive: true })
+      for (const f of files) {
+        mkdirSync(dirname(join(dir, f)), { recursive: true })
+        writeFileSync(join(dir, f), 'x', 'utf8')
+      }
+      return buildPayload(dir, files, { dshVersion: '1', profile, createdAt: new Date().toISOString(), linkMap: {}, unmapped: {} }, [])
+    }
+    const pDesktop = mkPayload(['profiles/desktop/package.json', 'profiles/desktop/cordis.patch.yml', 'settings.yaml'], 'desktop')
+    const pWeb = mkPayload(['profiles/web/package.json', 'profiles/web/cordis.patch.yml'], 'web')
+
+    check('重映射: 能从备份里提出源 profile 名', JSON.stringify(payloadProfileNames(pDesktop)) === '["desktop"]', JSON.stringify(payloadProfileNames(pDesktop)))
+    check('重映射: desktop 备份 → web 目标得到 desktop→web',
+      JSON.stringify(planProfileRemap(pDesktop, 'web').map) === '{"desktop":"web"}', JSON.stringify(planProfileRemap(pDesktop, 'web').map))
+    check('重映射: desktop 备份 → desktop 目标是恒等（同平台行为与旧版一致）',
+      Object.keys(planProfileRemap(pDesktop, 'desktop').map).length === 0)
+    check('重映射: web 备份 → desktop 目标得到 web→desktop',
+      JSON.stringify(planProfileRemap(pWeb, 'desktop').map) === '{"web":"desktop"}', JSON.stringify(planProfileRemap(pWeb, 'desktop').map))
+    check('重映射: 只改 profiles/<name>/ 一段，不动顶层文件',
+      remapPayloadPath('settings.yaml', planProfileRemap(pDesktop, 'web')) === 'settings.yaml')
+    check('重映射: 不动 __appdata__ 挂载点（它只是平台挂载标记，不是 profile）',
+      remapPayloadPath('__appdata__/dsh-desktop/desktop/settings.json', planProfileRemap(pDesktop, 'web'))
+        === '__appdata__/dsh-desktop/desktop/settings.json')
+    check('重映射: 自定义 profile 名不被乱猜',
+      Object.keys(planProfileRemap(mkPayload(['profiles/alpha/a.json'], 'alpha'), 'beta').map).length === 0)
+
+    // --- 端到端：Windows(desktop) 备份 → Linux(web) 恢复 ---
+    const bRoot = join(remapRoot, 'B', 'dsh')
+    mkdirSync(join(bRoot, 'profiles', 'web'), { recursive: true })
+    writeFileSync(join(bRoot, 'profiles', 'web', 'package.json'), '{"name":"linux-own"}', 'utf8')
+    writeFileSync(join(bRoot, 'profiles', 'web', 'pnpm-workspace.yaml'), 'packages:\n  - .\n', 'utf8')
+    const remap = planProfileRemap(pDesktop, 'web')
+    const applied = applyPayloadMode(pDesktop, bRoot, 'overwrite', { remap })
+    check('跨平台 Win→Linux: 配置落到本机 profiles/web（而不是 profiles/desktop）',
+      existsSync(join(bRoot, 'profiles', 'web', 'cordis.patch.yml')))
+    check('跨平台 Win→Linux: 不再凭空创建 profiles/desktop（目标机根本不加载它）',
+      !existsSync(join(bRoot, 'profiles', 'desktop')))
+    check('跨平台 Win→Linux: 逐条回报重映射明细',
+      Array.isArray(applied.remapped) && applied.remapped.length === 2 &&
+      applied.remapped.every((x) => x.from.startsWith('profiles/desktop/') && x.to.startsWith('profiles/web/')),
+      JSON.stringify(applied.remapped))
+
+    // --- 端到端：mirror 不得删掉本机 profile（旧版会整棵删） ---
+    const mRoot = join(remapRoot, 'M', 'dsh')
+    mkdirSync(join(mRoot, 'profiles', 'web'), { recursive: true })
+    writeFileSync(join(mRoot, 'profiles', 'web', 'package.json'), '{"name":"must-survive"}', 'utf8')
+    writeFileSync(join(mRoot, 'profiles', 'web', 'cordis.patch.yml'), '- id: must-survive\n', 'utf8')
+    const mirrorRes = applyPayloadMode(pDesktop, mRoot, 'mirror', { remap })
+    check('跨平台 mirror: 本机 profiles/web 不因「备份里没有」被删除（旧版数据丢失点）',
+      existsSync(join(mRoot, 'profiles', 'web', 'package.json')),
+      'removed=' + JSON.stringify(mirrorRes.removed))
+    check('跨平台 mirror: 本机自有配置仍在（cordis.patch.yml 被备份内容覆盖属预期）',
+      existsSync(join(mRoot, 'profiles', 'web', 'pnpm-workspace.yaml')) ||
+      existsSync(join(mRoot, 'profiles', 'web', 'cordis.patch.yml')))
+
+    // --- 反向：Linux(web) 备份 → Windows(desktop) 恢复 ---
+    const wRoot = join(remapRoot, 'W', 'dsh')
+    mkdirSync(join(wRoot, 'profiles', 'desktop'), { recursive: true })
+    writeFileSync(join(wRoot, 'profiles', 'desktop', 'package.json'), '{"name":"win-own"}', 'utf8')
+    applyPayloadMode(pWeb, wRoot, 'overwrite', { remap: planProfileRemap(pWeb, 'desktop') })
+    check('跨平台 Linux→Win: 配置落到 profiles/desktop', existsSync(join(wRoot, 'profiles', 'desktop', 'cordis.patch.yml')))
+    check('跨平台 Linux→Win: 不再创建 profiles/web', !existsSync(join(wRoot, 'profiles', 'web')))
+
+    // --- 同平台恢复必须零行为变化 ---
+    const sRoot = join(remapRoot, 'S', 'dsh')
+    mkdirSync(join(sRoot, 'profiles', 'desktop'), { recursive: true })
+    const sameRes = applyPayloadMode(pDesktop, sRoot, 'overwrite', { remap: planProfileRemap(pDesktop, 'desktop') })
+    check('同平台 desktop→desktop: 路径不变、无重映射明细',
+      sameRes.remapped.length === 0 && existsSync(join(sRoot, 'profiles', 'desktop', 'cordis.patch.yml')),
+      JSON.stringify(sameRes.remapped))
+  } finally {
+    try { rmSync(remapRoot, { recursive: true, force: true }) } catch (e) { /* ignore */ }
+  }
 }
 
 console.log('\n==== ' + pass + ' passed, ' + fail + ' failed ====')

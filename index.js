@@ -543,9 +543,95 @@ function parsePayloadObject(payload) {
   } catch (e) { return null }
 }
 
+// ============================================================
+// profile 名重映射（v0.4.6，跨平台恢复的关键）
+// ============================================================
+// 背景：profile 名是**跟平台绑定的**——Windows 桌面版固定用 profiles/desktop，
+// Linux/macOS 的 `dsh web` 用 profiles/web。备份里存的是源机器那一套相对路径
+// （profiles/desktop/package.json …），目标机上如果直接按原路径落地：
+//
+//   1) Desktop 备份 → Web 机器：写进 profiles/desktop/，而目标机实际加载的是 profiles/web，
+//      于是「恢复成功」但配置一个都没生效；更糟的是 mirror 模式会把目标机自己的
+//      profiles/web/* 当成「备份里没有的多余配置」**整棵删掉**（插件依赖、cordis.patch.yml
+//      全没了，DSH 起来后插件全部消失）。
+//   2) Web 备份 → Desktop 机器：同样写进 profiles/web/，桌面版不认。
+//   3) desktop ↔ desktop、web ↔ web：名字相同，映射为恒等，行为与旧版完全一致。
+//
+// 因此恢复时必须把备份里的 profiles/<源名>/... 换成本机**正在使用**的 profile 名。
+// 只重映射 profiles/<name>/ 这一层，其余路径（含 __appdata__/ 挂载点）原样不动；
+// 本机不使用 desktop/web 这套名字（自定义 profile）时，退化为按名字匹配，绝不乱猜。
+const PROFILE_DIR_RE = /^profiles\/([^/]+)\/(.*)$/
+
+/** 备份里出现的 profile 名（去重、排序），供界面提示与测试断言用。 */
+export function payloadProfileNames(payload) {
+  const parsed = parsePayloadObject(payload)
+  if (!parsed) return []
+  const names = new Set()
+  for (const f of parsed.files) {
+    if (!f || typeof f.path !== 'string') continue
+    const m = PROFILE_DIR_RE.exec(f.path)
+    if (m) names.add(m[1])
+  }
+  return [...names].sort()
+}
+
+/**
+ * 决定「备份里的 profile 名 → 本机 profile 名」的映射。
+ *
+ * targetProfile 是本机实际在跑的 profile 名（调用方传 resolveProfile().name）。
+ * 规则（宁可不改，也不猜错）：
+ *   - 备份里根本没有 profiles/ 条目 → 无映射
+ *   - 备份含本机目标名 → 恒等（同平台恢复，零行为变化）
+ *   - 只有「源名与目标名都是平台标准名（desktop / web）」才重映射。
+ *     理由：跨平台差异**只**发生在 desktop↔web 这两个固定名之间（桌面版固定 desktop、
+ *     `dsh web` 固定 web）。自定义 profile 名（如 alpha→beta）属于用户自己的改名，
+ *     备份里没有任何信息能断定它是「同一套配置换了名字」，强行改名会把配置写进
+ *     一个用户没打算用的 profile，属于静默猜错，因此保持原样。
+ *   - 多 profile 的备份：只在目标名不在其中、且恰好一个平台标准名时映射它，避免把
+ *     A 机的 desktop 与 web 混成一个。
+ */
+export function planProfileRemap(payload, targetProfile) {
+  const target = String(targetProfile || '').trim()
+  const names = payloadProfileNames(payload)
+  if (!target || names.length === 0) return { map: {}, from: null, to: null, names }
+  if (names.includes(target)) return { map: {}, from: target, to: target, names }
+  const isPlatformName = (n) => n === 'desktop' || n === 'web'
+  // 跨平台映射只在两端都是标准名时成立
+  if (names.length === 1) {
+    const from = names[0]
+    if (isPlatformName(from) && isPlatformName(target)) {
+      return { map: { [from]: target }, from, to: target, names }
+    }
+    return { map: {}, from: null, to: null, names }
+  }
+  // 多 profile：只映射唯一那个平台标准名，其余维持原样
+  const platformNames = names.filter(isPlatformName)
+  if (platformNames.length === 1 && isPlatformName(target)) {
+    const from = platformNames[0]
+    return { map: { [from]: target }, from, to: target, names }
+  }
+  return { map: {}, from: null, to: null, names }
+}
+
+/** 按映射改写一条备份内相对路径；不需要改写时原样返回。 */
+export function remapPayloadPath(relPath, remap) {
+  const m = remap && remap.map ? remap : null
+  if (!m) return relPath
+  const hit = PROFILE_DIR_RE.exec(relPath)
+  if (!hit) return relPath
+  const next = m.map[hit[1]]
+  if (!next || next === hit[1]) return relPath
+  return 'profiles/' + next + '/' + hit[2]
+}
+
 /** 解析 payload 里路径合法、能落到本机的条目 [{ path, sha256, buffer, abs }]，附带非法条目清单。
- *  payload 本身不合法时抛错，且错误信息是给用户看的（不是 at position ... 这种）。 */
-function payloadValidEntries(payload, root) {
+ *  payload 本身不合法时抛错，且错误信息是给用户看的（不是 at position ... 这种）。
+ *
+ *  v0.4.6：opts.remap 给出 profile 名映射后，条目额外带 srcPath（备份里的原始路径）
+ *  与 destPath（实际落地路径），二者不同即表示这次恢复发生了跨 profile 迁移。 */
+function payloadValidEntries(payload, root, opts) {
+  const o = opts || {}
+  const remap = o.remap || null
   const parsed = parsePayloadObject(payload)
   if (!parsed) throw new Error('备份内容不是有效的配置清单（JSON 解析失败或缺少 files 数组），无法恢复')
   const files = Array.isArray(parsed.files) ? parsed.files : []
@@ -560,12 +646,19 @@ function payloadValidEntries(payload, root) {
       invalid.push({ path: f.path, reason: '路径不安全（含 ..、盘符或绝对路径）' })
       continue
     }
-    const abs = f.path.startsWith(APPDATA_PREFIX) ? appDataAbsPath(f.path) : join(root, f.path)
-    if (!abs) {
-      invalid.push({ path: f.path, reason: '无法解析到本地路径' })
+    // 重映射只改 profiles/<name>/ 这一段。改完必须再过一次 isSafeRelPath：
+    // 目标名来自本机 profile 解析，理论上安全，但绝不能因为多一层字符串拼接就放松校验。
+    const destPath = remapPayloadPath(f.path, remap)
+    if (destPath !== f.path && !isSafeRelPath(destPath)) {
+      invalid.push({ path: f.path, reason: '重映射后的路径不安全' })
       continue
     }
-    entries.push({ path: f.path, sha256: f.sha256, buffer: Buffer.from(f.data, 'base64'), abs })
+    const abs = destPath.startsWith(APPDATA_PREFIX) ? appDataAbsPath(destPath) : join(root, destPath)
+    if (!abs) {
+      invalid.push({ path: destPath, reason: '无法解析到本地路径' })
+      continue
+    }
+    entries.push({ path: destPath, srcPath: f.path, sha256: f.sha256, buffer: Buffer.from(f.data, 'base64'), abs })
   }
   return { entries, invalid }
 }
@@ -575,12 +668,13 @@ function payloadValidEntries(payload, root) {
  * 恢复确认弹窗用它把「会改动哪些配置」摊开给用户，让模式选择有依据。
  * 冲突 = 本机已有该文件、但内容与备份不同；localOnly = 本机配置范围内、备份里没有的文件（mirror 会删掉它们）。
  */
-export function planPayloadApply(payload, root, parsedEntries) {
+export function planPayloadApply(payload, root, parsedEntries, opts) {
+  const o = opts || {}
   // 第三个参数是内部优化（复用已解析条目）。传进来的东西不对就自己重解析，
   // 不能让一个可选优化参数把整次预览打崩。
   let parsed = parsedEntries
   if (!parsed || !Array.isArray(parsed.entries) || !Array.isArray(parsed.invalid)) {
-    parsed = payloadValidEntries(payload, root)
+    parsed = payloadValidEntries(payload, root, { remap: o.remap })
   }
   const { entries, invalid } = parsed
   const added = []
@@ -652,9 +746,12 @@ function keepLocalPassphrase(rel, abs, incoming) {
 export function applyPayloadMode(payload, root, mode, opts) {
   const o = opts || {}
   const m = normalizeRestoreMode(mode)
-  const parsed = payloadValidEntries(payload, root)
+  const parsed = payloadValidEntries(payload, root, { remap: o.remap })
   const entries = parsed.entries
   const plan = planPayloadApply(payload, root, parsed)
+  // 跨 profile 迁移的条目：备份里叫 profiles/desktop/x，本机落到 profiles/web/x。
+  // 必须逐条回报——否则用户只看到「恢复成功 N 个文件」，却不知道该去哪个 profile 下找。
+  const remapped = entries.filter((e) => e.srcPath && e.srcPath !== e.path).map((e) => ({ from: e.srcPath, to: e.path }))
   const held = new Set()
   if (m === 'merge') {
     for (const p of plan.unchanged) held.add(p)
@@ -704,6 +801,7 @@ export function applyPayloadMode(payload, root, mode, opts) {
     keptLocalOnly: m === 'mirror' ? [] : plan.localOnly,
     unchanged: plan.unchanged,
     added: plan.added,
+    remapped,
     totals: plan.totals,
   }
 }
@@ -2507,7 +2605,10 @@ export function apply(ctx, config) {
     if (!parsePayloadObject(got.payload)) {
       return { ok: false, error: '这份备份的内容不是有效的配置清单，无法比对差异。' }
     }
-    const plan = planPayloadApply(got.payload, dshRoot)
+    // 跨平台恢复的核心：备份里 profiles/<源 profile>/ 要换成本机正在跑的那个 profile。
+    // Windows 桌面版固定 desktop、dsh web 固定 web——不换的话配置会落进目标机根本不加载的目录。
+    const remap = planProfileRemap(got.payload, resolveProfile().name)
+    const plan = planPayloadApply(got.payload, dshRoot, undefined, { remap })
     const meta = extractPayloadMeta(got.payload)
     log('restore preview ' + got.name + ': ' + plan.totals.bundle + ' files, ' +
         plan.totals.added + ' new, ' + plan.totals.conflicts + ' conflicts, ' + plan.totals.localOnly + ' local-only')
@@ -2529,6 +2630,12 @@ export function apply(ctx, config) {
         { id: 'mirror', label: '完全覆盖（与备份一模一样）', effect: '覆盖写入，并删除本机多出来、备份里没有的配置。' },
       ],
       meta: meta ? { profile: meta.profile, createdAt: meta.createdAt } : undefined,
+      // 跨平台提示：备份是 desktop、本机跑 web 时，界面要明确告诉用户「配置会被搬到 web」。
+      // 不给这条信息，用户会以为恢复的是另一个 profile，或者疑惑为什么路径对不上。
+      profileRemap: remap.from && remap.to && remap.from !== remap.to
+        ? { from: remap.from, to: remap.to, note: '备份来自 ' + remap.from + ' profile，本机使用 ' + remap.to + '，恢复时会自动写到本机 profile 下' }
+        : null,
+      targetProfile: remap.to || null,
     }
   }
 
@@ -2548,7 +2655,9 @@ export function apply(ctx, config) {
     // 恢复前先本地快照（安全性快照，本身就是回滚目标）：任何模式都可回滚
     lastLocalSnapshot = makeSnapshot(dshRoot, snapshotRoot, SNAPSHOT_KEEP)
     // 按模式落地：merge 只补缺失 / overwrite 覆盖但不删 / mirror 完全对齐。排除项一律不动。
-    const r = applyPayloadMode(payload, dshRoot, mode)
+    // 与预览用同一套映射规则：预览说会写到哪里，这里就必须写到哪里。
+    const remap = planProfileRemap(payload, resolveProfile().name)
+    const r = applyPayloadMode(payload, dshRoot, mode, { remap })
     // 源机器的 file: 绝对路径和 pnpm storeDir 在这台电脑上不存在。不改的话，
     // 接下来的 pnpm install 会整批失败，package.json 里的插件全部显示「包不可用」。
     let portability = { profiles: [] }
@@ -2590,6 +2699,11 @@ export function apply(ctx, config) {
       snapshot: lastLocalSnapshot,
       portability,
       meta: meta ? { profile: meta.profile, linkCount: Object.keys(meta.linkMap || {}).length } : undefined,
+      // 跨 profile 迁移明细：让界面能说清「备份里的 desktop 配置写到了本机 web」。
+      profileRemap: remap.from && remap.to && remap.from !== remap.to
+        ? { from: remap.from, to: remap.to, count: (r.remapped || []).length }
+        : null,
+      remapped: (r.remapped || []).slice(0, 40),
     }
   }
 

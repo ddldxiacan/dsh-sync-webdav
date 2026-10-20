@@ -7,7 +7,7 @@
 
 > 适用于 [DeepSeek Harness](https://github.com/deepseek-ai) 的双半区插件（Host + Client），零 npm 依赖。
 >
-> 版本 **0.4.5**。要求 DSH **>= 0.2.1-rc.2**（端点栅栏用到 `connection.requestRejection`，profile 判定用到 `ctx.profileContext`）；已在 **0.2.1-rc.2 / Web 版**实测。
+> 版本 **0.4.6**。要求 DSH **>= 0.2.1-rc.2**（端点栅栏用到 `connection.requestRejection`，profile 判定用到 `ctx.profileContext`）；已在 **0.2.1-rc.2 / Web 版**实测。
 >
 > 下限写 `0.2.1-rc.2` 而不是 `0.2.1` 是有意的：按 semver 规范，预发布版本 **不满足** `>=0.2.1` 这种不含预发布标识的范围，
 > 而下限若写 `>=0.2.1`，正在跑 `0.2.1-rc.2` 的机器会被宿主的 `engines.dsh` 校验判为 `incompatible-version`、直接装不上。
@@ -92,6 +92,20 @@ dsh-sync 把这件事变成两个按钮：**备份**（加密上传）和**恢�
 | 远端列表为空 / 「远端没有备份」 | WebDAV 配置与 A 机不一致，或远程目录填错 | 核对 url/username/password/remoteDir |
 
 **v0.3.1 起**：恢复成功后提示会明确报告「已恢复 N 个文件（逐文件校验通过）+ 快照名 + 需重启」，被跳过/校验失败的文件会逐个列出，不再静默。
+
+## 更新说明
+
+### v0.4.6 — 跨平台恢复不再丢配置（重要）
+
+修掉一个**数据丢失级**缺陷，凡是换过平台（Windows ↔ Linux/macOS）用过「完全覆盖」的人都可能踩到：
+
+- **profile 名自动重映射**：Windows 桌面版固定 `profiles/desktop`、`dsh web` 固定 `profiles/web`。旧版把备份里的路径原样落地，导致跨平台恢复时配置写进目标机**不加载**的 profile（看着成功、实际没生效）。现在恢复时自动把 `profiles/<源>/…` 换成本机正在跑的 profile，预览和结果里都会告知。
+- **修掉「完全覆盖」删掉目标机 profile**：旧版会把目标机上「备份里没有的配置」当多余项删除，于是 Linux 自己的 `profiles/web/*`（插件依赖、`cordis.patch.yml`、`pnpm-workspace.yaml`）被整棵删掉。现在 `profiles/web` 保住了，`mirror` 只删真正多余的配置。
+- **同平台恢复零行为变化**：`desktop→desktop`、`web→web` 是恒等映射，与旧版逐字节一致。
+- 自定义 profile 名不猜测，不做映射（避免把配置写进没打算用的 profile）。
+- 顺手修掉 4 个自测自身的平台假设缺陷（用 `127.0.0.1:1` 断言落盘、Linux 上仍读 `APPDATA`），自测从 `386 passed / 4 failed` 变成 **406 passed / 0 failed**。
+
+升级后**必须重启 DeepSeek Harness** 生效。已经用旧版跨平台恢复过的机器，建议重启后确认一次配置是否落在当前 profile 下。
 
 ## 版本升级
 
@@ -203,17 +217,43 @@ git push origin main --tags
 
 插件本身是纯 Node ESM，没有原生依赖，**Windows、Linux、macOS 都能跑**。`dsh web`（纯 CLI，无 Electron）同样支持，只是少了桌面版内置运行时，pnpm 必须自己在 `PATH` 里（见下节）。
 
-三处平台差异已经处理：
+四处平台差异已经处理：
 
 | 事项 | Windows | Linux | macOS |
 |---|---|---|---|
 | Electron 应用级设置根目录 | `%APPDATA%`（`…\AppData\Roaming`） | `$XDG_CONFIG_HOME` 或 `~/.config` | `~/Library/Application Support` |
+| **profile 名** | 桌面版固定 `profiles/desktop` | `dsh web` 固定 `profiles/web` | 同 Linux（`dsh web`） |
 | 路径比较是否区分大小写 | 不区分 | **区分**（`/Home` ≠ `/home`） | 不区分（默认卷） |
 | pnpm 调用形态 | `.CMD` 外壳经 `cmd.exe` | 脚本用 `node`、原生 ELF 直接执行 | 同 Linux |
 
 **符号链接会被跟随**（0.4.5 起）：Linux/macOS 上把 `skins/` 或整个 `~/.dsh` 软链到别处很常见（dotfiles 管理、独立仓库）。旧版本用 `readdir` 的 dirent 判断，软链既不算文件也不算目录，会被**静默跳过** —— 备份看着成功，其实少了整棵配置。现在会跟随链接（含断链跳过、成环检测），并且「完全覆盖」只删链接自身、绝不删它指向的真实文件。
 
 > **0.4.4 修复**：旧版本在 Linux/macOS 上会无条件拼出 `~/AppData/Roaming`。那是 Windows 才有的路径，在 Linux 上并不存在 —— 结果是恢复一份 Windows 备份时会**在你的 home 下凭空创建 `~/AppData/Roaming/@deepseek-ai/…` 这棵假目录树**，而且恢复预览里还会把它报成「本机缺少的配置」。现在按平台解析真实位置，解析不到就跳过，绝不虚构路径。
+
+### 跨平台恢复会自动重映射 profile（0.4.6 起）
+
+**profile 名是跟平台绑定的**：Windows 桌面版固定用 `profiles/desktop`，Linux/macOS 的 `dsh web` 固定用 `profiles/web`。备份里存的是源机器那一套相对路径，旧版本直接按原路径落地，于是产生两个真实故障：
+
+1. **配置「恢复了但没生效」**：Windows 备份 → Linux 恢复时，配置被写进 `profiles/desktop/`，而 Linux 实际加载的是 `profiles/web`，一眼看去「恢复成功 N 个文件」，实际一个都没起作用。
+2. **数据丢失**：更严重的是「完全覆盖」模式——它会把目标机上「备份里没有的配置」当作多余项删除，于是 Linux 自己的 `profiles/web/*`（插件依赖、`cordis.patch.yml`、`pnpm-workspace.yaml`）被**整棵删掉**，重启后插件全部消失。
+
+现在恢复时会把备份里的 `profiles/<源 profile>/…` 换成本机**正在使用**的 profile，预览与结果里都会明确告知：
+
+```
+跨平台恢复：配置会换到本机的 profile
+这份备份来自 desktop profile，本机使用的是 web profile，恢复时会自动把配置写到本机 profile 下。
+```
+
+规则是「宁可不动，也绝不猜错」：
+
+| 备份里的 profile | 本机 profile | 行为 |
+|---|---|---|
+| `desktop` | `web` | 重映射 `desktop` → `web` |
+| `web` | `desktop` | 重映射 `web` → `desktop` |
+| `desktop` | `desktop` | **恒等**，与旧版行为完全一致 |
+| 自定义名（如 `alpha`） | `beta` | **不映射**——备份里没有任何信息能断定这是同一套配置改了名，强行改名会把配置写进你没打算用的 profile |
+
+只重映射 `profiles/<name>/` 这一段：顶层文件（`settings.yaml.imported`、`.credentials.yaml` 等）和 `__appdata__/` 挂载点都原样保留。四种组合（Win→Win、Win→Linux、Linux→Win、Linux→Linux）都有回归断言锁住。
 
 备份本身是**平台无关**的：内部一律用 posix 相对路径作为键，`__appdata__/` 前缀只是「挂载点」标记，换平台只切换根目录，不改备份格式。所以可以 A 机 Windows 备份、B 机 Linux 恢复。
 
@@ -313,7 +353,7 @@ dsh-sync-webdav/
 | `GET /dsh-sync/status` | — | `{ configured, config: { url, username, password: '', remoteDir, hasPassword, hasPassphrase } \| null, coverage: { included[], excluded[], totals }, remote: { reachable, backups: [{name,size,modified}], latest? }, lastLocalSnapshot? }`（**不含明文密码**） |
 | `POST /dsh-sync/config` | `{ url, username, password, remoteDir }` | `{ ok: true }`（先做连通性测试，失败不保存；密码留空=沿用已保存的） |
 | `POST /dsh-sync/backup` | `{ passphrase }` | `{ ok: true, name, size, fileCount, scope, coverage, pruned }`（`coverage` 给出已同步/已排除的顶层清单） |
-| `POST /dsh-sync/restore` | `{ name?, passphrase }` | `{ ok: true, restored, verified, removedCount, snapshot, portability?, meta? }` |
+| `POST /dsh-sync/restore` | `{ name?, passphrase, mode? }` | `{ ok: true, restored, verified, removedCount, snapshot, portability?, meta?, profileRemap?, remapped? }`（`profileRemap` 形如 `{ from:'desktop', to:'web', count }`，跨平台恢复才有） |
 | `POST /dsh-sync/delete` | `{ name }` 或 `{ names: [] }` | `{ ok: true, deleted }`（只接受 `dsh-sync-YYYYMMDD-HHMMSS.bundle`） |
 | `POST /dsh-sync/rollback` | `{ snapshot }` | `{ ok: true, restored, removedCount }` |
 | `GET /dsh-sync/plugins` | — | `{ ok: true, profile, deps: [{name, spec, kind, installed, rewrite?}], missing, needsInstall, mapped, pnpm: {available, path?, via?}, lastRestore? }` |
@@ -340,7 +380,7 @@ header: { version, salt(b64), iv(b64), tag(b64), payloadSha256 }
 node tools-selftest.mjs
 ```
 
-预期自测全绿（`0 failed`）。覆盖：排除规则（含 `node_modules`/`sessions` 回归断言）、加解密往返、错误口令与篡改拒绝、打包/解包、备份 `meta` 与旧备份向后兼容、快照与回滚（含「`dsh-runtimes/` 必须在回滚后存活」的回归断言）、路径穿越防护、`link:` → 仓库 spec 改写、**B 机恢复 E2E**（A 机备份 → B 机恢复 → 重装插件依赖）、**异步 runner 不阻塞事件循环**（含「源码中不得出现 `spawnSync(`」防退化护栏），一个内置 mock WebDAV 服务器上的 Basic Auth / MKCOL / PUT / GET / PROPFIND 全链路，以及 v0.4.0 新增的回归断言：`PATH` 兜底的各条分支（原生启动器直接执行 / 旁有 `bin/pnpm.mjs` 时用脚本 / Windows `.CMD` 外壳经 cmd.exe / 完全没有 pnpm 时给出「npm i -g pnpm」提示）、`resolveProfile` 优先采信 `profileContext.name`、`requestRejection` 返回 401/403 时 12 个端点全部不进入业务逻辑、`connection` 缺失时 fail-closed、安装失败还原 `package.json`、`parseIgnoredBuildScripts` 与 `allowBuilds` 写入，以及 v0.4.2 新增的**恢复方式**回归断言：`merge` 只写本机缺少的文件且保留本机改过的同名配置、`overwrite` 覆盖同名但保留本机独有配置、`mirror` 覆盖并删除本机独有配置、三种模式都不删聊天记录与运行时、`planPayloadApply` 预览不写盘且把「新增/相同/冲突/本机独有」分开报、未知 mode 回落默认 `merge`。
+预期自测全绿（`0 failed`）。覆盖：排除规则（含 `node_modules`/`sessions` 回归断言）、加解密往返、错误口令与篡改拒绝、打包/解包、备份 `meta` 与旧备份向后兼容、快照与回滚（含「`dsh-runtimes/` 必须在回滚后存活」的回归断言）、路径穿越防护、`link:` → 仓库 spec 改写、**B 机恢复 E2E**（A 机备份 → B 机恢复 → 重装插件依赖）、**异步 runner 不阻塞事件循环**（含「源码中不得出现 `spawnSync(`」防退化护栏），一个内置 mock WebDAV 服务器上的 Basic Auth / MKCOL / PUT / GET / PROPFIND 全链路，以及 v0.4.0 新增的回归断言：`PATH` 兜底的各条分支（原生启动器直接执行 / 旁有 `bin/pnpm.mjs` 时用脚本 / Windows `.CMD` 外壳经 cmd.exe / 完全没有 pnpm 时给出「npm i -g pnpm」提示）、`resolveProfile` 优先采信 `profileContext.name`、`requestRejection` 返回 401/403 时 12 个端点全部不进入业务逻辑、`connection` 缺失时 fail-closed、安装失败还原 `package.json`、`parseIgnoredBuildScripts` 与 `allowBuilds` 写入，以及 v0.4.2 新增的**恢复方式**回归断言：`merge` 只写本机缺少的文件且保留本机改过的同名配置、`overwrite` 覆盖同名但保留本机独有配置、`mirror` 覆盖并删除本机独有配置、三种模式都不删聊天记录与运行时、`planPayloadApply` 预览不写盘且把「新增/相同/冲突/本机独有」分开报、未知 mode 回落默认 `merge`，以及 v0.4.6 新增的**跨平台 profile 重映射**回归断言：`planProfileRemap` 只在 `desktop↔web` 之间映射、同平台恒等、自定义 profile 名不被乱猜、只改 `profiles/<name>/` 一段而不动顶层文件与 `__appdata__`、Win→Linux 与 Linux→Win 两个方向都落到本机 profile、**`mirror` 不得把目标机自己的 profile 整棵删掉**（v0.4.5 的数据丢失点）、以及「可达 WebDAV 时配置真的落盘」（旧用例用必然拒绝连接的 `127.0.0.1:1`，永远走不到落盘分支）。
 
 ## 已知限制
 

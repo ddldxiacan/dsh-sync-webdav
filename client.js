@@ -748,6 +748,17 @@ window.__ModuleLoader__.load({
           pv.error
             ? h('div', { className: PREFIX + '-hint' }, '差异比对失败（' + pv.error + '），仍可按所选模式恢复。')
             : null,
+          // ---- 跨平台提示：profile 名会改，必须先说清楚，否则用户找不到配置 ----
+          // Windows 桌面版用 profiles/desktop、`dsh web` 用 profiles/web；恢复时会把备份里
+          // 的 profile 换成本机正在跑的那个。不给这条提示，用户会以为恢复进了别的 profile。
+          (data && data.profileRemap)
+            ? h('div', { className: PREFIX + '-warn' },
+                h('div', { className: PREFIX + '-warn-title' }, '跨平台恢复：配置会换到本机的 profile'),
+                h('div', null, '这份备份来自 ' + data.profileRemap.from + ' profile，本机使用的是 ' +
+                  data.profileRemap.to + ' profile，恢复时会自动把配置写到本机 profile 下（而不是新建一个用不到的 ' +
+                  data.profileRemap.from + ' profile）。'))
+            : null,
+
           totals
             ? h('div', { className: PREFIX + '-warn' },
                 h('div', { className: PREFIX + '-warn-title' }, '这份备份与本机的差异'),
@@ -823,6 +834,11 @@ window.__ModuleLoader__.load({
             : d.mode === 'overwrite' ? '覆盖同名配置' : '只补缺失';
           const parts = [];
           parts.push('方式：' + modeText);
+          // 跨平台恢复改了 profile 名：必须在结果里点名，否则用户会去旧的 profile 目录找配置
+          if (d.profileRemap && d.profileRemap.from !== d.profileRemap.to) {
+            parts.push('已把 ' + d.profileRemap.from + ' profile 的 ' + (d.profileRemap.count || 0) +
+              ' 个配置写到本机的 ' + d.profileRemap.to + ' profile');
+          }
           if (d.restored > 0 && d.verified === d.restored && !skipped.length && !mismatch.length) {
             parts.push('已恢复 ' + d.restored + ' 个文件（逐文件校验通过），快照：' + (d.snapshot || '—'));
           } else {
