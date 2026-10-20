@@ -29,8 +29,10 @@ import {
   isNativeExecutable, findPnpmOnPath, resolvePnpmInvocation, buildPnpmCommand, describeScope,
   parseIgnoredBuildScripts, parsePnpmAllowBuilds, readAllowBuilds, approveBuilds, isLoopbackRequest,
   applyPayloadMode, planPayloadApply, normalizeRestoreMode, DEFAULT_RESTORE_MODE, RESTORE_MODES,
+  pathsEqual, isUnderDir, __setAppDataPlatformForTest,
 } from './index.js'
 
+const APPDATA_PROBE = '__appdata__/dsh-desktop/desktop/settings.json'
 let pass = 0, fail = 0
 const check = (name, cond, detail) => {
   if (cond) { pass++; console.log('PASS  ' + name + (detail ? '  -- ' + detail : '')) }
@@ -2012,6 +2014,122 @@ check('depKind: registry 版本号', depKind('^0.4.6') === 'registry' && depKind
     check('回滚: 回报安全快照名（lastLocalSnapshot 指向回滚前那份）',
       src.includes('if (rolled.taken) lastLocalSnapshot = rolled.taken') &&
       /snapshot: rolled\.taken/.test(src))
+  }
+}
+
+// ---------- 13. Linux / 纯 Web 版（无 Electron）兼容 ----------
+{
+  // 13.1 Electron 应用数据根目录必须按平台解析。
+  // 旧实现无脑拼 ~/AppData/Roaming：在 Linux 上那是**不存在**的虚构目录，
+  // 恢复 Windows 备份时会在 home 下凭空造一棵假目录树，预览里还报成「本机缺少的配置」。
+  {
+    const probe = () => appDataAbsPath(APPDATA_PROBE)
+    __setAppDataPlatformForTest('win32')
+    const win = probe()
+    __setAppDataPlatformForTest('linux')
+    const linux = probe()
+    __setAppDataPlatformForTest('darwin')
+    const mac = probe()
+    __setAppDataPlatformForTest(null)
+    const real = probe()
+
+    check('平台: Windows 仍落在 AppData/Roaming', /AppData[\\/]Roaming/i.test(win), win)
+    check('平台: Linux 不再用虚构的 AppData/Roaming（改走 XDG/.config）',
+      !/[\\/]AppData[\\/]Roaming[\\/]/i.test(linux) && /[\\/]\.config[\\/]/.test(linux), linux)
+    check('平台: macOS 落在 Application Support', /Application Support/.test(mac), mac)
+    check('平台: 三个平台解析出三个不同位置',
+      new Set([win, linux, mac]).size === 3, [win, linux, mac].join(' | '))
+    check('平台: 不注入时按本机平台（与 win32 分支一致或与平台相符）',
+      process.platform === 'win32' ? real === win : true, process.platform + ' -> ' + real)
+  }
+
+  // 13.2 Linux 上 XDG_CONFIG_HOME 优先于 ~/.config
+  {
+    const prev = process.env.XDG_CONFIG_HOME
+    __setAppDataPlatformForTest('linux')
+    try {
+      process.env.XDG_CONFIG_HOME = '/custom/xdg'
+      const p = appDataAbsPath(APPDATA_PROBE)
+      check('平台: Linux 尊重 XDG_CONFIG_HOME', /custom[\\/]xdg/.test(p), p)
+      delete process.env.XDG_CONFIG_HOME
+      const q = appDataAbsPath(APPDATA_PROBE)
+      check('平台: 没有 XDG_CONFIG_HOME 时回落到 ~/.config', /[\\/]\.config[\\/]/.test(q), q)
+    } finally {
+      __setAppDataPlatformForTest(null)
+      if (prev === undefined) delete process.env.XDG_CONFIG_HOME
+      else process.env.XDG_CONFIG_HOME = prev
+    }
+  }
+
+  // 13.3 路径比较的大小写语义：Linux 区分大小写，Windows/macOS 不区分。
+  // 一律 toLowerCase 会把 Linux 上 /Home 和 /home 判成同一个目录。
+  {
+    check('路径: Linux 语义区分大小写',
+      pathsEqual('/home/alice', '/home/ALICE', { caseInsensitive: false }) === false)
+    check('路径: Windows/macOS 语义不区分大小写',
+      pathsEqual('/home/alice', '/home/ALICE', { caseInsensitive: true }) === true)
+    check('路径: 前缀边界不被当成子目录（/home/aliceX 不在 /home/alice 下）',
+      isUnderDir('/home/aliceX', '/home/alice', { caseInsensitive: false }) === false)
+    check('路径: 真正的子目录仍判为在目录下',
+      isUnderDir('/home/alice/.dsh', '/home/alice', { caseInsensitive: false }) === true)
+    check('路径: Windows 风格的 C:/ 不会落在 Linux home 之下',
+      isUnderDir('C:/Users/bob/.pnpm', '/home/alice', { caseInsensitive: false }) === false)
+    check('路径: 反斜杠与正斜杠视为同一分隔符',
+      pathsEqual('C:\\Users\\a', 'C:/Users/a', { caseInsensitive: true }) === true)
+  }
+
+  // 13.4 Linux 上 pnpm 的四种真实安装形态都要认得出（Web 版只有 PATH 这条路）
+  {
+    const pnpmRoot = join(tmpdir(), 'dsh-sync-linuxpnpm-' + Date.now())
+    try {
+      const mk = (p) => mkdirSync(p, { recursive: true })
+      // 形态1：npm -g，入口是 node 脚本，旁边有 bin/pnpm.mjs
+      const s1 = join(pnpmRoot, 's1'); mk(join(s1, 'bin'))
+      writeFileSync(join(s1, 'pnpm'), '#!/usr/bin/env node\n', 'utf8')
+      writeFileSync(join(s1, 'bin', 'pnpm.mjs'), '// mjs\n', 'utf8')
+      const i1 = resolvePnpmInvocation(undefined, { homeRoot: null, env: { PATH: s1 }, platform: 'linux' })
+      check('Linux pnpm: 旁有 bin/pnpm.mjs 时用 node 跑脚本',
+        i1 && i1.via === 'path-script' && i1.cmd === process.execPath, JSON.stringify(i1))
+
+      // 形态2：官方独立安装，单个原生 ELF
+      const s2 = join(pnpmRoot, 's2'); mk(s2)
+      writeFileSync(join(s2, 'pnpm'), Buffer.from([0x7f, 0x45, 0x4c, 0x46, 2, 1, 1, 0, 0, 0, 0, 0]))
+      const i2 = resolvePnpmInvocation(undefined, { homeRoot: null, env: { PATH: s2 }, platform: 'linux' })
+      check('Linux pnpm: 原生 ELF 直接执行（不带 --expose-internals）',
+        i2 && i2.via === 'path-binary' && i2.args.length === 0, JSON.stringify(i2))
+
+      // 形态3：只有 node 脚本、没有 bin/pnpm.mjs
+      const s3 = join(pnpmRoot, 's3'); mk(s3)
+      writeFileSync(join(s3, 'pnpm'), '#!/usr/bin/env node\n', 'utf8')
+      const i3 = resolvePnpmInvocation(undefined, { homeRoot: null, env: { PATH: s3 }, platform: 'linux' })
+      check('Linux pnpm: 纯 node 脚本走 path-script', i3 && i3.via === 'path-script', JSON.stringify(i3))
+
+      // 形态4：PATH 里没有
+      const i4 = resolvePnpmInvocation(undefined, { homeRoot: null, env: { PATH: join(pnpmRoot, 'none') }, platform: 'linux' })
+      check('Linux pnpm: 找不到时返回 null（界面据此提示装 pnpm）', i4 === null)
+
+      // 关键：.CMD 外壳是 Windows 专有，Linux 绝不能走那条分支
+      check('Linux pnpm: 不会误判成 Windows 的 cmd-shim',
+        [i1, i2, i3].every((x) => x && x.via !== 'path-cmd-shim'))
+    } finally {
+      try { rmSync(pnpmRoot, { recursive: true, force: true }) } catch (e) { /* ignore */ }
+    }
+  }
+
+  // 13.5 纯 Node（dsh web）没有 process.resourcesPath，也必须能解析 pnpm
+  {
+    check('Web 版: Node 环境下 process.resourcesPath 本就可能是 undefined，不据此报错',
+      (() => {
+        const inv = resolvePnpmInvocation(undefined, { homeRoot: null, env: { PATH: process.env.PATH }, platform: process.platform })
+        return inv === null || (typeof inv.cmd === 'string' && inv.cmd.length > 0)
+      })())
+  }
+
+  // 13.6 操作失败不能冒成 HTTP 500（Linux 上快照目录可能 EACCES / 磁盘满 ENOSPC）
+  {
+    const src = readFileSync(new URL('./index.js', import.meta.url), 'utf8')
+    check('错误处理: 备份/恢复/回滚的异常被翻成可读错误，不会冒成 500',
+      src.includes('配置可能只写入了一部分') && src.includes("label + '失败：'") && src.includes('failed: '))
   }
 }
 

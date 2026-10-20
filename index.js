@@ -83,11 +83,38 @@ export function isExcludedAppData(relPosix, fileSizeBytes, isDir) {
   if (fileSizeBytes !== undefined && fileSizeBytes > APPDATA_MAX_FILE_BYTES) return true
   return false
 }
-/** 收集 AppData 应用设置文件（相对 AppData Roaming 根，含 __appdata__ 前缀），供打包 */
+/**
+ * Electron 应用级用户数据的根目录（「Roaming」那一级）。按平台取真实位置：
+ *   Windows  %APPDATA%                      → C:\Users\x\AppData\Roaming
+ *   macOS    ~/Library/Application Support
+ *   Linux    $XDG_CONFIG_HOME 或 ~/.config   （Electron 在 Linux 上的标准位置）
+ *
+ * 为什么必须按平台分：旧实现无脑拼 ~/AppData/Roaming。那在 Linux/macOS 上是个
+ * **并不存在**的虚构目录 —— 后果是恢复一份 Windows 备份时，会在用户 home 下
+ * 凭空创建 ~/AppData/Roaming/@deepseek-ai/... 这棵假目录树，而且预览里还会把它
+ * 报成「本机缺少的配置」。宁可解析不到（返回 null）也不要造一个假路径。
+ *
+ * 备份里的键名仍然统一用 Windows 那套（dsh-desktop/desktop/settings.json），
+ * 换到别的平台只是挂载点不同，靠这里切换根目录即可，不必改备份格式。
+ */
 function appDataRoamingRoot() {
-  if (process.env.APPDATA) return process.env.APPDATA
-  try { return join(homedir(), 'AppData', 'Roaming') } catch (e) { return null }
+  const platform = (appDataPlatformOverride() || process.platform)
+  if (platform === 'win32') {
+    if (process.env.APPDATA) return process.env.APPDATA
+    try { return join(homedir(), 'AppData', 'Roaming') } catch (e) { return null }
+  }
+  if (platform === 'darwin') {
+    try { return join(homedir(), 'Library', 'Application Support') } catch (e) { return null }
+  }
+  // Linux 及其它类 Unix：Electron 遵循 XDG
+  if (process.env.XDG_CONFIG_HOME) return process.env.XDG_CONFIG_HOME
+  try { return join(homedir(), '.config') } catch (e) { return null }
 }
+// 仅供自测注入「当前平台」，避免为了验证 Linux 分支而在 Windows 上造一整套环境。
+// 生产路径永远返回 null，行为完全由 process.platform 决定。
+let APP_DATA_PLATFORM_OVERRIDE = null
+export function __setAppDataPlatformForTest(p) { APP_DATA_PLATFORM_OVERRIDE = p || null }
+function appDataPlatformOverride() { return APP_DATA_PLATFORM_OVERRIDE }
 export function collectAppDataFiles() {
   const roaming = appDataRoamingRoot()
   if (!roaming) return []
@@ -1150,10 +1177,12 @@ export function isNativeExecutable(file) {
 }
 
 /** 在 PATH 里找 pnpm（Windows 补 PATHEXT）。返回真实路径或 null。
- *  Web 版是纯 npm 安装的 CLI，没有 Electron 内置运行时，只有 PATH 这条路可用。 */
-export function findPnpmOnPath(env) {
+ *  Web 版是纯 npm 安装的 CLI，没有 Electron 内置运行时，只有 PATH 这条路可用。
+ *  opts.platform 仅供自测注入（在 Windows 上验证 Linux 分支，反之亦然）。 */
+export function findPnpmOnPath(env, opts) {
   const e = env || process.env
-  const exts = process.platform === 'win32'
+  const platform = (opts && opts.platform) || process.platform
+  const exts = platform === 'win32'
     ? String(e.PATHEXT || '.EXE;.CMD;.BAT;.COM').split(';').filter(Boolean)
     : ['']
   for (const dir of String(e.PATH || e.Path || '').split(delimiter)) {
@@ -1173,6 +1202,7 @@ export function findPnpmOnPath(env) {
  *  优先级：宿主给的 packageManager > 桌面版 resources 布局 > PATH。 */
 export function resolvePnpmInvocation(resourcesPath, opts) {
   const o = opts || {}
+  const platform = o.platform || process.platform
   // 1) 宿主提供的 packageManager（桌面版 Electron 内置运行时走这条）
   const pm = o.packageManager
   if (pm && typeof pm.command === 'string' && pm.command) {
@@ -1182,14 +1212,14 @@ export function resolvePnpmInvocation(resourcesPath, opts) {
   const bundled = findPnpmPath(resourcesPath, o)
   if (bundled) return { cmd: process.execPath, args: ['--expose-internals', bundled], via: 'bundled' }
   // 3) PATH 上的 pnpm（Web 版 / CLI 安装的正解）
-  const onPath = findPnpmOnPath(o.env)
+  const onPath = findPnpmOnPath(o.env, { platform })
   if (!onPath) return null
   // npm 安装的 pnpm 包里，启动器旁一定有 bin/pnpm.mjs，优先用它（脚本才认 --expose-internals）
   const sibling = join(dirname(onPath), 'bin', 'pnpm.mjs')
   if (existsSync(sibling)) return { cmd: process.execPath, args: ['--expose-internals', sibling], via: 'path-script' }
   // Windows 上 npm / corepack 装的 pnpm 是 .CMD / .BAT 批处理外壳，spawn 直接跑会 EINVAL，
   // 必须经 cmd.exe 转一手（见 buildPnpmCommand）。
-  if (process.platform === 'win32' && /\.(cmd|bat)$/i.test(onPath)) return { cmd: onPath, args: [], via: 'path-cmd-shim' }
+  if (platform === 'win32' && /\.(cmd|bat)$/i.test(onPath)) return { cmd: onPath, args: [], via: 'path-cmd-shim' }
   if (!isNativeExecutable(onPath)) return { cmd: process.execPath, args: ['--expose-internals', onPath], via: 'path-script' }
   return { cmd: onPath, args: [], via: 'path-binary' }   // 原生二进制：直接执行
 }
@@ -1774,14 +1804,27 @@ function yamlSingleQuote(s) {
   return "'" + String(s).replace(/'/g, "''") + "'"
 }
 
-function pathsEqual(a, b) {
-  return String(a || '').replace(/\\/g, '/').replace(/\/+$/, '').toLowerCase() ===
-    String(b || '').replace(/\\/g, '/').replace(/\/+$/, '').toLowerCase()
+/** 路径比较用的规范化：统一分隔符、去掉尾斜杠。
+ *  大小写只在 Windows/macOS（默认不区分大小写）上折叠；Linux 上 /Home 与 /home
+ *  是两个不同目录，一律 toLowerCase 会把它们判成同一个，导致该改写的没改写、
+ *  该保留的被误改。 */
+const CASE_INSENSITIVE_FS = process.platform === 'win32' || process.platform === 'darwin'
+function normPathForCompare(p, caseInsensitive) {
+  const s = String(p || '').replace(/\\/g, '/').replace(/\/+$/, '')
+  const fold = caseInsensitive === undefined ? CASE_INSENSITIVE_FS : !!caseInsensitive
+  return fold ? s.toLowerCase() : s
 }
 
-function isUnderDir(file, dir) {
-  const a = String(file || '').replace(/\\/g, '/').replace(/\/+$/, '').toLowerCase()
-  const d = String(dir || '').replace(/\\/g, '/').replace(/\/+$/, '').toLowerCase()
+/** 路径是否相等。opts.caseInsensitive 仅供自测注入跨平台语义（默认按本机平台）。 */
+export function pathsEqual(a, b, opts) {
+  const ci = opts && opts.caseInsensitive !== undefined ? opts.caseInsensitive : undefined
+  return normPathForCompare(a, ci) === normPathForCompare(b, ci)
+}
+
+export function isUnderDir(file, dir, opts) {
+  const ci = opts && opts.caseInsensitive !== undefined ? opts.caseInsensitive : undefined
+  const a = normPathForCompare(file, ci)
+  const d = normPathForCompare(dir, ci)
   return !!d && (a === d || a.startsWith(d + '/'))
 }
 
@@ -2208,6 +2251,12 @@ export function apply(ctx, config) {
     restoring = label
     try {
       return await fn()
+    } catch (e) {
+      // 不能把异常冒成 500：Linux 上快照/写入可能因权限或磁盘满失败（EACCES、ENOSPC），
+      // 用户需要知道是哪一步、为什么，而不是笼统的「HTTP 500」。
+      const msg = (e && e.message) ? e.message : String(e)
+      log(label + ' failed: ' + msg)
+      return { ok: false, error: label + '失败：' + msg + '。配置可能只写入了一部分，可用本地快照回滚。' }
     } finally {
       restoring = null
     }

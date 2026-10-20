@@ -7,7 +7,7 @@
 
 > 适用于 [DeepSeek Harness](https://github.com/deepseek-ai) 的双半区插件（Host + Client），零 npm 依赖。
 >
-> 版本 **0.4.3**。要求 DSH **>= 0.2.1-rc.2**（端点栅栏用到 `connection.requestRejection`，profile 判定用到 `ctx.profileContext`）；已在 **0.2.1-rc.2 / Web 版**实测。
+> 版本 **0.4.4**。要求 DSH **>= 0.2.1-rc.2**（端点栅栏用到 `connection.requestRejection`，profile 判定用到 `ctx.profileContext`）；已在 **0.2.1-rc.2 / Web 版**实测。
 >
 > 下限写 `0.2.1-rc.2` 而不是 `0.2.1` 是有意的：按 semver 规范，预发布版本 **不满足** `>=0.2.1` 这种不含预发布标识的范围，
 > 而下限若写 `>=0.2.1`，正在跑 `0.2.1-rc.2` 的机器会被宿主的 `engines.dsh` 校验判为 `incompatible-version`、直接装不上。
@@ -198,6 +198,22 @@ git push origin main --tags
 - **端点鉴权**：所有 `/dsh-sync/*` 走宿主的 Host/Origin 栅栏 + 浏览器 cookie 认证，与 `/api` 同一套；`connection` 缺失时只放行 loopback
 - **不回传明文密码**：`/status` 只回 `hasPassword`，设置页也不再回显密码（留空=沿用已保存的）
 - **恢复方式（0.4.2 起由用户选）**：确认弹窗会先比对本机与备份，列出「本机缺少 / 内容相同 / 内容不同 / 本机独有」各有多少，再由你选一种方式：**只补缺失（默认）**——本机已有的配置一律不动，只补本机没有的文件；**覆盖同名配置**——备份里的文件全部覆盖写入，但本机多出来的配置保留；**完全覆盖**——覆盖写入并删掉备份里没有的配置，与源机器一模一样。被保留的冲突文件会在结果里逐个回报。全新机器上「只补缺失」与「完全覆盖」结果相同。配置范围就是打包规则会收进去的路径。聊天记录（`sessions/`）、聊天文件（`attachments/`）、聊天派生数据、`dsh-runtimes/`、`node_modules/`、日志、缓存和大于 50MB 的文件**不在备份里，恢复时也不删除**——否则会删掉运行时导致 DSH 起不来，或丢掉聊天记录。旧备份若完全没有应用级设置（没有 `__appdata__/` 条目，也没有 `meta.appDataIncluded`），不会据此清空本机 AppData 配置。
+
+## 跨平台（Linux / macOS / Web 版）
+
+插件本身是纯 Node ESM，没有原生依赖，**Windows、Linux、macOS 都能跑**。`dsh web`（纯 CLI，无 Electron）同样支持，只是少了桌面版内置运行时，pnpm 必须自己在 `PATH` 里（见下节）。
+
+三处平台差异已经处理：
+
+| 事项 | Windows | Linux | macOS |
+|---|---|---|---|
+| Electron 应用级设置根目录 | `%APPDATA%`（`…\AppData\Roaming`） | `$XDG_CONFIG_HOME` 或 `~/.config` | `~/Library/Application Support` |
+| 路径比较是否区分大小写 | 不区分 | **区分**（`/Home` ≠ `/home`） | 不区分（默认卷） |
+| pnpm 调用形态 | `.CMD` 外壳经 `cmd.exe` | 脚本用 `node`、原生 ELF 直接执行 | 同 Linux |
+
+> **0.4.4 修复**：旧版本在 Linux/macOS 上会无条件拼出 `~/AppData/Roaming`。那是 Windows 才有的路径，在 Linux 上并不存在 —— 结果是恢复一份 Windows 备份时会**在你的 home 下凭空创建 `~/AppData/Roaming/@deepseek-ai/…` 这棵假目录树**，而且恢复预览里还会把它报成「本机缺少的配置」。现在按平台解析真实位置，解析不到就跳过，绝不虚构路径。
+
+备份本身是**平台无关**的：内部一律用 posix 相对路径作为键，`__appdata__/` 前缀只是「挂载点」标记，换平台只切换根目录，不改备份格式。所以可以 A 机 Windows 备份、B 机 Linux 恢复。
 
 ## 安装
 
