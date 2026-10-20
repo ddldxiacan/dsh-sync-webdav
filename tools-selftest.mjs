@@ -1923,5 +1923,97 @@ check('depKind: registry 版本号', depKind('^0.4.6') === 'registry' && depKind
   }
 }
 
+// ---------- 12. 全面审查修掉的 bug 回归 ----------
+{
+  // 12.1 回滚到最旧的一份快照会崩溃（安全快照把它挤掉后仍去读它）
+  const rbRoot = join(tmpdir(), 'dsh-sync-rb-protect-' + Date.now())
+  try {
+    const root = join(rbRoot, 'root')
+    const snaps = join(rbRoot, 'snaps')
+    mkdirSync(root, { recursive: true })
+    const made = []
+    for (let i = 1; i <= 5; i++) {
+      writeFileSync(join(root, 'settings.json'), '{"v":"第' + i + '版"}', 'utf8')
+      made.push(makeSnapshot(root, snaps, 5))
+    }
+    writeFileSync(join(root, 'settings.json'), '{"v":"当前"}', 'utf8')
+    let crashed = null
+    let res = null
+    try {
+      res = rollbackFromSnapshot(join(snaps, made[0]), root, snaps, 5)
+    } catch (e) { crashed = e }
+    check('回滚: 回到最旧一份快照不再 ENOENT 崩溃', !crashed, crashed && crashed.message)
+    check('回滚: 最旧快照的内容真的被恢复了',
+      !crashed && readFileSync(join(root, 'settings.json'), 'utf8') === '{"v":"第1版"}',
+      crashed ? '-' : readFileSync(join(root, 'settings.json'), 'utf8'))
+    check('回滚: 目标快照被保护、没有被安全快照挤出', existsSync(join(snaps, made[0])))
+  } finally {
+    try { rmSync(rbRoot, { recursive: true, force: true }) } catch (e) { /* ignore */ }
+  }
+
+  // 12.3 同一时刻两次快照不能互相覆盖（并发/连点）
+  const dupRoot = join(tmpdir(), 'dsh-sync-snap-dup-' + Date.now())
+  try {
+    const root = join(dupRoot, 'root')
+    const snaps = join(dupRoot, 'snaps')
+    mkdirSync(root, { recursive: true })
+    writeFileSync(join(root, 'a.json'), '{"a":1}', 'utf8')
+    const fixed = new Date('2026-10-20T12:00:00.123Z')
+    const names = []
+    for (let i = 0; i < 3; i++) names.push(makeSnapshot(root, snaps, 50, fixed))
+    check('快照: 同一毫秒内多份快照不会撞名覆盖',
+      new Set(names).size === 3 && readdirSync(snaps).length === 3, JSON.stringify(names))
+  } finally {
+    try { rmSync(dupRoot, { recursive: true, force: true }) } catch (e) { /* ignore */ }
+  }
+
+  // 12.4 恢复必须互斥：并发两次恢复只允许一个进入，避免写出两份备份混合的半状态
+  {
+    const src = readFileSync(new URL('./index.js', import.meta.url), 'utf8')
+    check('恢复: 有互斥锁，并发请求会有一个被明确拒绝',
+      src.includes('withRestoreLock') && src.includes('已有一次') && src.includes('restoring'))
+    check('恢复: 回滚与恢复共用同一把锁（两者都改写整个配置范围）',
+      /withRestoreLock\('恢复'/.test(src) && /withRestoreLock\('回滚'/.test(src))
+    // 备份也必须上锁：恢复跑到一半时备份，会拍下两份配置混合的半成品，
+    // 而这份坏备份看起来完全正常，要等下次恢复才暴露。
+    check('备份: 与恢复/回滚共用同一把锁（避免拍下半合并状态）',
+      /withRestoreLock\('备份'/.test(src))
+  }
+
+  // 12.5 client 卸载后重新挂载时 mountedRef 必须复位，否则整卡请求全失效
+  {
+    const cSrc = readFileSync(new URL('./client.js', import.meta.url), 'utf8')
+    check('client: 挂载时把 mountedRef 重置为 true（设置页切走再切回来仍可用）',
+      /mountedRef\.current = true;[\s\S]{0,80}mountedRef\.current = false;/.test(cSrc))
+  }
+
+  // 12.5b 损坏的备份要在动文件之前被拦住，而不是抛 500
+  {
+    const bad = [
+      Buffer.from('not json at all'),
+      Buffer.from('{}'),
+      Buffer.from('[]'),
+      Buffer.from('{"files":"nope"}'),
+    ]
+    for (const b of bad) {
+      let threw = null
+      let plan = null
+      try { plan = planPayloadApply(b, tmpdir()) } catch (e) { threw = e }
+      check('损坏备份: 不能被当成正常清单（' + b.toString().slice(0, 18) + '）', threw !== null, threw ? threw.message.slice(0, 40) : 'no throw')
+    }
+    const src = readFileSync(new URL('./index.js', import.meta.url), 'utf8')
+    check('恢复: 解析失败时在写文件前拒绝，并给出可读错误',
+      src.includes('未做任何改动') && src.includes('parsePayloadObject'))
+  }
+
+  // 12.6 回滚结果里带上安全快照名，供界面提示「如何撤销」
+  {
+    const src = readFileSync(new URL('./index.js', import.meta.url), 'utf8')
+    check('回滚: 回报安全快照名（lastLocalSnapshot 指向回滚前那份）',
+      src.includes('if (rolled.taken) lastLocalSnapshot = rolled.taken') &&
+      /snapshot: rolled\.taken/.test(src))
+  }
+}
+
 console.log('\n==== ' + pass + ' passed, ' + fail + ' failed ====')
 process.exit(fail ? 1 : 0)

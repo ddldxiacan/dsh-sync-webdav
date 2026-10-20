@@ -486,9 +486,21 @@ export function normalizeRestoreMode(mode) {
   return RESTORE_MODES.includes(m) ? m : DEFAULT_RESTORE_MODE
 }
 
-/** 解析 payload 里路径合法、能落到本机的条目 [{ path, sha256, buffer, abs }]，附带非法条目清单。 */
+/** payload 解析成对象；内容不是合法 JSON 时返回 null（备份损坏，调用方必须明确报错）。 */
+function parsePayloadObject(payload) {
+  try {
+    const o = JSON.parse(payload.toString('utf8'))
+    if (!o || typeof o !== 'object' || Array.isArray(o)) return null
+    if (!Array.isArray(o.files)) return null
+    return o
+  } catch (e) { return null }
+}
+
+/** 解析 payload 里路径合法、能落到本机的条目 [{ path, sha256, buffer, abs }]，附带非法条目清单。
+ *  payload 本身不合法时抛错，且错误信息是给用户看的（不是 at position ... 这种）。 */
 function payloadValidEntries(payload, root) {
-  const parsed = JSON.parse(payload.toString('utf8'))
+  const parsed = parsePayloadObject(payload)
+  if (!parsed) throw new Error('备份内容不是有效的配置清单（JSON 解析失败或缺少 files 数组），无法恢复')
   const files = Array.isArray(parsed.files) ? parsed.files : []
   const entries = []
   const invalid = []
@@ -717,14 +729,25 @@ export function bundleName(date) {
     p(d.getHours()) + p(d.getMinutes()) + p(d.getSeconds()) + '.bundle'
 }
 
-/** 把 root（按排除规则）快照到 snapshotRoot/<ts>/；返回快照目录名，并保留最近 keep 份 */
-export function makeSnapshot(root, snapshotRoot, keep, date) {
+/** 把 root（按排除规则）快照到 snapshotRoot/<ts>/；返回快照目录名，并保留最近 keep 份。
+ *  opts.protect 指定一个快照目录名在本轮保留时不被删除：回滚会先拍一份新快照，
+ *  若回滚目标恰好是最旧的那份，它会被保留策略清掉，接着再去读它就是 ENOENT。 */
+export function makeSnapshot(root, snapshotRoot, keep, date, opts) {
+  const o = opts || {}
   const d = date || new Date()
   const p = (n) => String(n).padStart(2, '0')
   const ts = d.getFullYear() + p(d.getMonth() + 1) + p(d.getDate()) + '-' +
     p(d.getHours()) + p(d.getMinutes()) + p(d.getSeconds()) + '-' + String(d.getMilliseconds()).padStart(3, '0')
   mkdirSync(snapshotRoot, { recursive: true })
-  const dest = join(snapshotRoot, ts)
+  // 毫秒级时间戳仍可能撞名（并发恢复、或快速连点两次回滚）：撞上就加到唯一为止。
+  // 不处理的话第二份会写进同一个目录，与第一份混在一起，回滚出来的内容是两次的混合。
+  let finalTs = ts
+  let n = 0
+  while (existsSync(join(snapshotRoot, finalTs))) {
+    n++
+    finalTs = ts + '-' + n
+  }
+  const dest = join(snapshotRoot, finalTs)
   mkdirSync(dest, { recursive: true })
   for (const rel of collectFiles(root)) {
     const target = join(dest, rel)
@@ -741,12 +764,22 @@ export function makeSnapshot(root, snapshotRoot, keep, date) {
       copyFileSync(abs, target)
     } catch (e) { /* 单文件失败不阻断快照 */ }
   }
-  // 只保留最近 keep 份
+  // 只保留最近 keep 份；opts.protect 指定的那份不参与删除
   let olds = readdirSync(snapshotRoot).filter((n) => { try { return statSync(join(snapshotRoot, n)).isDirectory() } catch (e) { return false } }).sort()
+  const protectedName = o.protect ? String(o.protect) : null
   while (olds.length > keep) {
-    try { rmSync(join(snapshotRoot, olds.shift()), { recursive: true, force: true }) } catch (e) { /* ignore */ }
+    const victim = olds.shift()
+    if (victim === protectedName) continue
+    try { rmSync(join(snapshotRoot, victim), { recursive: true, force: true }) } catch (e) { /* ignore */ }
   }
-  return ts
+  return finalTs
+}
+
+/** 取路径最后一段（快照目录名），用于保留策略里的保护名单。 */
+function basenameSafe(p) {
+  const s = String(p || '').replace(/[\\/]+$/, '')
+  const i = Math.max(s.lastIndexOf('/'), s.lastIndexOf('\\'))
+  return i >= 0 ? s.slice(i + 1) : s
 }
 
 /** 从快照目录回滚到 root：先快照现状，再把配置范围对齐到该快照。
@@ -755,7 +788,10 @@ export function makeSnapshot(root, snapshotRoot, keep, date) {
  *  opts.pruneAppData === false 时不清理 AppData，避免自测误删本机设置。 */
 export function rollbackFromSnapshot(snapshotDir, root, snapshotRoot, keep, opts) {
   const o = opts || {}
-  const taken = makeSnapshot(root, snapshotRoot, keep)
+  // 回滚目标必须保护起来：下面 makeSnapshot 会按保留策略清旧快照，
+  // 若目标正好是最旧的一份，它会先被删掉，紧接着 walk 就是 ENOENT。
+  const protect = basenameSafe(snapshotDir)
+  const taken = makeSnapshot(root, snapshotRoot, keep, undefined, { protect })
   let count = 0
   const keepSet = new Set()
   const walk = (dir, prefix) => {
@@ -2161,6 +2197,21 @@ export function apply(ctx, config) {
 
   let lastLocalSnapshot = null
   let installing = false
+  // 恢复/回滚互斥：两者都会改写整个配置范围并各自拍快照。并发执行时两次写入会交错，
+  // 最后的配置是两份备份的混合体，而两份快照都「看起来正常」——这种半合并状态极难排查。
+  // 后到的请求直接拒绝，让用户等前一个跑完（每次恢复也就几秒）。
+  let restoring = null
+  const withRestoreLock = async (label, fn) => {
+    if (restoring) {
+      return { ok: false, error: '已有一次' + restoring + '正在进行，请等它完成后再试（同一时间只允许一个操作改写配置）' }
+    }
+    restoring = label
+    try {
+      return await fn()
+    } finally {
+      restoring = null
+    }
+  }
   // 路由注册时拿到的 ctx（fail-closed 兜底要用它再取一次 connection）
   let routeCtxRef = ctx
   try {
@@ -2255,7 +2306,11 @@ export function apply(ctx, config) {
     return { ok: true, hasPassphrase: true }
   }
 
-  const handleBackup = async (body) => {
+  // 备份也参与同一把锁：恢复进行到一半时拍的备份，会是两份配置混合的半成品，
+  // 而且这种坏备份看起来完全正常，等到下次恢复才会暴露。
+  const handleBackup = (body) => withRestoreLock('备份', () => doBackupLocked(body))
+
+  const doBackupLocked = async (body) => {
     const c = loadPluginConfig()
     if (!c) return { ok: false, error: '尚未配置 WebDAV（先 POST /dsh-sync/config）' }
     const resolved = resolvePassphrase(c, body)
@@ -2374,6 +2429,9 @@ export function apply(ctx, config) {
   const handleRestorePreview = async (body) => {
     const got = await fetchRestorePayload(body)
     if (!got.ok) return got
+    if (!parsePayloadObject(got.payload)) {
+      return { ok: false, error: '这份备份的内容不是有效的配置清单，无法比对差异。' }
+    }
     const plan = planPayloadApply(got.payload, dshRoot)
     const meta = extractPayloadMeta(got.payload)
     log('restore preview ' + got.name + ': ' + plan.totals.bundle + ' files, ' +
@@ -2399,13 +2457,19 @@ export function apply(ctx, config) {
     }
   }
 
-  const handleRestore = async (body) => {
+  const handleRestore = (body) => withRestoreLock('恢复', () => doRestoreLocked(body))
+
+  const doRestoreLocked = async (body) => {
     const got = await fetchRestorePayload(body)
     if (!got.ok) return got
     const payload = got.payload
     const name = got.name
     const c = got.c
     const mode = normalizeRestoreMode(body && body.mode)
+    // payload 不合法就在动任何文件之前拒绝：绝不能在「已经拍了快照、开始写文件」之后才发现。
+    if (!parsePayloadObject(payload)) {
+      return { ok: false, error: '这份备份的内容不是有效的配置清单，未做任何改动。请换一份备份或检查备份文件是否损坏。' }
+    }
     // 恢复前先本地快照（安全性快照，本身就是回滚目标）：任何模式都可回滚
     lastLocalSnapshot = makeSnapshot(dshRoot, snapshotRoot, SNAPSHOT_KEEP)
     // 按模式落地：merge 只补缺失 / overwrite 覆盖但不删 / mirror 完全对齐。排除项一律不动。
@@ -2474,7 +2538,9 @@ export function apply(ctx, config) {
     }
   }
 
-  const handleRollback = async (body) => {
+  const handleRollback = (body) => withRestoreLock('回滚', () => doRollbackLocked(body))
+
+  const doRollbackLocked = async (body) => {
     const snapshot = String(body.snapshot || '')
     if (!snapshot || snapshot.includes('..') || /[\\/]$/.test(snapshot) || snapshot.includes('/') || snapshot.includes('\\')) {
       return { ok: false, error: 'snapshot 名称非法' }
@@ -2483,15 +2549,19 @@ export function apply(ctx, config) {
     if (!existsSync(dir)) return { ok: false, error: '快照不存在: ' + snapshot }
     // 配置范围对齐到该快照；排除项（dsh-runtimes/ 等）原样保留
     const rolled = rollbackFromSnapshot(dir, dshRoot, snapshotRoot, SNAPSHOT_KEEP)
-    lastLocalSnapshot = snapshot
+    // 「最近一次本地快照」必须是刚拍的那份（回滚前的状态），不是刚回滚到的旧快照。
+    // 设成旧快照会让界面显示错乱，并且让「回滚到最近快照」按钮无法撤销这次回滚。
+    if (rolled.taken) lastLocalSnapshot = rolled.taken
     log('rolled back to snapshot ' + snapshot + ': ' + rolled.count + ' files' +
         (rolled.removed.length ? ', removed ' + rolled.removed.length : '') +
-        (rolled.failed.length ? ', remove failed ' + rolled.failed.length : ''))
+        (rolled.failed.length ? ', remove failed ' + rolled.failed.length : '') +
+        (rolled.taken ? ' (safety snapshot ' + rolled.taken + ')' : ''))
     return {
       ok: true, restored: rolled.count,
       removedCount: rolled.removed.length,
       removed: rolled.removed.slice(0, 30),
       removeFailed: rolled.failed,
+      snapshot: rolled.taken,
     }
   }
 
@@ -3034,7 +3104,7 @@ export function apply(ctx, config) {
     handlePlugins, handlePluginInstall, buildPluginsReport, resolveProfile, defaultRunner,
     handleVersion, handleUpgrade, inspectSelf, versionCache, runProfileInstall,
     handleStatus, handleDelete, handlePassphrase, handleConfig, handleBackup,
-    handleRestore, handleRestorePreview,
+    handleRestore, handleRestorePreview, handleRollback,
     describeScope, localCoverage,
   }
 

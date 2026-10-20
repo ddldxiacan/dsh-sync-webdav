@@ -488,8 +488,13 @@ window.__ModuleLoader__.load({
       const restorePreviewRef = useRef(null);
       const setPreview = (v) => { restorePreviewRef.current = v; setRestorePreview(v); };
 
+      // 卸载后不再 setState：挂载时**必须重置为 true**，否则设置页切走再切回来、
+      // 组件实例被复用时会带着上一次卸载留下的 false，导致整张卡片的请求全部失效。
       const mountedRef = useRef(true);
-      useEffect(() => () => { mountedRef.current = false; }, []);
+      useEffect(() => {
+        mountedRef.current = true;
+        return () => { mountedRef.current = false; };
+      }, []);
 
       const setField = (key) => (e) => {
         formDirtyRef.current = true;
@@ -911,6 +916,8 @@ window.__ModuleLoader__.load({
           let text = '已回滚，恢复 ' + (d.restored || 0) + ' 个文件';
           if (removedCount > 0) text += '，并删除快照中不存在的 ' + removedCount + ' 个配置文件';
           if (removeFailed.length) text += '。有 ' + removeFailed.length + ' 个配置文件未能删除';
+          // 回滚前自动拍了一份，告诉用户名字，他才知道可以再滚回来
+          if (d.snapshot) text += '。回滚前的状态已存为快照 ' + d.snapshot + '（可用「回滚到最近快照」撤销）';
           setMsg({ kind: removeFailed.length ? 'error' : 'ok', text });
         }
         await refresh({ silent: true });

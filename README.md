@@ -7,7 +7,7 @@
 
 > 适用于 [DeepSeek Harness](https://github.com/deepseek-ai) 的双半区插件（Host + Client），零 npm 依赖。
 >
-> 版本 **0.4.2**。要求 DSH **>= 0.2.1-rc.2**（端点栅栏用到 `connection.requestRejection`，profile 判定用到 `ctx.profileContext`）；已在 **0.2.1-rc.2 / Web 版**实测。
+> 版本 **0.4.3**。要求 DSH **>= 0.2.1-rc.2**（端点栅栏用到 `connection.requestRejection`，profile 判定用到 `ctx.profileContext`）；已在 **0.2.1-rc.2 / Web 版**实测。
 >
 > 下限写 `0.2.1-rc.2` 而不是 `0.2.1` 是有意的：按 semver 规范，预发布版本 **不满足** `>=0.2.1` 这种不含预发布标识的范围，
 > 而下限若写 `>=0.2.1`，正在跑 `0.2.1-rc.2` 的机器会被宿主的 `engines.dsh` 校验判为 `incompatible-version`、直接装不上。
