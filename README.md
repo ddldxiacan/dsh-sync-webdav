@@ -7,7 +7,7 @@
 
 > 适用于 [DeepSeek Harness](https://github.com/deepseek-ai) 的双半区插件（Host + Client），零 npm 依赖。
 >
-> 版本 **0.4.4**。要求 DSH **>= 0.2.1-rc.2**（端点栅栏用到 `connection.requestRejection`，profile 判定用到 `ctx.profileContext`）；已在 **0.2.1-rc.2 / Web 版**实测。
+> 版本 **0.4.5**。要求 DSH **>= 0.2.1-rc.2**（端点栅栏用到 `connection.requestRejection`，profile 判定用到 `ctx.profileContext`）；已在 **0.2.1-rc.2 / Web 版**实测。
 >
 > 下限写 `0.2.1-rc.2` 而不是 `0.2.1` 是有意的：按 semver 规范，预发布版本 **不满足** `>=0.2.1` 这种不含预发布标识的范围，
 > 而下限若写 `>=0.2.1`，正在跑 `0.2.1-rc.2` 的机器会被宿主的 `engines.dsh` 校验判为 `incompatible-version`、直接装不上。
@@ -210,6 +210,8 @@ git push origin main --tags
 | Electron 应用级设置根目录 | `%APPDATA%`（`…\AppData\Roaming`） | `$XDG_CONFIG_HOME` 或 `~/.config` | `~/Library/Application Support` |
 | 路径比较是否区分大小写 | 不区分 | **区分**（`/Home` ≠ `/home`） | 不区分（默认卷） |
 | pnpm 调用形态 | `.CMD` 外壳经 `cmd.exe` | 脚本用 `node`、原生 ELF 直接执行 | 同 Linux |
+
+**符号链接会被跟随**（0.4.5 起）：Linux/macOS 上把 `skins/` 或整个 `~/.dsh` 软链到别处很常见（dotfiles 管理、独立仓库）。旧版本用 `readdir` 的 dirent 判断，软链既不算文件也不算目录，会被**静默跳过** —— 备份看着成功，其实少了整棵配置。现在会跟随链接（含断链跳过、成环检测），并且「完全覆盖」只删链接自身、绝不删它指向的真实文件。
 
 > **0.4.4 修复**：旧版本在 Linux/macOS 上会无条件拼出 `~/AppData/Roaming`。那是 Windows 才有的路径，在 Linux 上并不存在 —— 结果是恢复一份 Windows 备份时会**在你的 home 下凭空创建 `~/AppData/Roaming/@deepseek-ai/…` 这棵假目录树**，而且恢复预览里还会把它报成「本机缺少的配置」。现在按平台解析真实位置，解析不到就跳过，绝不虚构路径。
 

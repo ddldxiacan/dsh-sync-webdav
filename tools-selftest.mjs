@@ -6,7 +6,7 @@
  */
 import { createHash } from 'node:crypto'
 import { createServer } from 'node:http'
-import { mkdirSync, readFileSync, readdirSync, rmSync, statSync, writeFileSync, existsSync } from 'node:fs'
+import { mkdirSync, readFileSync, readdirSync, rmSync, statSync, writeFileSync, existsSync, symlinkSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { dirname, join } from 'node:path'
 import {
@@ -2131,6 +2131,83 @@ check('depKind: registry 版本号', depKind('^0.4.6') === 'registry' && depKind
     check('错误处理: 备份/恢复/回滚的异常被翻成可读错误，不会冒成 500',
       src.includes('配置可能只写入了一部分') && src.includes("label + '失败：'") && src.includes('failed: '))
   }
+}
+
+// ---------- 14. 符号链接（Linux/macOS 上把配置目录软链到别处很常见） ----------
+{
+  const symRoot = join(tmpdir(), 'dsh-sync-symlink-' + Date.now())
+  let canSymlink = true
+  try {
+    mkdirSync(symRoot, { recursive: true })
+    writeFileSync(join(symRoot, 'probe'), 'x', 'utf8')
+    symlinkSync(join(symRoot, 'probe'), join(symRoot, 'probe-link'))
+  } catch (e) {
+    // Windows 非管理员/未开开发者模式时不能建软链；跳过而不是误报失败
+    canSymlink = false
+  }
+  if (!canSymlink) {
+    console.log('SKIP  符号链接用例（当前环境不允许创建软链）')
+  } else {
+    try {
+      const root = join(symRoot, 'dsh')
+      mkdirSync(join(root, 'sub'), { recursive: true })
+      writeFileSync(join(root, 'sub', 'real.json'), '{"real":1}', 'utf8')
+      // 文件链接
+      symlinkSync(join(root, 'sub', 'real.json'), join(root, 'file-link.json'))
+      // 目录链接（典型：skins/ 指向外部仓库）
+      symlinkSync(join(root, 'sub'), join(root, 'dir-link'))
+      // 环：链接回祖父目录，必须不死循环
+      symlinkSync(root, join(root, 'sub', 'loop'))
+
+      const files = collectFiles(root)
+      check('软链: 文件软链被纳入备份（旧实现静默跳过）',
+        files.includes('file-link.json'), JSON.stringify(files))
+      check('软链: 目录软链下的文件被纳入备份',
+        files.includes('dir-link/real.json'), JSON.stringify(files))
+      check('软链: 链接成环不会无限递归（能正常返回）',
+        Array.isArray(files) && files.length < 50, String(files.length))
+
+      // 备份→恢复 往返
+      const payload = buildPayload(root, files)
+      const dst = join(symRoot, 'dst')
+      mkdirSync(dst, { recursive: true })
+      const rr = applyPayloadMode(payload, dst, 'merge')
+      check('软链: 备份内容能正常恢复落地',
+        rr.count === files.length && rr.mismatches.length === 0,
+        'count=' + rr.count + ' expect=' + files.length)
+
+      // 安全属性：mirror 只删链接本身，绝不动它指向的真实文件
+      const outFile = join(symRoot, 'outside-important.txt')
+      writeFileSync(outFile, 'important', 'utf8')
+      const dst2 = join(symRoot, 'dst2')
+      mkdirSync(dst2, { recursive: true })
+      symlinkSync(outFile, join(dst2, 'extra-link.json'))
+      const rm = applyPayloadMode(buildPayload(root, ['sub/real.json']), dst2, 'mirror')
+      check('软链: 完全覆盖只删链接自身，不删链接指向的真实文件',
+        !existsSync(join(dst2, 'extra-link.json')) && existsSync(outFile) &&
+        readFileSync(outFile, 'utf8') === 'important',
+        JSON.stringify(rm.removed))
+    } finally {
+      try { rmSync(symRoot, { recursive: true, force: true }) } catch (e) { /* ignore */ }
+    }
+  }
+}
+
+// ---------- 15. 内部辅助函数的参数容错 ----------
+{
+  // planPayloadApply 的第三参数是可选优化；传错东西不能把整次预览打崩
+  const p = buildPayload((() => {
+    const d = join(tmpdir(), 'dsh-sync-argprobe-' + Date.now())
+    mkdirSync(d, { recursive: true })
+    writeFileSync(join(d, 'a.json'), '{}', 'utf8')
+    return d
+  })(), ['a.json'])
+  let crashed = null
+  let out = null
+  try { out = planPayloadApply(p, join(tmpdir(), 'nonexistent-probe'), { notEntries: true }) } catch (e) { crashed = e }
+  check('参数容错: planPayloadApply 收到无效的第三参数仍能工作（不退化成崩溃）',
+    !crashed && out && out.totals && typeof out.totals.bundle === 'number',
+    crashed ? crashed.message : JSON.stringify(out && out.totals))
 }
 
 console.log('\n==== ' + pass + ' passed, ' + fail + ' failed ====')

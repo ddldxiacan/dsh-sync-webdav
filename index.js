@@ -314,19 +314,39 @@ function dirSize(dir) {
   return out
 }
 
-/** 遍历 root，收集全部应打包文件（返回 posix 相对路径列表，已排序） */
+/** 遍历 root，收集全部应打包文件（返回 posix 相对路径列表，已排序）。
+ *
+ *  符号链接必须跟随：Linux/macOS 上把配置目录软链到别处很常见
+ *  （dotfiles 管理、`skins/` 指向独立仓库、pnpm 风格的目录布局）。
+ *  readdir 的 dirent 对软链只有 isSymbolicLink()，既不算 isFile 也不算 isDirectory，
+ *  旧实现会把它们**静默跳过** —— 备份看着成功，其实少了整棵皮肤/配置目录。
+ *  跟随的同时必须防环（链接回祖父目录会无限递归），用 realpath 记录已访问目录。 */
 export function collectFiles(root) {
   const out = []
+  const seenDirs = new Set()
   const walk = (dir, prefix) => {
+    let real
+    try { real = realpathSync(dir) } catch (e) { return }
+    if (seenDirs.has(real)) return          // 防环：同一个真实目录只走一次
+    seenDirs.add(real)
     let entries
     try { entries = readdirSync(dir, { withFileTypes: true }) } catch (e) { return }
     for (const ent of entries) {
       const rel = prefix ? prefix + '/' + ent.name : ent.name
       const abs = join(dir, ent.name)
-      if (ent.isDirectory()) {
+      let kind = null
+      if (ent.isDirectory()) kind = 'dir'
+      else if (ent.isFile()) kind = 'file'
+      else if (ent.isSymbolicLink()) {
+        // 链接指向什么，要以链接目标为准（断链就跳过，绝不抛错）
+        let st
+        try { st = statSync(abs) } catch (e) { continue }
+        kind = st.isDirectory() ? 'dir' : (st.isFile() ? 'file' : null)
+      }
+      if (kind === 'dir') {
         if (isExcluded(rel)) continue
         walk(abs, rel)
-      } else if (ent.isFile()) {
+      } else if (kind === 'file') {
         let size = 0
         try { size = statSync(abs).size } catch (e) { continue }
         if (isExcluded(rel, size)) continue
@@ -556,7 +576,13 @@ function payloadValidEntries(payload, root) {
  * 冲突 = 本机已有该文件、但内容与备份不同；localOnly = 本机配置范围内、备份里没有的文件（mirror 会删掉它们）。
  */
 export function planPayloadApply(payload, root, parsedEntries) {
-  const { entries, invalid } = parsedEntries || payloadValidEntries(payload, root)
+  // 第三个参数是内部优化（复用已解析条目）。传进来的东西不对就自己重解析，
+  // 不能让一个可选优化参数把整次预览打崩。
+  let parsed = parsedEntries
+  if (!parsed || !Array.isArray(parsed.entries) || !Array.isArray(parsed.invalid)) {
+    parsed = payloadValidEntries(payload, root)
+  }
+  const { entries, invalid } = parsed
   const added = []
   const unchanged = []
   const conflicts = []
