@@ -584,38 +584,57 @@ export function payloadProfileNames(payload) {
  * 决定「备份里的 profile 名 → 本机 profile 名」的映射。
  *
  * targetProfile 是本机实际在跑的 profile 名（调用方传 resolveProfile().name）。
- * 规则（宁可不改，也不猜错）：
- *   - 备份里根本没有 profiles/ 条目 → 无映射
- *   - 备份含本机目标名 → 恒等（同平台恢复，零行为变化）
- *   - 只有「源名与目标名都是平台标准名（desktop / web）」才重映射。
- *     理由：跨平台差异**只**发生在 desktop↔web 这两个固定名之间（桌面版固定 desktop、
- *     `dsh web` 固定 web）。自定义 profile 名（如 alpha→beta）属于用户自己的改名，
- *     备份里没有任何信息能断定它是「同一套配置换了名字」，强行改名会把配置写进
- *     一个用户没打算用的 profile，属于静默猜错，因此保持原样。
- *   - 多 profile 的备份：只在目标名不在其中、且恰好一个平台标准名时映射它，避免把
- *     A 机的 desktop 与 web 混成一个。
+ *
+ * 判定顺序（关键，v0.5.0 修正）：
+ *   1) **优先用备份 meta 里记录的「源机器当时在用的 profile」**（meta.profile）。
+ *      它才是这份备份真正代表的那套配置。多 profile 的机器上尤其重要：
+ *      实测事故（2026-10-20）Windows 机器同时有 desktop（22 个插件，日常在用）
+ *      和 web（4 个插件，备用）两个 profile，备份里两个都在。旧逻辑看到
+ *      「备份里有 web」就直接取恒等，于是 Windows 的 web 覆盖了 Linux 的 web，
+ *      而真正在用的 desktop 被写到 Linux 的 profiles/desktop —— `dsh web` 根本不加载它，
+ *      用户看到的仍是 4 个插件的空壳配置。
+ *   2) 没有 meta（旧备份）时退化为按名字判断：
+ *      - 备份含本机目标名 → 恒等
+ *      - 只有「源名与目标名都是平台标准名（desktop / web）」才重映射
+ *   3) 自定义 profile 名（如 alpha→beta）永不猜测：备份里没有信息能断定这是
+ *      「同一套配置换了名字」，强行改名会把配置写进用户没打算用的 profile。
+ *
+ * 返回的 skip 是「本次不落地」的 profile 名：当源 profile 被映射到 target 时，
+ * 备份里那个与 target 同名的 profile 会写到同一个目录造成互相覆盖，因此跳过它。
  */
 export function planProfileRemap(payload, targetProfile) {
   const target = String(targetProfile || '').trim()
   const names = payloadProfileNames(payload)
-  if (!target || names.length === 0) return { map: {}, from: null, to: null, names }
-  if (names.includes(target)) return { map: {}, from: target, to: target, names }
   const isPlatformName = (n) => n === 'desktop' || n === 'web'
-  // 跨平台映射只在两端都是标准名时成立
+  const none = { map: {}, from: null, to: null, names, skip: [] }
+  if (!target || names.length === 0) return none
+
+  // 1) meta.profile 优先：那是源机器备份时真正在跑的 profile
+  const meta = extractPayloadMeta(payload)
+  const metaProfile = meta && meta.profile ? String(meta.profile).trim() : ''
+  if (metaProfile && names.includes(metaProfile) && metaProfile !== target &&
+      isPlatformName(metaProfile) && isPlatformName(target)) {
+    // 与目标同名的那个 profile 来自源机器的另一套配置，会覆盖到同一目录 → 跳过
+    const skip = names.filter((n) => n !== metaProfile && n === target)
+    return { map: { [metaProfile]: target }, from: metaProfile, to: target, names, skip, reason: 'meta' }
+  }
+
+  // 2) 无 meta 或 meta 不可用时的旧规则
+  if (names.includes(target)) return { map: {}, from: target, to: target, names, skip: [] }
   if (names.length === 1) {
     const from = names[0]
     if (isPlatformName(from) && isPlatformName(target)) {
-      return { map: { [from]: target }, from, to: target, names }
+      return { map: { [from]: target }, from, to: target, names, skip: [] }
     }
-    return { map: {}, from: null, to: null, names }
+    return none
   }
-  // 多 profile：只映射唯一那个平台标准名，其余维持原样
   const platformNames = names.filter(isPlatformName)
   if (platformNames.length === 1 && isPlatformName(target)) {
     const from = platformNames[0]
-    return { map: { [from]: target }, from, to: target, names }
+    const skip = names.filter((n) => n !== from && n === target)
+    return { map: { [from]: target }, from, to: target, names, skip }
   }
-  return { map: {}, from: null, to: null, names }
+  return none
 }
 
 /** 按映射改写一条备份内相对路径；不需要改写时原样返回。 */
@@ -642,6 +661,7 @@ function payloadValidEntries(payload, root, opts) {
   const files = Array.isArray(parsed.files) ? parsed.files : []
   const entries = []
   const invalid = []
+  const skippedProfiles = []
   for (const f of files) {
     if (!f || typeof f.path !== 'string' || !f.path) {
       invalid.push({ path: (f && f.path) ? String(f.path) : '(无路径)', reason: '条目缺少有效路径' })
@@ -653,6 +673,14 @@ function payloadValidEntries(payload, root, opts) {
     }
     // 重映射只改 profiles/<name>/ 这一段。改完必须再过一次 isSafeRelPath：
     // 目标名来自本机 profile 解析，理论上安全，但绝不能因为多一层字符串拼接就放松校验。
+    //
+    // remap.skip 里的 profile：源 profile 已映射到本机目标名，备份里同名的那份若也落地
+    // 会写到同一个目录互相覆盖，所以本次直接不写（不是错误，属于有意的取舍）。
+    const srcHit = PROFILE_DIR_RE.exec(f.path)
+    if (srcHit && Array.isArray(remap && remap.skip) && remap.skip.includes(srcHit[1])) {
+      skippedProfiles.push({ path: f.path, profile: srcHit[1], reason: '该 profile 已被映射到本机目标 profile，避免互相覆盖' })
+      continue
+    }
     const destPath = remapPayloadPath(f.path, remap)
     if (destPath !== f.path && !isSafeRelPath(destPath)) {
       invalid.push({ path: f.path, reason: '重映射后的路径不安全' })
@@ -665,7 +693,7 @@ function payloadValidEntries(payload, root, opts) {
     }
     entries.push({ path: destPath, srcPath: f.path, sha256: f.sha256, buffer: Buffer.from(f.data, 'base64'), abs })
   }
-  return { entries, invalid }
+  return { entries, invalid, skippedProfiles }
 }
 
 /**
@@ -681,7 +709,7 @@ export function planPayloadApply(payload, root, parsedEntries, opts) {
   if (!parsed || !Array.isArray(parsed.entries) || !Array.isArray(parsed.invalid)) {
     parsed = payloadValidEntries(payload, root, { remap: o.remap })
   }
-  const { entries, invalid } = parsed
+  const { entries, invalid, skippedProfiles } = parsed
   const added = []
   const unchanged = []
   const conflicts = []
@@ -710,6 +738,7 @@ export function planPayloadApply(payload, root, parsedEntries, opts) {
   return {
     appDataIncluded,
     added, unchanged, conflicts, localOnly, invalid,
+    profileSkipped: Array.isArray(skippedProfiles) ? skippedProfiles : [],
     totals: {
       bundle: entries.length,
       added: added.length,
@@ -807,6 +836,7 @@ export function applyPayloadMode(payload, root, mode, opts) {
     unchanged: plan.unchanged,
     added: plan.added,
     remapped,
+    profileSkipped: plan.profileSkipped,
     totals: plan.totals,
   }
 }

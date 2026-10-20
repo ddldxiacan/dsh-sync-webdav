@@ -1328,7 +1328,10 @@ check('depKind: registry 版本号', depKind('^0.4.6') === 'registry' && depKind
     const pkgJson = JSON.parse(readFileSync(new URL('./package.json', import.meta.url), 'utf8'))
     check('package.json: engines.dsh 下限接受预发布运行时',
       /^>=0\.2\.1-rc\.2$/.test(pkgJson.dsh.engines.dsh), pkgJson.dsh.engines.dsh)
-    check('package.json: 版本号已随发布推进', /^0\.4\.\d+$/.test(pkgJson.version), pkgJson.version)
+    // 不写死具体版本：只要求是合法的正式版 semver，避免每次发版都得改断言
+    // （写死 0.4.x 时，发 0.5.0 就会假失败，把真正的回归信号淹没）。
+    check('package.json: 版本号是合法 semver（非预发布、非占位）',
+      /^\d+\.\d+\.\d+$/.test(pkgJson.version) && pkgJson.version !== '0.0.0', pkgJson.version)
   }
 }
 
@@ -2337,6 +2340,62 @@ check('depKind: registry 版本号', depKind('^0.4.6') === 'registry' && depKind
       JSON.stringify(sameRes.remapped))
   } finally {
     try { rmSync(remapRoot, { recursive: true, force: true }) } catch (e) { /* ignore */ }
+  }
+}
+
+// ---------- 16b. 多 profile 备份：优先迁移「源机器当时在用的」那份（v0.5.0 回归） ----------
+//
+// 真实事故（2026-10-20）：Windows 机器同时有 desktop（22 插件，日常在用）与
+// web（4 插件，备用）两个 profile，备份里两个都在。旧逻辑看到「备份里有 web」
+// 就直接取恒等，于是 Windows 的 web 覆盖了 Linux 的 web，真正在用的 desktop
+// 被写到 Linux 的 profiles/desktop —— `dsh web` 不加载它，用户看到的仍是空壳配置。
+{
+  const mpRoot = join(tmpdir(), 'dsh-sync-multiprof-' + Date.now())
+  try {
+    const src = join(mpRoot, 'src')
+    for (const [p, n] of [['desktop', 3], ['web', 1]]) {
+      mkdirSync(join(src, 'profiles', p), { recursive: true })
+      writeFileSync(join(src, 'profiles', p, 'cordis.patch.yml'), '- id: ' + p + '\n')
+      writeFileSync(join(src, 'profiles', p, 'marker-' + n + '.txt'), p)
+    }
+    writeFileSync(join(src, 'settings.yaml.imported'), 'x')
+    const files = collectFiles(src)
+    // meta.profile = desktop：源机器备份时真正在跑的 profile
+    const payload = buildPayload(src, files, {
+      dshVersion: '1', profile: 'desktop', createdAt: new Date().toISOString(), linkMap: {}, unmapped: {},
+    }, [])
+    check('多 profile: 能识别备份里有两个 profile', JSON.stringify(payloadProfileNames(payload)) === '["desktop","web"]')
+
+    const remap = planProfileRemap(payload, 'web')
+    check('多 profile: meta.profile(desktop) 优先映射到本机 web',
+      JSON.stringify(remap.map) === '{"desktop":"web"}' && remap.reason === 'meta', JSON.stringify(remap.map))
+    check('多 profile: 备份里与目标同名的 web 被跳过（否则两份写进同一目录互相覆盖）',
+      JSON.stringify(remap.skip) === '["web"]', JSON.stringify(remap.skip))
+
+    const dst = join(mpRoot, 'dst')
+    mkdirSync(join(dst, 'profiles', 'web'), { recursive: true })
+    const res = applyPayloadMode(payload, dst, 'overwrite', { remap })
+    check('多 profile: 源机器 desktop 的配置落到本机 web',
+      readFileSync(join(dst, 'profiles', 'web', 'cordis.patch.yml'), 'utf8') === '- id: desktop\n',
+      readFileSync(join(dst, 'profiles', 'web', 'cordis.patch.yml'), 'utf8'))
+    check('多 profile: 不再创建 profiles/desktop（本机根本不加载它）',
+      !existsSync(join(dst, 'profiles', 'desktop')))
+    check('多 profile: 被跳过的 profile 会在结果里回报，不静默丢',
+      res.profileSkipped.length > 0 && res.profileSkipped.every((x) => x.profile === 'web'),
+      JSON.stringify(res.profileSkipped.map((x) => x.path)))
+
+    // 同平台（desktop→desktop）仍必须恒等
+    const same = planProfileRemap(payload, 'desktop')
+    check('多 profile: 同平台 desktop→desktop 仍是恒等（不误跳自己的 profile）',
+      Object.keys(same.map).length === 0 && same.skip.length === 0, JSON.stringify(same))
+
+    // 旧备份没有 meta → 退化为旧规则（含目标名即恒等）
+    const noMeta = buildPayload(src, files, null, [])
+    const legacy = planProfileRemap(noMeta, 'web')
+    check('多 profile: 无 meta 的旧备份退化为恒等，行为与旧版一致',
+      Object.keys(legacy.map).length === 0 && legacy.from === 'web', JSON.stringify(legacy.map))
+  } finally {
+    try { rmSync(mpRoot, { recursive: true, force: true }) } catch (e) { /* ignore */ }
   }
 }
 

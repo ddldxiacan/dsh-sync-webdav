@@ -7,7 +7,7 @@
 
 > 适用于 [DeepSeek Harness](https://github.com/deepseek-ai) 的双半区插件（Host + Client），零 npm 依赖。
 >
-> 版本 **0.4.9**。要求 DSH **>= 0.2.1-rc.2**（端点栅栏用到 `connection.requestRejection`，profile 判定用到 `ctx.profileContext`）；已在 **0.2.1-rc.2 / Web 版**实测。
+> 版本 **0.5.0**。要求 DSH **>= 0.2.1-rc.2**（端点栅栏用到 `connection.requestRejection`，profile 判定用到 `ctx.profileContext`）；已在 **0.2.1-rc.2 / Web 版**实测。
 >
 > 下限写 `0.2.1-rc.2` 而不是 `0.2.1` 是有意的：按 semver 规范，预发布版本 **不满足** `>=0.2.1` 这种不含预发布标识的范围，
 > 而下限若写 `>=0.2.1`，正在跑 `0.2.1-rc.2` 的机器会被宿主的 `engines.dsh` 校验判为 `incompatible-version`、直接装不上。
@@ -94,6 +94,19 @@ dsh-sync 把这件事变成两个按钮：**备份**（加密上传）和**恢�
 **v0.3.1 起**：恢复成功后提示会明确报告「已恢复 N 个文件（逐文件校验通过）+ 快照名 + 需重启」，被跳过/校验失败的文件会逐个列出，不再静默。
 
 ## 更新说明
+
+### v0.5.0 — 多 profile 备份优先迁移「源机器在用的那份」（重要）
+
+上一版的重映射在**备份里同时存在 desktop 和 web 两个 profile** 时会选错。
+
+**实测事故（2026-10-20）**：Windows 机器同时有 `desktop`（22 个插件，日常在用）和 `web`（4 个插件，备用）两个 profile，备份里两个都在。旧逻辑看到「备份里有 `web`」就直接取**恒等映射**，结果：Windows 的 `web` 覆盖了 Linux 的 `web`，而真正在用的 `desktop` 被写到 Linux 的 `profiles/desktop` —— `dsh web` 根本不加载它。用户看着「恢复成功」，实际拿到的仍是那份 4 插件的空壳配置。
+
+**修复**：重映射优先采用备份 `meta.profile` 记录的「源机器备份时正在使用的 profile」，它才是这份备份真正代表的那套配置。
+
+- `meta.profile=desktop`、本机 `web` → 把 `desktop` 映射到 `web`，**不再看备份里是否有同名 `web`**。
+- 备份里与目标同名的那个 profile（本例的 `web`）**跳过不落地**：两份写进同一目录会互相覆盖，跳过并在结果里逐条回报，不静默丢。
+- 旧备份没有 `meta` 时退化为原有规则（含目标名即恒等），行为与旧版一致，不影响老备份。
+- 同平台（`desktop→desktop`、`web→web`）仍是恒等，零行为变化。
 
 ### v0.4.9 — 自测不再污染真实快照目录
 
@@ -413,7 +426,7 @@ header: { version, salt(b64), iv(b64), tag(b64), payloadSha256 }
 node tools-selftest.mjs
 ```
 
-预期自测全绿（`0 failed`）。覆盖：排除规则（含 `node_modules`/`sessions` 回归断言）、加解密往返、错误口令与篡改拒绝、打包/解包、备份 `meta` 与旧备份向后兼容、快照与回滚（含「`dsh-runtimes/` 必须在回滚后存活」的回归断言）、路径穿越防护、`link:` → 仓库 spec 改写、**B 机恢复 E2E**（A 机备份 → B 机恢复 → 重装插件依赖）、**异步 runner 不阻塞事件循环**（含「源码中不得出现 `spawnSync(`」防退化护栏），一个内置 mock WebDAV 服务器上的 Basic Auth / MKCOL / PUT / GET / PROPFIND 全链路，以及 v0.4.0 新增的回归断言：`PATH` 兜底的各条分支（原生启动器直接执行 / 旁有 `bin/pnpm.mjs` 时用脚本 / Windows `.CMD` 外壳经 cmd.exe / 完全没有 pnpm 时给出「npm i -g pnpm」提示）、`resolveProfile` 优先采信 `profileContext.name`、`requestRejection` 返回 401/403 时 12 个端点全部不进入业务逻辑、`connection` 缺失时 fail-closed、安装失败还原 `package.json`、`parseIgnoredBuildScripts` 与 `allowBuilds` 写入，以及 v0.4.2 新增的**恢复方式**回归断言：`merge` 只写本机缺少的文件且保留本机改过的同名配置、`overwrite` 覆盖同名但保留本机独有配置、`mirror` 覆盖并删除本机独有配置、三种模式都不删聊天记录与运行时、`planPayloadApply` 预览不写盘且把「新增/相同/冲突/本机独有」分开报、未知 mode 回落默认 `merge`，以及 v0.4.9 新增的**自测隔离**回归断言（未指定 `snapshotRoot` 时必须落在测试 root 内、`dshRoot` 不得是真实 `~/.dsh`），以及 v0.4.8 新增的**恢复自保**回归断言（备份不含本插件时依赖与 bundle 注册都会被补回、已存在时幂等、只缺 bundle 时不动已有依赖版本、profile 缺失时 fail-soft、拿不到原声明时不瞎编依赖值），以及 v0.4.7 新增的**远程目录默认值**回归断言（缺字段补 `dsh-sync`、显式空串仍为根目录、自定义目录原样保留、`null`/`undefined` 不抛错、与 `configForDisk` 对接后规范化正确、`backupSearchDirs` 仍覆盖根目录以保证老备份找得到），以及 v0.4.6 新增的**跨平台 profile 重映射**回归断言：`planProfileRemap` 只在 `desktop↔web` 之间映射、同平台恒等、自定义 profile 名不被乱猜、只改 `profiles/<name>/` 一段而不动顶层文件与 `__appdata__`、Win→Linux 与 Linux→Win 两个方向都落到本机 profile、**`mirror` 不得把目标机自己的 profile 整棵删掉**（v0.4.5 的数据丢失点）、以及「可达 WebDAV 时配置真的落盘」（旧用例用必然拒绝连接的 `127.0.0.1:1`，永远走不到落盘分支）。
+预期自测全绿（`0 failed`）。覆盖：排除规则（含 `node_modules`/`sessions` 回归断言）、加解密往返、错误口令与篡改拒绝、打包/解包、备份 `meta` 与旧备份向后兼容、快照与回滚（含「`dsh-runtimes/` 必须在回滚后存活」的回归断言）、路径穿越防护、`link:` → 仓库 spec 改写、**B 机恢复 E2E**（A 机备份 → B 机恢复 → 重装插件依赖）、**异步 runner 不阻塞事件循环**（含「源码中不得出现 `spawnSync(`」防退化护栏），一个内置 mock WebDAV 服务器上的 Basic Auth / MKCOL / PUT / GET / PROPFIND 全链路，以及 v0.4.0 新增的回归断言：`PATH` 兜底的各条分支（原生启动器直接执行 / 旁有 `bin/pnpm.mjs` 时用脚本 / Windows `.CMD` 外壳经 cmd.exe / 完全没有 pnpm 时给出「npm i -g pnpm」提示）、`resolveProfile` 优先采信 `profileContext.name`、`requestRejection` 返回 401/403 时 12 个端点全部不进入业务逻辑、`connection` 缺失时 fail-closed、安装失败还原 `package.json`、`parseIgnoredBuildScripts` 与 `allowBuilds` 写入，以及 v0.4.2 新增的**恢复方式**回归断言：`merge` 只写本机缺少的文件且保留本机改过的同名配置、`overwrite` 覆盖同名但保留本机独有配置、`mirror` 覆盖并删除本机独有配置、三种模式都不删聊天记录与运行时、`planPayloadApply` 预览不写盘且把「新增/相同/冲突/本机独有」分开报、未知 mode 回落默认 `merge`，以及 v0.5.0 新增的**多 profile 优先级**回归断言（`meta.profile` 优先于同名判断、与目标同名的 profile 被跳过并回报、同平台仍恒等、无 meta 的旧备份退化行为不变），以及 v0.4.9 新增的**自测隔离**回归断言（未指定 `snapshotRoot` 时必须落在测试 root 内、`dshRoot` 不得是真实 `~/.dsh`），以及 v0.4.8 新增的**恢复自保**回归断言（备份不含本插件时依赖与 bundle 注册都会被补回、已存在时幂等、只缺 bundle 时不动已有依赖版本、profile 缺失时 fail-soft、拿不到原声明时不瞎编依赖值），以及 v0.4.7 新增的**远程目录默认值**回归断言（缺字段补 `dsh-sync`、显式空串仍为根目录、自定义目录原样保留、`null`/`undefined` 不抛错、与 `configForDisk` 对接后规范化正确、`backupSearchDirs` 仍覆盖根目录以保证老备份找得到），以及 v0.4.6 新增的**跨平台 profile 重映射**回归断言：`planProfileRemap` 只在 `desktop↔web` 之间映射、同平台恒等、自定义 profile 名不被乱猜、只改 `profiles/<name>/` 一段而不动顶层文件与 `__appdata__`、Win→Linux 与 Linux→Win 两个方向都落到本机 profile、**`mirror` 不得把目标机自己的 profile 整棵删掉**（v0.4.5 的数据丢失点）、以及「可达 WebDAV 时配置真的落盘」（旧用例用必然拒绝连接的 `127.0.0.1:1`，永远走不到落盘分支）。
 
 ## 已知限制
 
