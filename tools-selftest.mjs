@@ -30,7 +30,7 @@ import {
   parseIgnoredBuildScripts, parsePnpmAllowBuilds, readAllowBuilds, approveBuilds, isLoopbackRequest,
   applyPayloadMode, planPayloadApply, normalizeRestoreMode, DEFAULT_RESTORE_MODE, RESTORE_MODES,
   pathsEqual, isUnderDir, __setAppDataPlatformForTest,
-  planProfileRemap, remapPayloadPath, payloadProfileNames,
+  planProfileRemap, remapPayloadPath, payloadProfileNames, ensureSelfRegistered,
 } from './index.js'
 
 const APPDATA_PROBE = '__appdata__/dsh-desktop/desktop/settings.json'
@@ -2337,6 +2337,70 @@ check('depKind: registry 版本号', depKind('^0.4.6') === 'registry' && depKind
       JSON.stringify(sameRes.remapped))
   } finally {
     try { rmSync(remapRoot, { recursive: true, force: true }) } catch (e) { /* ignore */ }
+  }
+}
+
+// ---------- 17. 恢复后的自保：插件不能把自己删掉（v0.4.8 回归） ----------
+//
+// 真实事故（2026-10-20）：Windows 机器备份里的 profiles/web 没装本插件，
+// 在 Linux 上用「完全覆盖」恢复后，目标 profile 的 dependencies / bundles /
+// node_modules 里都没有 dsh-sync-webdav 了 —— 设置页卡片消失、端点 404，
+// 用户连回滚按钮都点不到，只能手工重装。这一节锁死「恢复必须把自身补回来」。
+{
+  const selfRoot = join(tmpdir(), 'dsh-sync-self-' + Date.now())
+  const mkProfile = (deps, bundles) => {
+    const dir = join(selfRoot, 'p-' + Math.random().toString(36).slice(2))
+    mkdirSync(dir, { recursive: true })
+    const pkg = { name: 'dsh-profile-web', private: true, dependencies: { ...deps } }
+    if (bundles !== undefined) pkg.dsh = { profile: { bundles: [...bundles] } }
+    writeFileSync(join(dir, 'package.json'), JSON.stringify(pkg, null, 2), 'utf8')
+    return dir
+  }
+  const readPkg = (dir) => JSON.parse(readFileSync(join(dir, 'package.json'), 'utf8'))
+  try {
+    // 场景 A：备份 machine 的 profile 完全没装本插件（事故原样）
+    const A = mkProfile({ 'other-plugin': '1.0.0' }, ['@deepseek-ai/dsh-base', 'other-plugin'])
+    const ra = ensureSelfRegistered(A, 'dsh-sync-webdav', 'github:ddldxiacan/dsh-sync-webdav#v0.4.8')
+    const pa = readPkg(A)
+    check('自保: 恢复后依赖被补回', ra.ok && ra.depAdded && pa.dependencies['dsh-sync-webdav'] === 'github:ddldxiacan/dsh-sync-webdav#v0.4.8')
+    check('自保: 恢复后 bundles 被补回（DSH 只加载 bundles 里列出的包）',
+      ra.bundleAdded && pa.dsh.profile.bundles.includes('dsh-sync-webdav'))
+    check('自保: 其它依赖与字段一律不动',
+      pa.dependencies['other-plugin'] === '1.0.0' &&
+      pa.dsh.profile.bundles.includes('other-plugin') &&
+      pa.name === 'dsh-profile-web')
+
+    // 场景 B：已经存在 → 幂等，不重复添加、不重复写
+    const ra2 = ensureSelfRegistered(A, 'dsh-sync-webdav', 'github:x#v1')
+    const pa2 = readPkg(A)
+    check('自保: 已存在时幂等（不重复追加 bundles）',
+      ra2.ok && ra2.changed === false &&
+      pa2.dsh.profile.bundles.filter((b) => b === 'dsh-sync-webdav').length === 1 &&
+      pa2.dependencies['dsh-sync-webdav'] === 'github:ddldxiacan/dsh-sync-webdav#v0.4.8')
+
+    // 场景 C：只缺 bundles、依赖还在（备份里有依赖但没注册 bundle）
+    const C = mkProfile({ 'dsh-sync-webdav': 'github:ddldxiacan/dsh-sync-webdav#v0.4.7' }, ['@deepseek-ai/dsh-base'])
+    const rc = ensureSelfRegistered(C, 'dsh-sync-webdav', 'github:ddldxiacan/dsh-sync-webdav#v0.4.8')
+    const pc = readPkg(C)
+    check('自保: 只缺 bundle 注册时只补 bundles，不改已有依赖版本',
+      rc.ok && rc.bundleAdded && !rc.depAdded &&
+      pc.dependencies['dsh-sync-webdav'] === 'github:ddldxiacan/dsh-sync-webdav#v0.4.7' &&
+      pc.dsh.profile.bundles.includes('dsh-sync-webdav'))
+
+    // 场景 D：package.json 缺失/损坏 → fail-soft，不抛错
+    const D = join(selfRoot, 'no-such-dir')
+    const rd = ensureSelfRegistered(D, 'dsh-sync-webdav', 'x')
+    check('自保: profile 目录不存在时 fail-soft 不抛错', rd.ok === false, JSON.stringify(rd))
+
+    // 场景 E：没有 spec 时不硬编码猜版本（只补 bundle 注册）
+    const E = mkProfile({}, ['@deepseek-ai/dsh-base'])
+    const re = ensureSelfRegistered(E, 'dsh-sync-webdav', null)
+    const pe = readPkg(E)
+    check('自保: 拿不到原声明时不瞎编依赖值，但 bundle 注册照补',
+      re.bundleAdded && !Object.prototype.hasOwnProperty.call(pe.dependencies, 'dsh-sync-webdav'),
+      JSON.stringify(pe.dependencies))
+  } finally {
+    try { rmSync(selfRoot, { recursive: true, force: true }) } catch (e) { /* ignore */ }
   }
 }
 

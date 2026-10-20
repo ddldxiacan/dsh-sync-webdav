@@ -846,6 +846,13 @@ window.__ModuleLoader__.load({
             parts.push('已把 ' + d.profileRemap.from + ' profile 的 ' + (d.profileRemap.count || 0) +
               ' 个配置写到本机的 ' + d.profileRemap.to + ' profile');
           }
+          // 恢复把插件自己从 profile 覆盖掉时，服务端已自动补回；这里要说明，
+          // 否则用户不知道「为什么插件还在」，也不知道该重装还是重启。
+          if (d.selfRepair && d.selfRepair.changed) {
+            parts.push('这份备份里没有本插件，已自动把它补回 profile' +
+              (d.selfRepair.depAdded ? '（依赖声明）' : '') +
+              (d.selfRepair.bundleAdded ? '（bundle 注册）' : '') + '，无需手动重装');
+          }
           if (d.restored > 0 && d.verified === d.restored && !skipped.length && !mismatch.length) {
             parts.push('已恢复 ' + d.restored + ' 个文件（逐文件校验通过），快照：' + (d.snapshot || '—'));
           } else {

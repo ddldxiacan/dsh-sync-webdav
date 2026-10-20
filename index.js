@@ -2057,6 +2057,60 @@ export function portabilizeRestoredTree(dshRoot, opts) {
   return { profiles }
 }
 
+/**
+ * 恢复后自保：确保**本插件自己**仍在目标 profile 的 dependencies 与 bundles 里。
+ *
+ * 为什么必须有这一步（v0.4.8）：
+ * 恢复会把备份里的 profiles/<name>/package.json 整个覆盖过来。若那份备份来自一台
+ * 「没装本插件」或「插件装在别的 profile」的机器，覆盖后目标机的 profile 里就没有
+ * 本插件了。紧接着设置页会自动触发 pnpm install（按新的 package.json 收敛
+ * node_modules），于是本插件的代码被删掉；DSH 一重启就加载不到这个 bundle，
+ * 设置页的「配置同步」卡片和 /dsh-sync/* 端点一起消失 —— 用户此时**连回滚按钮都点不到**，
+ * 只能手工重装插件才能救回来。
+ *
+ * 实测事故（2026-10-20）：Windows 机器备份里的 profiles/web 恰好没装本插件，在 Linux 上
+ * 用「完全覆盖」恢复后，插件的依赖、bundle 注册与 node_modules 三者全被清掉。
+ *
+ * 所以恢复完成后把自身补回去（依赖 + bundle 注册），并把结果回报给界面。
+ * 只补自己这一个包名，其它依赖与字段一律不动。
+ */
+export function ensureSelfRegistered(profileDir, pkgName, spec) {
+  if (!profileDir || !pkgName) return { ok: false, reason: 'no-profile' }
+  const file = join(profileDir, 'package.json')
+  let pkg
+  try { pkg = JSON.parse(readFileSync(file, 'utf8')) } catch (e) { return { ok: false, reason: 'no-package-json' } }
+  if (!pkg || typeof pkg !== 'object' || Array.isArray(pkg)) return { ok: false, reason: 'bad-package-json' }
+  let changed = false
+  let depAdded = false
+  let bundleAdded = false
+  // 1) dependencies：没这个键就补上（值由调用方给，即恢复前本机的声明）
+  const deps = (pkg.dependencies && typeof pkg.dependencies === 'object' && !Array.isArray(pkg.dependencies))
+    ? pkg.dependencies : {}
+  if (spec && !Object.prototype.hasOwnProperty.call(deps, pkgName)) {
+    deps[pkgName] = spec
+    pkg.dependencies = deps
+    depAdded = true
+    changed = true
+  }
+  // 2) bundles：DSH 只加载 bundles 里列出的包，缺了等同于没装
+  const prof = (pkg.dsh && typeof pkg.dsh === 'object') ? pkg.dsh.profile : null
+  if (prof && typeof prof === 'object') {
+    if (!Array.isArray(prof.bundles)) prof.bundles = []
+    if (!prof.bundles.includes(pkgName)) {
+      prof.bundles.push(pkgName)
+      bundleAdded = true
+      changed = true
+    }
+  }
+  if (!changed) return { ok: true, depAdded: false, bundleAdded: false, changed: false }
+  try {
+    writeJsonFile(file, pkg)
+  } catch (e) {
+    return { ok: false, reason: 'write-failed: ' + (e && e.message ? e.message : String(e)) }
+  }
+  return { ok: true, depAdded, bundleAdded, changed: true }
+}
+
 /** 按名字删除远端 .bundle。条目可以是字符串，或 { name, remoteDir }。非法名字拒绝，404 视为已经不在。 */
 export async function deleteRemoteBackups(cfg, names) {
   const deleted = []
@@ -2679,12 +2733,32 @@ export function apply(ctx, config) {
     // 按模式落地：merge 只补缺失 / overwrite 覆盖但不删 / mirror 完全对齐。排除项一律不动。
     // 与预览用同一套映射规则：预览说会写到哪里，这里就必须写到哪里。
     const remap = planProfileRemap(payload, resolveProfile().name)
+    // 先记下「恢复前本插件是怎么声明的」：备份可能来自没装本插件的机器，
+    // 覆盖后要靠这份声明把自身补回 profile（否则插件会把自己删掉，见 ensureSelfRegistered）。
+    const selfBefore = inspectSelf()
     const r = applyPayloadMode(payload, dshRoot, mode, { remap })
     // 源机器的 file: 绝对路径和 pnpm storeDir 在这台电脑上不存在。不改的话，
     // 接下来的 pnpm install 会整批失败，package.json 里的插件全部显示「包不可用」。
     let portability = { profiles: [] }
     try { portability = portabilizeRestoredTree(dshRoot) } catch (e) {
       log('portabilize failed: ' + (e && e.message ? e.message : String(e)))
+    }
+    // 恢复可能把本插件自己从 profile 里覆盖掉（备份来自没装插件的机器时）。
+    // 必须补回去：插件没了，用户连「回滚」按钮都点不到，只能手工重装。
+    // portabilize 跑完之后再补，避免刚写好又被它改写掉。
+    let selfRepair = null
+    if (selfBefore && selfBefore.ok && selfBefore.pkgName) {
+      try {
+        const prof = resolveProfile()
+        selfRepair = ensureSelfRegistered(prof.dir, selfBefore.pkgName, selfBefore.spec)
+        if (selfRepair && selfRepair.changed) {
+          log('self-register: restored bundle re-added to profile' +
+              (selfRepair.depAdded ? ' (dependencies)' : '') +
+              (selfRepair.bundleAdded ? ' (bundles)' : ''))
+        }
+      } catch (e) {
+        selfRepair = { ok: false, reason: e && e.message ? e.message : String(e) }
+      }
     }
     // 记录本次恢复的插件依赖映射。安装本身由设置页在恢复成功后自动触发
     // （pnpm 可能要几分钟，不放在这条请求里，避免和「先写完文件」缠在一起）。
@@ -2705,7 +2779,8 @@ export function apply(ctx, config) {
         (r.mismatches.length ? ', mismatches ' + r.mismatches.length : '') +
         ' (snapshot ' + lastLocalSnapshot + ')' +
         (meta ? ', install meta captured' : ', no install meta in bundle') +
-        (rewrittenN ? ', retargeted ' + rewrittenN + ' local specs' : ''))
+        (rewrittenN ? ', retargeted ' + rewrittenN + ' local specs' : '') +
+        (selfRepair && selfRepair.changed ? ', self re-registered in profile' : ''))
     return {
       ok: true, mode, restored: r.count, verified: r.verified,
       removedCount: r.removed.length,
@@ -2721,6 +2796,8 @@ export function apply(ctx, config) {
       snapshot: lastLocalSnapshot,
       portability,
       meta: meta ? { profile: meta.profile, linkCount: Object.keys(meta.linkMap || {}).length } : undefined,
+      // 自保结果：备份来自没装本插件的机器时，恢复会把插件自己覆盖掉，这里回报是否补回。
+      selfRepair: selfRepair || null,
       // 跨 profile 迁移明细：让界面能说清「备份里的 desktop 配置写到了本机 web」。
       profileRemap: remap.from && remap.to && remap.from !== remap.to
         ? { from: remap.from, to: remap.to, count: (r.remapped || []).length }
