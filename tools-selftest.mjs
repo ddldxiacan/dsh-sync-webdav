@@ -15,7 +15,7 @@ import {
   isExcludedAppData, collectAppDataFiles, appDataAbsPath,
   bundleName, makeSnapshot, rollbackFromSnapshot, isExcluded,
   davRequest, ensureRemoteDir, parsePropfind, listRemoteBackups, listAccountBackups,
-  backupSearchDirs, normalizeRemoteDir, resolvePassphrase, configForDisk, describeDecryptError,
+  backupSearchDirs, normalizeRemoteDir, resolvePassphrase, configForDisk, describeDecryptError, applyDefaultRemoteDir,
   redactBackupBytes,
   summarizePackedScope, pruneRemoteBackups, parseGitLsRemote,
   repoSpecFromUrl, depKind, collectInstallMeta, extractPayloadMeta,
@@ -1171,6 +1171,25 @@ check('depKind: registry 版本号', depKind('^0.4.6') === 'registry' && depKind
       const c = configForDisk({ passphrase: 'keep-me' }, { url: 'https://dav.example/dav', username: 'a', password: 'b', remoteDir: '/dsh-sync/', passphrase: 'nope' })
       return c.passphrase === 'keep-me' && c.remoteDir === 'dsh-sync' && c.url === 'https://dav.example/dav'
     })())
+  // ---- 远程目录默认值（v0.4.7）----
+  // 语义边界很重要：缺字段 → 补 dsh-sync；显式空串 → 尊重「网盘根目录」。
+  // 若把空串也补成 dsh-sync，老用户（配置里存的正是 ''）下次备份会写到新目录，
+  // 而他们以为备份还在原处 —— 看起来就像备份全丢了。
+  check('默认目录: 请求体没带 remoteDir 时补 dsh-sync',
+    applyDefaultRemoteDir({ url: 'https://dav.example/dav', username: 'a' }).remoteDir === 'dsh-sync')
+  check('默认目录: 显式空串保持根目录语义（不能被默认值顶掉）',
+    applyDefaultRemoteDir({ url: 'x', remoteDir: '' }).remoteDir === '')
+  check('默认目录: 显式自定义目录原样保留',
+    applyDefaultRemoteDir({ url: 'x', remoteDir: '/mine/' }).remoteDir === '/mine/')
+  check('默认目录: body 为 null/undefined 不抛错并补默认',
+    applyDefaultRemoteDir(null).remoteDir === 'dsh-sync' && applyDefaultRemoteDir(undefined).remoteDir === 'dsh-sync')
+  check('默认目录: 默认值与 configForDisk 对接后规范化正确',
+    configForDisk(null, applyDefaultRemoteDir({ url: 'https://dav.example/dav', username: 'a', password: 'b' })).remoteDir === 'dsh-sync')
+  check('默认目录: 空串经 configForDisk 仍是根目录',
+    configForDisk(null, { url: 'x', remoteDir: '' }).remoteDir === '')
+  check('默认目录: backupSearchDirs 会覆盖默认目录与根目录（老备份仍能找到）',
+    JSON.stringify(backupSearchDirs({ remoteDir: 'dsh-sync' })) === JSON.stringify(['dsh-sync', '']))
+
   check('describeDecryptError: 认证失败说成口令不一致', /口令与这份备份不一致/.test(describeDecryptError(new Error('Unsupported state or unable to authenticate data'))))
   check('describeDecryptError: 其它错误原样', describeDecryptError(new Error('不是有效的 dsh-sync 备份文件')) === '不是有效的 dsh-sync 备份文件')
 

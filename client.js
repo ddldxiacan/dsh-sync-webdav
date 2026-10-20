@@ -54,6 +54,10 @@ window.__ModuleLoader__.load({
     const BASE = '/dsh-sync';
     const PREFIX = 'dsh-sync';
 
+    /** 远程目录默认值，与 Host 端 index.js 的 DEFAULT_REMOTE_DIR 保持一致。
+     *  留空仍然允许（= 网盘根目录），只是不再作为默认，避免备份散落在根目录。 */
+    const DEFAULT_REMOTE_DIR = 'dsh-sync';
+
     /** 端点不可达 / 未注册（插件 Host 半区未加载或未注册路由）时的统一文案。 */
     const NOT_READY = '插件服务未就绪：请确认本机已安装 dsh-sync-webdav 插件（与备份同版本）并重启 DeepSeek Harness';
 
@@ -61,7 +65,7 @@ window.__ModuleLoader__.load({
       { key: 'url', label: 'WebDAV URL', placeholder: '例如 https://dav.example.com/dav/', type: 'text' },
       { key: 'username', label: '用户名', placeholder: '例如 user', type: 'text' },
       { key: 'password', label: '密码', placeholder: '留空=沿用已保存的密码', type: 'password' },
-      { key: 'remoteDir', label: '远程目录', placeholder: '建议 dsh-sync；留空是网盘根目录，改完要点保存', type: 'text' },
+      { key: 'remoteDir', label: '远程目录', placeholder: '默认 dsh-sync；留空=网盘根目录', type: 'text' },
     ];
 
     // ============================================================
@@ -456,7 +460,10 @@ window.__ModuleLoader__.load({
 
     function DshSyncSection() {
       // 表单：打开页面时从 Host 已保存的配置回填。用户开始改之后不再被刷新覆盖。
-      const [form, setForm] = useState({ url: '', username: '', password: '', remoteDir: '' });
+      // 远程目录默认预填 dsh-sync：以前是空值+placeholder 提示，多数人会直接跳过，
+      // 结果备份全堆在网盘根目录里，找起来麻烦也容易和别的文件混在一起。
+      // 已保存过配置的机器仍以 Host 回填的实际值为准（见 applySavedConfig），不会被这里覆盖。
+      const [form, setForm] = useState({ url: '', username: '', password: '', remoteDir: DEFAULT_REMOTE_DIR });
       const formDirtyRef = useRef(false);
       const installLock = useRef(false);
       const autoInstallTried = useRef(false);

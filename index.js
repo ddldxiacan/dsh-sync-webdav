@@ -55,6 +55,11 @@ const REMOTE_KEEP = 5
 const CONFIG_FILE_NAME = 'dsh-sync.json'
 const SNAPSHOT_ROOT_NAME = '.dsh-sync-snapshots'
 const RESTORE_STATE_NAME = 'dsh-sync-last-restore.json'
+// 远程目录的默认值。空字符串在历史上表示「网盘根目录」，是个有意义的取值，
+// 不能拿它当「没填」——所以默认值只在字段**完全缺失**时补上（见 applyDefaultRemoteDir）。
+// 为什么要有默认值：根目录下会跟网盘里其它文件混在一起，删/找备份都不方便；
+// 给个固定子目录既清爽，也避免两台机器各自往根目录堆东西。
+const DEFAULT_REMOTE_DIR = 'dsh-sync'
 // Electron 应用级用户数据（settings.json 等）：不在 ~/.dsh 下，单独收集后以 __appdata__/ 前缀入库。
 // 只取稳定的小型配置文件，排除 Chromium 缓存类目录（体积大且可再生）。
 const APPDATA_ROOT_NAME = '@deepseek-ai'
@@ -1160,6 +1165,21 @@ export function resolvePassphrase(saved, body) {
   const stored = saved && typeof saved.passphrase === 'string' ? saved.passphrase : ''
   if (remember && stored) return { passphrase: stored, typed: false, remember }
   return { passphrase: '', typed: false, remember }
+}
+
+/**
+ * 请求体里「没给 remoteDir」时补上默认目录；**显式给的（哪怕空字符串）一律尊重**。
+ *
+ * 这里必须区分「字段缺失」和「字段为空」：
+ *   - 字段缺失（老客户端、脚本只传 url/username/password）→ 用默认 dsh-sync，省得往根目录堆。
+ *   - 显式空字符串 → 用户就是要用网盘根目录（0.4.6 及更早版本里这是「留空=根目录」的语义，
+ *     且已有用户的配置里就存着 ''）。若把它当「没填」补成 dsh-sync，老用户下次备份会
+ *     写到新目录，而他们以为备份还在原处——等于让人觉得「备份全丢了」。
+ */
+export function applyDefaultRemoteDir(body) {
+  const b = (body && typeof body === 'object') ? body : {}
+  if (Object.prototype.hasOwnProperty.call(b, 'remoteDir')) return b
+  return { ...b, remoteDir: DEFAULT_REMOTE_DIR }
 }
 
 /** 保存服务器配置时保留本机口令，并忽略请求体里夹带的口令（口令走单独接口）。 */
@@ -2456,6 +2476,8 @@ export function apply(ctx, config) {
     if (prev && prev.password && body && (body.password === undefined || body.password === null || body.password === '')) {
       body = { ...body, password: prev.password }
     }
+    // 请求体没带 remoteDir 就用默认 dsh-sync；带了（含空字符串）一律照用户的来。
+    body = applyDefaultRemoteDir(body)
     const c = configForDisk(prev, body)
     if (!c.url) return { ok: false, error: 'url 不能为空' }
     const err = await ensureRemoteDir(c)

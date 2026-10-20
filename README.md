@@ -7,7 +7,7 @@
 
 > 适用于 [DeepSeek Harness](https://github.com/deepseek-ai) 的双半区插件（Host + Client），零 npm 依赖。
 >
-> 版本 **0.4.6**。要求 DSH **>= 0.2.1-rc.2**（端点栅栏用到 `connection.requestRejection`，profile 判定用到 `ctx.profileContext`）；已在 **0.2.1-rc.2 / Web 版**实测。
+> 版本 **0.4.7**。要求 DSH **>= 0.2.1-rc.2**（端点栅栏用到 `connection.requestRejection`，profile 判定用到 `ctx.profileContext`）；已在 **0.2.1-rc.2 / Web 版**实测。
 >
 > 下限写 `0.2.1-rc.2` 而不是 `0.2.1` 是有意的：按 semver 规范，预发布版本 **不满足** `>=0.2.1` 这种不含预发布标识的范围，
 > 而下限若写 `>=0.2.1`，正在跑 `0.2.1-rc.2` 的机器会被宿主的 `engines.dsh` 校验判为 `incompatible-version`、直接装不上。
@@ -24,7 +24,7 @@ dsh-sync 把这件事变成两个按钮：**备份**（加密上传）和**恢�
 
 | 功能 | 说明 |
 |---|---|
-| 服务器配置 | WebDAV URL、用户名、密码、远程目录；「保存并测试连接」会真实发起 PROPFIND/MKCOL 验证 |
+| 服务器配置 | WebDAV URL、用户名、密码、远程目录（**默认 `dsh-sync`**，留空=网盘根目录）；「保存并测试连接」会真实发起 PROPFIND/MKCOL 验证 |
 | 状态区 | 远端可达性、备份条目（名称/大小/时间）、最近一次本地快照 |
 | 备份 | 输入口令 → 打包 `~/.dsh` → AES-256-GCM 加密 → PUT 上传 |
 | 恢复 | 选一个备份（或「恢复最新」）→ 看差异预览并选恢复方式（只补缺失 / 覆盖同名 / 完全覆盖）→ 确认 → 自动先做本地快照 → 解密后按所选方式落地 → 改写源机器路径 → 自动安装缺失插件 |
@@ -94,6 +94,17 @@ dsh-sync 把这件事变成两个按钮：**备份**（加密上传）和**恢�
 **v0.3.1 起**：恢复成功后提示会明确报告「已恢复 N 个文件（逐文件校验通过）+ 快照名 + 需重启」，被跳过/校验失败的文件会逐个列出，不再静默。
 
 ## 更新说明
+
+### v0.4.7 — 远程目录默认 `dsh-sync`
+
+以前远程目录是空值 + placeholder 提示（「建议 dsh-sync」），多数人会直接跳过，结果备份全堆在网盘**根目录**里——跟网盘里其它文件混在一起，清理和核对都不方便。
+
+现在改成默认预填 `dsh-sync`：
+
+- **新装 / 没配过**：设置页里远程目录已填好 `dsh-sync`，保存后备份落在 `<你的 WebDAV>/dsh-sync/` 子目录。
+- **脚本 / 老客户端不传 `remoteDir`**：Host 端补默认值，同样落到 `dsh-sync`。
+- **显式留空仍然是「网盘根目录」**：这是一条有意义的语义，且已有用户的配置里存的就是空串。若把空串当「没填」补成默认值，他们下次备份会写到新目录，而自己以为备份还在原处——看起来就像**备份全丢了**。所以只在字段**完全缺失**时才补默认。
+- 备份列表始终同时搜索「当前目录 / 根目录 / `dsh-sync`」三处，老备份不会因为默认值变化而找不到。
 
 ### v0.4.6 — 跨平台恢复不再丢配置（重要）
 
@@ -380,7 +391,7 @@ header: { version, salt(b64), iv(b64), tag(b64), payloadSha256 }
 node tools-selftest.mjs
 ```
 
-预期自测全绿（`0 failed`）。覆盖：排除规则（含 `node_modules`/`sessions` 回归断言）、加解密往返、错误口令与篡改拒绝、打包/解包、备份 `meta` 与旧备份向后兼容、快照与回滚（含「`dsh-runtimes/` 必须在回滚后存活」的回归断言）、路径穿越防护、`link:` → 仓库 spec 改写、**B 机恢复 E2E**（A 机备份 → B 机恢复 → 重装插件依赖）、**异步 runner 不阻塞事件循环**（含「源码中不得出现 `spawnSync(`」防退化护栏），一个内置 mock WebDAV 服务器上的 Basic Auth / MKCOL / PUT / GET / PROPFIND 全链路，以及 v0.4.0 新增的回归断言：`PATH` 兜底的各条分支（原生启动器直接执行 / 旁有 `bin/pnpm.mjs` 时用脚本 / Windows `.CMD` 外壳经 cmd.exe / 完全没有 pnpm 时给出「npm i -g pnpm」提示）、`resolveProfile` 优先采信 `profileContext.name`、`requestRejection` 返回 401/403 时 12 个端点全部不进入业务逻辑、`connection` 缺失时 fail-closed、安装失败还原 `package.json`、`parseIgnoredBuildScripts` 与 `allowBuilds` 写入，以及 v0.4.2 新增的**恢复方式**回归断言：`merge` 只写本机缺少的文件且保留本机改过的同名配置、`overwrite` 覆盖同名但保留本机独有配置、`mirror` 覆盖并删除本机独有配置、三种模式都不删聊天记录与运行时、`planPayloadApply` 预览不写盘且把「新增/相同/冲突/本机独有」分开报、未知 mode 回落默认 `merge`，以及 v0.4.6 新增的**跨平台 profile 重映射**回归断言：`planProfileRemap` 只在 `desktop↔web` 之间映射、同平台恒等、自定义 profile 名不被乱猜、只改 `profiles/<name>/` 一段而不动顶层文件与 `__appdata__`、Win→Linux 与 Linux→Win 两个方向都落到本机 profile、**`mirror` 不得把目标机自己的 profile 整棵删掉**（v0.4.5 的数据丢失点）、以及「可达 WebDAV 时配置真的落盘」（旧用例用必然拒绝连接的 `127.0.0.1:1`，永远走不到落盘分支）。
+预期自测全绿（`0 failed`）。覆盖：排除规则（含 `node_modules`/`sessions` 回归断言）、加解密往返、错误口令与篡改拒绝、打包/解包、备份 `meta` 与旧备份向后兼容、快照与回滚（含「`dsh-runtimes/` 必须在回滚后存活」的回归断言）、路径穿越防护、`link:` → 仓库 spec 改写、**B 机恢复 E2E**（A 机备份 → B 机恢复 → 重装插件依赖）、**异步 runner 不阻塞事件循环**（含「源码中不得出现 `spawnSync(`」防退化护栏），一个内置 mock WebDAV 服务器上的 Basic Auth / MKCOL / PUT / GET / PROPFIND 全链路，以及 v0.4.0 新增的回归断言：`PATH` 兜底的各条分支（原生启动器直接执行 / 旁有 `bin/pnpm.mjs` 时用脚本 / Windows `.CMD` 外壳经 cmd.exe / 完全没有 pnpm 时给出「npm i -g pnpm」提示）、`resolveProfile` 优先采信 `profileContext.name`、`requestRejection` 返回 401/403 时 12 个端点全部不进入业务逻辑、`connection` 缺失时 fail-closed、安装失败还原 `package.json`、`parseIgnoredBuildScripts` 与 `allowBuilds` 写入，以及 v0.4.2 新增的**恢复方式**回归断言：`merge` 只写本机缺少的文件且保留本机改过的同名配置、`overwrite` 覆盖同名但保留本机独有配置、`mirror` 覆盖并删除本机独有配置、三种模式都不删聊天记录与运行时、`planPayloadApply` 预览不写盘且把「新增/相同/冲突/本机独有」分开报、未知 mode 回落默认 `merge`，以及 v0.4.7 新增的**远程目录默认值**回归断言（缺字段补 `dsh-sync`、显式空串仍为根目录、自定义目录原样保留、`null`/`undefined` 不抛错、与 `configForDisk` 对接后规范化正确、`backupSearchDirs` 仍覆盖根目录以保证老备份找得到），以及 v0.4.6 新增的**跨平台 profile 重映射**回归断言：`planProfileRemap` 只在 `desktop↔web` 之间映射、同平台恒等、自定义 profile 名不被乱猜、只改 `profiles/<name>/` 一段而不动顶层文件与 `__appdata__`、Win→Linux 与 Linux→Win 两个方向都落到本机 profile、**`mirror` 不得把目标机自己的 profile 整棵删掉**（v0.4.5 的数据丢失点）、以及「可达 WebDAV 时配置真的落盘」（旧用例用必然拒绝连接的 `127.0.0.1:1`，永远走不到落盘分支）。
 
 ## 已知限制
 
