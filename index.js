@@ -3389,6 +3389,8 @@ export function apply(ctx, config) {
 
   /** 供 tools-selftest.mjs 直接调用的内部句柄（不启动 DSH、不注册路由） */
   apply._internals = {
+    // snapshotRoot 暴露出来仅供自测断言「测试隔离」用（自测绝不能写用户真实快照目录）
+    snapshotRoot, dshRoot,
     handlePlugins, handlePluginInstall, buildPluginsReport, resolveProfile, defaultRunner,
     handleVersion, handleUpgrade, inspectSelf, versionCache, runProfileInstall,
     handleStatus, handleDelete, handlePassphrase, handleConfig, handleBackup,
@@ -3494,7 +3496,16 @@ export let selftest = null
  *  cfg.enableRoutes=false 时连 webServer 注入都跳过，便于在纯 node 下验证端点逻辑。 */
 export function createTestHarness(config) {
   const fakeCtx = { inject: () => () => {}, effect: () => () => {} }
-  apply(fakeCtx, { ...(config || {}), __test: true })
+  const cfg = { ...(config || {}), __test: true }
+  // 自测必须完全隔离。apply() 没给 snapshotRoot 时会退回 join(homedir(), '.dsh-sync-snapshots')，
+  // 而自测会反复 makeSnapshot/rollback —— 于是每跑一次自测，就往**用户真实的快照目录**写几份快照，
+  // 并按「保留 5 份」把用户自己的回滚点顶掉。
+  // 实测事故（2026-10-20）：连跑几次自测后，用户恢复前的快照被挤掉，回滚点丢失。
+  // 因此只要没显式给 snapshotRoot，就放进 root 内部：同样隔离，且绝不碰真实 home。
+  if (cfg.snapshotRoot === undefined) {
+    cfg.snapshotRoot = join(String(cfg.root || join(homedir(), '.dsh')), '.dsh-sync-snapshots')
+  }
+  apply(fakeCtx, cfg)
   selftest = apply._internals
   return selftest
 }

@@ -7,7 +7,7 @@
 import { createHash } from 'node:crypto'
 import { createServer } from 'node:http'
 import { mkdirSync, readFileSync, readdirSync, rmSync, statSync, writeFileSync, existsSync, symlinkSync } from 'node:fs'
-import { tmpdir } from 'node:os'
+import { tmpdir, homedir } from 'node:os'
 import { dirname, join } from 'node:path'
 import {
   buildPayload, collectFiles, encryptBundle, decryptBundle, extractPayload,
@@ -2337,6 +2337,27 @@ check('depKind: registry 版本号', depKind('^0.4.6') === 'registry' && depKind
       JSON.stringify(sameRes.remapped))
   } finally {
     try { rmSync(remapRoot, { recursive: true, force: true }) } catch (e) { /* ignore */ }
+  }
+}
+
+// ---------- 17. 自测隔离：绝不写用户真实快照目录（v0.4.9 回归） ----------
+//
+// 真实事故（2026-10-20）：createTestHarness 没给 snapshotRoot 时会退回
+// join(homedir(), '.dsh-sync-snapshots')，而自测反复 makeSnapshot/rollback，
+// 于是每跑一次自测就往用户真实快照目录写几份、并按「保留 5 份」顶掉用户自己的回滚点。
+// 连跑几次后用户的恢复前快照被挤掉，回滚点丢失。这条断言锁死「自测默认隔离」。
+{
+  const isoRoot = join(tmpdir(), 'dsh-sync-iso-' + Date.now())
+  try {
+    mkdirSync(isoRoot, { recursive: true })
+    const h = createTestHarness({ root: isoRoot, profile: 'web' })
+    check('隔离: 未指定 snapshotRoot 时落在测试 root 内部，而非用户 home',
+      !!h.snapshotRoot && h.snapshotRoot.startsWith(isoRoot) && !h.snapshotRoot.startsWith(homedir()),
+      h.snapshotRoot)
+    check('隔离: dshRoot 也确实是测试传入的 root（不是真实 ~/.dsh）',
+      h.dshRoot === isoRoot, h.dshRoot)
+  } finally {
+    try { rmSync(isoRoot, { recursive: true, force: true }) } catch (e) { /* ignore */ }
   }
 }
 
