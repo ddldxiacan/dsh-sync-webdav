@@ -323,18 +323,36 @@ pnpm --version       # 必须能在 PATH 里被找到
 | 原生启动器（pnpm ≥ 10 的 ELF/Mach-O/PE） | 直接执行 | 交给 node 会 `SyntaxError: Invalid or unexpected token` |
 | Windows 的 `pnpm.CMD` 外壳（corepack/npm 装法） | `cmd.exe /d /s /c ""<path>" <args>"` + `windowsVerbatimArguments` | spawn 直接跑 `.CMD` 是 `EINVAL`，带空格的路径还会被截成 `'C:\Program'` |
 
-### 方式一：通过 DSH 插件管理器安装（推荐）
+### 方式一：从 npm 安装（推荐）
 
-在 DSH 的**插件管理**界面填入仓库地址安装：
+已发布到 npm，在 DSH 的**插件管理**界面填入包名即可：
 
 ```
-github:ddldxiacan/dsh-sync-webdav
+dsh-sync-webdav
 ```
 
 或使用 CLI：
 
 ```powershell
-dsh plugin --profile <你的profile> install github:ddldxiacan/dsh-sync-webdav   # Web 版通常是 --profile web
+dsh plugin --profile <你的profile> add dsh-sync-webdav   # Web 版通常是 --profile web
+```
+
+本插件**零 npm 依赖**（只装它自己一个包）、不含需要构建脚本的依赖，所以一条命令即装好，
+不需要任何额外参数，也不需要 Git。DSH 会读取 `package.json` 里的 `dsh.bundle.patch`，
+自动把 `dsh-sync` 注册进 profile 的 `cordis.patch.yml`，**无需手工改配置**。
+
+### 方式一·备选：从 GitHub 仓库安装
+
+不想走 npm 时可改用仓库地址：
+
+```
+github:ddldxiacan/dsh-sync-webdav
+```
+
+或：
+
+```powershell
+dsh plugin --profile <你的profile> add github:ddldxiacan/dsh-sync-webdav   # Web 版通常是 --profile web
 ```
 
 DSH 会通过 pnpm 拉取本仓库，读取 `package.json` 里的 `dsh.bundle.patch`，自动把 `dsh-sync` 注册进 profile 的 `cordis.patch.yml`，**无需手工改配置**。
@@ -343,10 +361,10 @@ DSH 会通过 pnpm 拉取本仓库，读取 `package.json` 里的 `dsh.bundle.pa
 >
 > 仓库为 **Public**，因此无需任何凭据即可安装。（若你 fork 后改为 Private，则需确保本机 git 已能访问该仓库：HTTPS 走 Personal Access Token，或配置 SSH key。）
 
-### 方式二：本地目录安装（开发调试）
+### 方式二：本地目录安装（开发调试 / 二次开发）
 
 ```powershell
-dsh plugin --profile <你的profile> install "E:\完整路径\dsh-sync-webdav"
+dsh plugin --profile <你的profile> add "E:\完整路径\dsh-sync-webdav"
 ```
 
 插件管理器同样支持**绝对路径**安装，适合改完代码立刻验证。
