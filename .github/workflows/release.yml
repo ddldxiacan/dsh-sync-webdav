@@ -90,6 +90,12 @@ jobs:
       # Publishing twice for the same version is an npm error, not a failure of
       # this release: it means the version was already shipped (for example a
       # re-run of a failed job). Detect it and continue to the GitHub Release.
+      #
+      # ONLY "this exact version already exists" may be tolerated. A 403 means
+      # the token is not allowed to publish (npm requires a Granular Access
+      # Token with Bypass 2FA) and MUST fail: swallowing it publishes nothing
+      # while the job goes green, which is how a release can silently ship only
+      # a GitHub tarball and no registry version.
       - name: Publish to npm
         id: npm
         env:
@@ -101,20 +107,42 @@ jobs:
             echo "published=false" >> "$GITHUB_OUTPUT"
             exit 0
           fi
+          VERSION="$(node -p 'require("./package.json").version')"
           set +e
           OUT="$(npm publish --access public 2>&1)"
           STATUS=$?
           set -e
           printf '%s\n' "$OUT"
+
           if [ $STATUS -eq 0 ]; then
             echo "published=true" >> "$GITHUB_OUTPUT"
-          elif printf '%s' "$OUT" | grep -qE 'E403|EPUBLISHCONFLICT|cannot publish over the previously published version'; then
-            echo "::notice::npm publish refused because this version is already on the registry; continuing."
-            echo "published=false" >> "$GITHUB_OUTPUT"
-          else
-            echo "::error::npm publish failed with exit code $STATUS"
-            exit $STATUS
+            exit 0
           fi
+
+          # Already on the registry? Tolerate ONLY that specific refusal.
+          if printf '%s' "$OUT" | grep -q "cannot publish over the previously published versions: ${VERSION}"; then
+            echo "::notice::${VERSION} is already on the registry; nothing to publish."
+            echo "published=false" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          # Everything else is a real failure, with the cause named.
+          if printf '%s' "$OUT" | grep -qE 'E403|bypass 2fa|Two-factor'; then
+            echo "::error::npm refused to publish (403). NPM_TOKEN must be a Granular Access Token with 'Bypass 2FA' enabled — an ordinary or 2FA-bound token cannot publish."
+          elif printf '%s' "$OUT" | grep -qE 'E401|ENEEDAUTH|401'; then
+            echo "::error::npm rejected the token (401). NPM_TOKEN is missing, revoked, or expired."
+          else
+            echo "::error::npm publish failed with exit code ${STATUS}"
+          fi
+          exit $STATUS
+
+      # The registry is the install path most users take, so a release that did
+      # not reach it must be visible as a failed run rather than a green one.
+      - name: Fail when the registry did not receive this version
+        if: steps.npm.outputs.published != 'true'
+        run: |
+          echo "::error::This release did NOT publish to npm (see the Publish to npm step). The GitHub Release was created, but 'dsh plugin add dsh-sync-webdav' will keep serving the previous version."
+          exit 1
 
       - name: Publish GitHub Release
         uses: softprops/action-gh-release@v2
