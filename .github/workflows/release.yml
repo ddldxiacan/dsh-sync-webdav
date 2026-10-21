@@ -1,0 +1,125 @@
+name: Release
+
+# Cut a release by pushing a tag. The tag is the single source of truth for the
+# version: it is written into package.json before publishing, so the manifest can
+# never disagree with the tag.
+#
+#   git tag v0.5.2 && git push origin v0.5.2
+#
+# What a tag produces:
+#   1. self-test gate (the same suite CI runs — never publish a red build)
+#   2. `npm publish --access public` to registry.npmjs.org
+#   3. a GitHub Release carrying the packed tarball, so non-npm installs work too
+#
+# The npm step needs the NPM_TOKEN repository secret. Absent, it reports and
+# skips rather than failing the release — the GitHub Release tarball remains a
+# working install path on its own.
+
+on:
+  push:
+    tags: ['v*']
+
+permissions:
+  contents: write
+
+jobs:
+  release:
+    name: Test, publish to npm, and cut a GitHub Release
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          registry-url: 'https://registry.npmjs.org'
+
+      - name: Resolve version from tag
+        id: version
+        run: |
+          VERSION="${GITHUB_REF_NAME#v}"
+          if ! printf '%s' "$VERSION" | grep -Eq '^[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z.-]+)?$'; then
+            echo "::error::Tag '$GITHUB_REF_NAME' is not a semantic version (expected vX.Y.Z)."
+            exit 1
+          fi
+          echo "version=$VERSION" >> "$GITHUB_OUTPUT"
+          echo "Releasing version $VERSION"
+
+      - name: Gate on the self-test
+        run: node tools-selftest.mjs
+
+      - name: Write the version into the manifest
+        run: |
+          node -e '
+            const fs = require("node:fs");
+            const manifest = JSON.parse(fs.readFileSync("package.json", "utf8"));
+            manifest.version = process.env.VERSION;
+            fs.writeFileSync("package.json", JSON.stringify(manifest, null, 2) + "\n");
+          '
+        env:
+          VERSION: ${{ steps.version.outputs.version }}
+
+      - name: Guard against a stale tag
+        run: |
+          # A tag whose manifest already carries a different version means the
+          # tag is behind main in a way that would silently publish the wrong
+          # code. Refuse instead of guessing.
+          if ! git diff --quiet -- package.json; then
+            echo "package.json version rewritten by this run:"
+            git --no-pager diff -- package.json
+          fi
+          node -e '
+            const v = require("./package.json").version;
+            if (v !== process.env.VERSION) {
+              console.error("::error::manifest version " + v + " != tag " + process.env.VERSION);
+              process.exit(1);
+            }
+            console.log("manifest version matches the tag: " + v);
+          '
+        env:
+          VERSION: ${{ steps.version.outputs.version }}
+
+      - name: Pack
+        id: pack
+        run: |
+          npm pack
+          TGZ="$(ls ./*.tgz)"
+          echo "tgz=${TGZ}" >> "$GITHUB_OUTPUT"
+          ls -la "${TGZ}"
+
+      # Publishing twice for the same version is an npm error, not a failure of
+      # this release: it means the version was already shipped (for example a
+      # re-run of a failed job). Detect it and continue to the GitHub Release.
+      - name: Publish to npm
+        id: npm
+        env:
+          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
+        run: |
+          if [ -z "${NODE_AUTH_TOKEN}" ]; then
+            echo "NPM_TOKEN is not configured; skipping npm publish."
+            echo "The GitHub Release tarball remains a working install path."
+            echo "published=false" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          set +e
+          OUT="$(npm publish --access public 2>&1)"
+          STATUS=$?
+          set -e
+          printf '%s\n' "$OUT"
+          if [ $STATUS -eq 0 ]; then
+            echo "published=true" >> "$GITHUB_OUTPUT"
+          elif printf '%s' "$OUT" | grep -qE 'E403|EPUBLISHCONFLICT|cannot publish over the previously published version'; then
+            echo "::notice::npm publish refused because this version is already on the registry; continuing."
+            echo "published=false" >> "$GITHUB_OUTPUT"
+          else
+            echo "::error::npm publish failed with exit code $STATUS"
+            exit $STATUS
+          fi
+
+      - name: Publish GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          name: dsh-sync-webdav v${{ steps.version.outputs.version }}
+          files: ${{ steps.pack.outputs.tgz }}
+          generate_release_notes: true
+          fail_on_unmatched_files: true

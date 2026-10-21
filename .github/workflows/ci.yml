@@ -1,0 +1,53 @@
+name: CI
+
+# Every push to main and every pull request runs the plugin's own self-test.
+#
+# The suite is `node tools-selftest.mjs` with zero dependencies, so this needs no
+# install step at all — which is also why it is a reliable gate: nothing can fail
+# because of a registry hiccup or a lockfile disagreement.
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  verify:
+    name: Self-test
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+
+      - name: Self-test
+        run: node tools-selftest.mjs
+
+      # The package ships no build step, so "does it pack, and does the tarball
+      # contain what it should" is the whole distribution contract.
+      - name: Pack dry-run
+        run: |
+          npm pack --dry-run
+          node -e '
+            const { execSync } = require("node:child_process");
+            const out = JSON.parse(execSync("npm pack --dry-run --json", { encoding: "utf8" }))[0];
+            const names = out.files.map((f) => f.path).sort();
+            const expected = ["LICENSE", "README.md", "client.js", "cordis.patch.yml", "index.js", "package.json", "tools-selftest.mjs"].sort();
+            const missing = expected.filter((n) => !names.includes(n));
+            const extra = names.filter((n) => !expected.includes(n));
+            if (missing.length > 0) {
+              console.error("::error::tarball is missing: " + missing.join(", "));
+              process.exit(1);
+            }
+            if (extra.length > 0) {
+              console.error("::error::tarball carries unexpected files: " + extra.join(", "));
+              process.exit(1);
+            }
+            console.log("tarball contents are exactly the expected " + names.length + " files");
+          '
