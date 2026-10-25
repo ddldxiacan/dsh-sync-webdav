@@ -65,6 +65,31 @@ const DEFAULT_REMOTE_DIR = 'dsh-sync'
 const APPDATA_ROOT_NAME = '@deepseek-ai'
 const APPDATA_PREFIX = '__appdata__/'
 const APPDATA_MAX_FILE_BYTES = 2 * 1024 * 1024
+
+// —— home 级挂载点 ——
+// DSH 插件与相邻工具的自定义模型配置并不总在 ~/.dsh 下：模型目录、价表、provider
+// 切换器散落在 home 根下。只按白名单收「配置」，绝不收可重建产物（venv / .git /
+// 备份 / 日志 / 会话），并同样以挂载前缀并入同一 payload，恢复/回滚时写回原位。
+const HOME_PREFIX = '__home__/'
+// 单文件上限比 AppData 宽（.cc-switch 的 sqlite 就是 1.2MB），但仍设上限防止误收大文件。
+const HOME_MAX_FILE_BYTES = 8 * 1024 * 1024
+// name  home 下的顶层名；include 非空时只收这些相对路径（目录则整棵收）；
+// excludeDirs / excludeFiles 是逐项黑名单（可再生的备份、日志、诊断产物）。
+const HOME_MOUNTS = [
+  { name: '.dsh-freetap' },
+  { name: '.dsh-opencode-free' },
+  { name: '.opencode2dsh' },
+  { name: '.dsh-wallpaper-engine', excludeDirs: ['diag', 'cache', 'thumbs', 'uploads', 'avatars', 'ffmpeg'] },
+  { name: '.cc-switch', excludeDirs: ['backups', 'logs'], excludeFiles: ['crash.log'] },
+  { name: '.claude', include: ['settings.json', 'settings.local.json', 'skills', 'cc-haha', 'plugins/known_marketplaces.json'] },
+]
+// 任何挂载点内都不收的目录名：可重建 / 可再生 / 仓库元数据 / 机器本地运行态。
+const HOME_SKIP_DIR_NAMES = new Set(['node_modules', '.git', '.runtime', 'cache', 'Cache', 'logs', 'tmp'])
+// ~/.dsh 里被 cache*/tmp* 规则误伤的「配置性质」路径前缀：显式白名单放行。
+// peakrate.json 是模型分时费率表，属于模型数据，不是可再生缓存。
+const CACHE_KEEP_PREFIXES = [
+  'cache/dsh-claude-style/',
+]
 export function isExcludedAppData(relPosix, fileSizeBytes, isDir) {
   // 采用「缓存目录黑名单 + 顶层文件白名单」：Chromium/Electron 的 userData 下绝大多数是
   // 缓存类可再生内容，只同步已知承载用户配置的文件与目录。
@@ -155,6 +180,102 @@ export function appDataAbsPath(relPosix) {
   if (!roaming) return null
   return join(roaming, APPDATA_ROOT_NAME, ...rel.split('/'))
 }
+// home 根目录：默认 **未启用**（返回 null，不收集任何 home 文件）。
+// 由插件入口 apply() 显式启用（生产 = homedir()），自测由 createTestHarness 注入隔离目录。
+// 为什么不能默认 homedir()：模块层直接调用 makeSnapshot / rollback / buildPayload 的代码
+// 会去读、甚至按 mirror 删用户真实的 ~/.cc-switch、~/.claude —— 那是删用户数据。
+// 不隔离的话，自测会读到用户真实的 ~/.cc-switch、~/.claude，而 mirror 用例会按
+// payload 删掉 home 里「备份没有」的配置 —— 直接删用户数据。
+let HOME_ROOT_OVERRIDE = null
+export function __setHomeRootForTest(p) { HOME_ROOT_OVERRIDE = p || null }
+function homeRoot() { return HOME_ROOT_OVERRIDE }
+/** 挂载点表（副本，调用方改不到内部常量）。 */
+export function homeMounts() { return HOME_MOUNTS.map((m) => ({ ...m })) }
+/**
+ * 一个挂载点内的相对路径是否应收集。
+ * include 对目录判「是否为某条目的祖先」，否则 plugins 这种中间目录会被整棵剪掉，
+ * 底下的 plugins/known_marketplaces.json 永远收不到。
+ */
+function homeMountKeeps(mount, rel, isDir) {
+  const segs = rel.split('/')
+  for (const seg of segs) {
+    if (HOME_SKIP_DIR_NAMES.has(seg)) return false
+    if (seg.startsWith('tmp') || seg.startsWith('cache')) return false
+  }
+  if (Array.isArray(mount.excludeDirs)) {
+    const dirSegs = isDir ? segs : segs.slice(0, -1)
+    if (dirSegs.some((s) => mount.excludeDirs.includes(s))) return false
+  }
+  if (!isDir && Array.isArray(mount.excludeFiles) && mount.excludeFiles.includes(segs[segs.length - 1])) return false
+  if (Array.isArray(mount.include)) {
+    const ok = isDir
+      ? mount.include.some((p) => p === rel || rel.startsWith(p + '/') || p.startsWith(rel + '/'))
+      : mount.include.some((p) => rel === p || rel.startsWith(p + '/'))
+    if (!ok) return false
+  }
+  return true
+}
+/** 遍历 home 挂载点，收集全部应打包文件（返回带 __home__ 前缀的 posix 路径，已排序）。 */
+export function collectHomeFiles() {
+  const home = homeRoot()
+  if (!home) return []
+  const out = []
+  for (const mount of HOME_MOUNTS) {
+    const seen = new Set()
+    const walk = (dir, prefix) => {
+      let real
+      try { real = realpathSync(dir) } catch (e) { return }
+      if (seen.has(real)) return
+      seen.add(real)
+      let entries
+      try { entries = readdirSync(dir, { withFileTypes: true }) } catch (e) { return }
+      for (const ent of entries) {
+        const rel = prefix ? prefix + '/' + ent.name : ent.name
+        const abs = join(dir, ent.name)
+        let kind = null
+        if (ent.isDirectory()) kind = 'dir'
+        else if (ent.isFile()) kind = 'file'
+        else if (ent.isSymbolicLink()) {
+          let st
+          try { st = statSync(abs) } catch (e) { continue }
+          kind = st.isDirectory() ? 'dir' : (st.isFile() ? 'file' : null)
+        }
+        if (kind === 'dir') {
+          if (!homeMountKeeps(mount, rel, true)) continue
+          walk(abs, rel)
+        } else if (kind === 'file') {
+          if (!homeMountKeeps(mount, rel, false)) continue
+          let size = 0
+          try { size = statSync(abs).size } catch (e) { continue }
+          if (size > HOME_MAX_FILE_BYTES) continue
+          out.push(HOME_PREFIX + mount.name + '/' + rel)
+        }
+      }
+    }
+    walk(join(home, mount.name), '')
+  }
+  out.sort()
+  return out
+}
+/** home 挂载路径（带 __home__/ 前缀）→ 绝对路径；非法、前缀不符或非白名单挂载点返回 null */
+export function homeAbsPath(relPosix) {
+  if (typeof relPosix !== 'string' || !relPosix.startsWith(HOME_PREFIX)) return null
+  const rel = relPosix.slice(HOME_PREFIX.length)
+  if (!isSafeRelPath(rel)) return null
+  const top = rel.split('/')[0]
+  if (!HOME_MOUNTS.some((m) => m.name === top)) return null
+  const home = homeRoot()
+  if (!home) return null
+  return join(home, ...rel.split('/'))
+}
+/** 备份内路径 → 本机绝对路径：root 内条目直连，带挂载前缀的交给对应挂载点解析。 */
+export function resolvePayloadAbs(relPath, root) {
+  if (typeof relPath !== 'string' || !relPath) return null
+  if (relPath.startsWith(APPDATA_PREFIX)) return appDataAbsPath(relPath)
+  if (relPath.startsWith(HOME_PREFIX)) return homeAbsPath(relPath)
+  return join(root, relPath)
+}
+
 // B 机恢复后重装插件依赖用。桌面版把运行时放在 primary-runtime/dependencies/ 下
 // （runtime.json 的 pnpm 字段），旧布局 runtime/pnpm/ 仍保留作兼容。
 const PNPM_CANDIDATES = [
@@ -194,17 +315,22 @@ export function isExcluded(relPosix, fileSizeBytes) {
   const rel = String(relPosix || '')
   if (CHAT_DERIVED_PATHS.has(rel)) return true
   const segs = rel.split('/')
+  // 白名单：被 cache*/tmp* 规则误伤的配置性质路径照收（模型费率表等）
+  const keepByPrefix = CACHE_KEEP_PREFIXES.some((p) => rel.startsWith(p) || p.startsWith(rel + '/'))
   for (const seg of segs) {
     if (CHAT_DIR_NAMES.has(seg) || REBUILDABLE_DIR_NAMES.has(seg) || EPHEMERAL_DIR_NAMES.has(seg)) return true
+    if (keepByPrefix) continue
     if (seg.startsWith('tmp') || seg.startsWith('cache')) return true
-  }
   if (fileSizeBytes !== undefined && fileSizeBytes > MAX_FILE_BYTES) return true
+  }
   return false
 }
 
 /** 某一类排除原因（无则 undefined）。供 describeScope 与界面文案共用。 */
-function exclusionReason(rel) {
+export function exclusionReason(rel) {
   if (CHAT_DERIVED_PATHS.has(rel)) return '聊天派生数据'
+  // 白名单内的路径不算排除项，否则范围卡片会把它同时报成「已同步」和「已排除」。
+  if (CACHE_KEEP_PREFIXES.some((p) => rel.startsWith(p) || p.startsWith(rel + '/'))) return undefined
   for (const seg of rel.split('/')) {
     if (seg === 'sessions') return '聊天记录'
     if (seg === 'attachments') return '聊天文件'
@@ -266,6 +392,16 @@ export function describeScope(root, opts) {
     }
   }
   walk(root, '')
+  // home 挂载点也算「本次同步范围」的一部分，单独列出来，
+  // 否则用户在范围卡片里看不到它们，只能靠信。
+  for (const rel of collectHomeFiles()) {
+    const segs = rel.split('/')
+    const name = HOME_PREFIX + (segs[1] || '')
+    let size = 0
+    const abs = homeAbsPath(rel)
+    if (abs) { try { size = statSync(abs).size } catch (e) { size = 0 } }
+    bump(included, name, 1, size)
+  }
   const bySize = (a, b) => b.bytes - a.bytes
   const inc = [...included.values()].sort(bySize).map((r) => ({ name: r.name, files: r.files, bytes: r.bytes }))
   const exc = [...excluded.values()].sort(bySize).map((r) => {
@@ -376,7 +512,7 @@ export function redactBackupBytes(rel, buf) {
 
 /** 打包（未加密）：返回明文 payload Buffer。meta 仅在新版本携带，旧备份不含该字段
  *  （不传 meta 时产物与旧版逐字节一致，保证格式向后兼容） */
-export function buildPayload(root, relFiles, meta, appDataFiles) {
+export function buildPayload(root, relFiles, meta, appDataFiles, homeFiles) {
   const files = []
   for (const rel of relFiles) {
     const buf = redactBackupBytes(rel, readFileSync(join(root, rel)))
@@ -385,6 +521,14 @@ export function buildPayload(root, relFiles, meta, appDataFiles) {
   // AppData 应用设置：以 __appdata__/ 前缀并入同一 payload，恢复时由 extractPayload 写回原位
   for (const rel of (appDataFiles || [])) {
     const abs = appDataAbsPath(rel)
+    if (!abs) continue
+    let buf
+    try { buf = readFileSync(abs) } catch (e) { continue }
+    files.push({ path: rel, sha256: createHash('sha256').update(buf).digest('hex'), data: buf.toString('base64') })
+  }
+  // home 级配置（模型目录/价表/provider 切换器）：同一 payload，恢复时写回 home 原位
+  for (const rel of (homeFiles || [])) {
+    const abs = homeAbsPath(rel)
     if (!abs) continue
     let buf
     try { buf = readFileSync(abs) } catch (e) { continue }
@@ -464,7 +608,7 @@ export function extractPayloadDetailed(payload, root) {
       skipped.push({ path: f.path, reason: '路径不安全（含 ..、盘符或绝对路径）' })
       continue
     }
-    const abs = f.path.startsWith(APPDATA_PREFIX) ? appDataAbsPath(f.path) : join(root, f.path)
+    const abs = resolvePayloadAbs(f.path, root)
     if (!abs) {
       skipped.push({ path: f.path, reason: '无法解析到本地路径' })
       continue
@@ -480,7 +624,7 @@ export function extractPayloadDetailed(payload, root) {
   const mismatches = []
   for (const f of files) {
     if (!f || typeof f.path !== 'string' || !f.path || !isSafeRelPath(f.path)) continue
-    const abs = f.path.startsWith(APPDATA_PREFIX) ? appDataAbsPath(f.path) : join(root, f.path)
+    const abs = resolvePayloadAbs(f.path, root)
     if (!abs) continue
     let onDisk
     try {
@@ -520,6 +664,15 @@ function payloadIncludesAppData(payload, keep) {
   }
   const meta = extractPayloadMeta(payload)
   return !!(meta && meta.appDataIncluded)
+}
+
+/** 这份备份是否声明了 home 级配置。没声明的旧备份不能用来清空本机 home 配置。 */
+function payloadIncludesHome(payload, keep) {
+  for (const p of keep) {
+    if (p.startsWith(HOME_PREFIX)) return true
+  }
+  const meta = extractPayloadMeta(payload)
+  return !!(meta && meta.homeIncluded)
 }
 
 // ============================================================
@@ -686,7 +839,7 @@ function payloadValidEntries(payload, root, opts) {
       invalid.push({ path: f.path, reason: '重映射后的路径不安全' })
       continue
     }
-    const abs = destPath.startsWith(APPDATA_PREFIX) ? appDataAbsPath(destPath) : join(root, destPath)
+    const abs = resolvePayloadAbs(destPath, root)
     if (!abs) {
       invalid.push({ path: destPath, reason: '无法解析到本地路径' })
       continue
@@ -729,13 +882,20 @@ export function planPayloadApply(payload, root, parsedEntries, opts) {
   for (const rel of collectFiles(root)) {
     if (!keep.has(rel)) localOnly.push(rel)
   }
+  const homeIncluded = payloadIncludesHome(payload, keep)
   const appDataIncluded = payloadIncludesAppData(payload, keep)
   if (appDataIncluded) {
     for (const rel of collectAppDataFiles()) {
       if (!keep.has(rel)) localOnly.push(rel)
     }
   }
+  if (homeIncluded) {
+    for (const rel of collectHomeFiles()) {
+      if (!keep.has(rel)) localOnly.push(rel)
+    }
+  }
   return {
+    homeIncluded,
     appDataIncluded,
     added, unchanged, conflicts, localOnly, invalid,
     profileSkipped: Array.isArray(skippedProfiles) ? skippedProfiles : [],
@@ -817,7 +977,8 @@ export function applyPayloadMode(payload, root, mode, opts) {
   if (m === 'mirror') {
     const keep = new Set(entries.map((e) => e.path))
     const pruneAppData = o.pruneAppData === false ? false : payloadIncludesAppData(payload, keep)
-    const pruned = removeConfigNotInSet(root, keep, { pruneAppData })
+    const pruneHome = o.pruneHome === false ? false : payloadIncludesHome(payload, keep)
+    const pruned = removeConfigNotInSet(root, keep, { pruneAppData, pruneHome })
     removed = pruned.removed
     failed = pruned.failed
   }
@@ -890,6 +1051,16 @@ export function removeConfigNotInSet(root, keep, opts) {
       drop(rel, abs, stop)
     }
   }
+  // home 挂载点：只在备份明确声明了 home 配置时才对齐，避免旧备份清空本机配置。
+  if (o.pruneHome) {
+    const home = homeRoot()
+    for (const rel of collectHomeFiles()) {
+      if (keep.has(rel)) continue
+      const abs = homeAbsPath(rel)
+      if (!abs || !home) continue
+      drop(rel, abs, home)
+    }
+  }
   return { removed, failed }
 }
 
@@ -903,7 +1074,10 @@ export function applyPayloadMirror(payload, root, opts) {
   const pruneAppData = opts && opts.pruneAppData === false
     ? false
     : payloadIncludesAppData(payload, keep)
-  const pruned = removeConfigNotInSet(root, keep, { pruneAppData })
+  const pruneHome = opts && opts.pruneHome === false
+    ? false
+    : payloadIncludesHome(payload, keep)
+  const pruned = removeConfigNotInSet(root, keep, { pruneAppData, pruneHome })
   return { ...written, removed: pruned.removed, failed: pruned.failed }
 }
 
@@ -950,6 +1124,16 @@ export function makeSnapshot(root, snapshotRoot, keep, date, opts) {
       copyFileSync(abs, target)
     } catch (e) { /* 单文件失败不阻断快照 */ }
   }
+  // home 级配置一并进快照，保证回滚语义与备份一致
+  for (const rel of collectHomeFiles()) {
+    const abs = homeAbsPath(rel)
+    if (!abs) continue
+    const target = join(dest, rel)
+    try {
+      mkdirSync(dirname(target), { recursive: true })
+      copyFileSync(abs, target)
+    } catch (e) { /* 单文件失败不阻断快照 */ }
+  }
   // 只保留最近 keep 份；opts.protect 指定的那份不参与删除
   let olds = readdirSync(snapshotRoot).filter((n) => { try { return statSync(join(snapshotRoot, n)).isDirectory() } catch (e) { return false } }).sort()
   const protectedName = o.protect ? String(o.protect) : null
@@ -987,7 +1171,7 @@ export function rollbackFromSnapshot(snapshotDir, root, snapshotRoot, keep, opts
       if (ent.isDirectory()) walk(abs, rel)
       else if (ent.isFile()) {
         if (!isSafeRelPath(rel)) continue
-        const target = rel.startsWith(APPDATA_PREFIX) ? appDataAbsPath(rel) : join(root, rel)
+        const target = resolvePayloadAbs(rel, root)
         if (!target) continue
         mkdirSync(dirname(target), { recursive: true })
         copyFileSync(abs, target)
@@ -1002,7 +1186,12 @@ export function rollbackFromSnapshot(snapshotDir, root, snapshotRoot, keep, opts
     if (p.startsWith(APPDATA_PREFIX)) { pruneAppData = true; break }
   }
   if (o.pruneAppData === false) pruneAppData = false
-  const pruned = removeConfigNotInSet(root, keepSet, { pruneAppData })
+  let pruneHome = false
+  for (const p of keepSet) {
+    if (p.startsWith(HOME_PREFIX)) { pruneHome = true; break }
+  }
+  if (o.pruneHome === false) pruneHome = false
+  const pruned = removeConfigNotInSet(root, keepSet, { pruneAppData, pruneHome })
   return { count, taken, removed: pruned.removed, failed: pruned.failed }
 }
 
@@ -1271,14 +1460,21 @@ export async function listAccountBackups(cfg) {
 }
 
 /** 备份打包了哪些顶层目录（文件数），用来一眼看出体积是不是被非配置内容撑大。 */
-export function summarizePackedScope(relFiles, appDataFiles) {
+export function summarizePackedScope(relFiles, appDataFiles, homeFiles) {
   const counts = Object.create(null)
   for (const rel of relFiles || []) {
     const top = String(rel).includes('/') ? String(rel).split('/')[0] : '(files)'
     counts[top] = (counts[top] || 0) + 1
   }
   const topLevel = Object.keys(counts).sort().map((name) => ({ name, files: counts[name] }))
-  return { topLevel, appDataFiles: (appDataFiles || []).length, fileCount: (relFiles || []).length }
+  const homeCounts = Object.create(null)
+  for (const rel of homeFiles || []) {
+    const segs = String(rel).split('/')
+    const name = segs[0] + '/' + (segs[1] || '')
+    homeCounts[name] = (homeCounts[name] || 0) + 1
+  }
+  const homeMounts = Object.keys(homeCounts).sort().map((name) => ({ name, files: homeCounts[name] }))
+  return { topLevel, appDataFiles: (appDataFiles || []).length, homeFiles: (homeFiles || []).length, homeMounts, fileCount: (relFiles || []).length }
 }
 
 /** 远端只保留最近 keep 份 .bundle（按文件名排序，旧的在前）。失败抛错，由调用方决定是否吞掉。 */
@@ -2373,6 +2569,7 @@ export function collectInstallMeta(dshRoot, profileName) {
   return {
     dshVersion, pnpmVersion, profile: name, createdAt: new Date().toISOString(), linkMap, unmapped,
     appDataIncluded: true,
+    homeIncluded: true,
   }
 }
 
@@ -2408,6 +2605,9 @@ export function apply(ctx, config) {
   const home = homedir()
   const dshRoot = cfg.root || join(home, '.dsh')
   const snapshotRoot = cfg.snapshotRoot || join(home, SNAPSHOT_ROOT_NAME)
+  // home 级挂载点默认开启（生产 = homedir()）。放在 apply() 里而不是模块层：
+  // 模块层默认 homedir() 会让任何直接调用 makeSnapshot/rollback 的代码读到并可能删用户真实 home。
+  __setHomeRootForTest(cfg.homeRoot !== undefined ? cfg.homeRoot : home)
   const configFile = join(dshRoot, CONFIG_FILE_NAME)
   const cleanupFns = []
 
@@ -2601,7 +2801,8 @@ export function apply(ctx, config) {
     }
     const relFiles = collectFiles(dshRoot)
     const appDataFiles = collectAppDataFiles()
-    const payload = buildPayload(dshRoot, relFiles, collectInstallMeta(dshRoot, resolveProfile().name), appDataFiles)
+    const homeFiles = collectHomeFiles()
+    const payload = buildPayload(dshRoot, relFiles, collectInstallMeta(dshRoot, resolveProfile().name), appDataFiles, homeFiles)
     const bundle = encryptBundle(payload, passphrase)
     const name = bundleName()
     const url = remoteDirUrl(c, name)
@@ -2613,7 +2814,7 @@ export function apply(ctx, config) {
     if (res.status !== 200 && res.status !== 201 && res.status !== 204) {
       return { ok: false, error: 'PUT 失败（HTTP ' + res.status + '）' }
     }
-    const scope = summarizePackedScope(relFiles, appDataFiles)
+    const scope = summarizePackedScope(relFiles, appDataFiles, homeFiles)
     let pruned = []
     let pruneError = null
     try {
@@ -2628,9 +2829,9 @@ export function apply(ctx, config) {
     let coverage = null
     // 备份结果是一次性展示，这里量出被排除目录的真实体积
     try { coverage = describeScope(dshRoot, { measureExcluded: true }) } catch (e) { coverage = null }
-    log('backup uploaded: ' + name + ' (' + bundle.length + ' bytes, ' + relFiles.length + ' files + ' + appDataFiles.length + ' appdata files; scope ' + scope.topLevel.map((t) => t.name + '=' + t.files).join(',') + ')')
+    log('backup uploaded: ' + name + ' (' + bundle.length + ' bytes, ' + relFiles.length + ' files + ' + appDataFiles.length + ' appdata files + ' + homeFiles.length + ' home files; scope ' + scope.topLevel.map((t) => t.name + '=' + t.files).join(',') + ')')
     return {
-      ok: true, name, size: bundle.length, fileCount: relFiles.length, appDataCount: appDataFiles.length,
+      ok: true, name, size: bundle.length, fileCount: relFiles.length, appDataCount: appDataFiles.length, homeCount: homeFiles.length,
       scope,
       coverage: coverage ? { included: coverage.included, excluded: coverage.excluded, totals: coverage.totals } : undefined,
       pruned, pruneError,
@@ -3535,6 +3736,11 @@ export function createTestHarness(config) {
   if (cfg.snapshotRoot === undefined) {
     cfg.snapshotRoot = join(String(cfg.root || join(homedir(), '.dsh')), '.dsh-sync-snapshots')
   }
+  // home 挂载点同样必须隔离（理由同上）：不隔离的话自测会读到用户真实 ~/.cc-switch、
+  // ~/.claude，而 mirror 用例会按 payload 删掉 home 里「备份没有」的配置 —— 直接删用户数据。
+  // 隔离目录默认不存在，于是 collectHomeFiles() 返回空，既有断言（文件数/范围）不受影响。
+  if (cfg.homeRoot === undefined) cfg.homeRoot = join(String(cfg.root || join(homedir(), '.dsh')), '__home__')
+  __setHomeRootForTest(cfg.homeRoot)
   apply(fakeCtx, cfg)
   selftest = apply._internals
   return selftest

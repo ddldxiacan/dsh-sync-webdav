@@ -31,6 +31,8 @@ import {
   applyPayloadMode, planPayloadApply, normalizeRestoreMode, DEFAULT_RESTORE_MODE, RESTORE_MODES,
   pathsEqual, isUnderDir, __setAppDataPlatformForTest,
   planProfileRemap, remapPayloadPath, payloadProfileNames, ensureSelfRegistered,
+  collectHomeFiles, homeAbsPath, homeMounts, resolvePayloadAbs, __setHomeRootForTest,
+  exclusionReason as exclusionReasonForTest,
 } from './index.js'
 
 const APPDATA_PROBE = '__appdata__/dsh-desktop/desktop/settings.json'
@@ -2411,7 +2413,8 @@ check('depKind: registry 版本号', depKind('^0.4.6') === 'registry' && depKind
     mkdirSync(isoRoot, { recursive: true })
     const h = createTestHarness({ root: isoRoot, profile: 'web' })
     check('隔离: 未指定 snapshotRoot 时落在测试 root 内部，而非用户 home',
-      !!h.snapshotRoot && h.snapshotRoot.startsWith(isoRoot) && !h.snapshotRoot.startsWith(homedir()),
+      !!h.snapshotRoot && h.snapshotRoot.startsWith(isoRoot) &&
+      !pathsEqual(h.snapshotRoot, join(homedir(), '.dsh-sync-snapshots')),
       h.snapshotRoot)
     check('隔离: dshRoot 也确实是测试传入的 root（不是真实 ~/.dsh）',
       h.dshRoot === isoRoot, h.dshRoot)
@@ -2484,5 +2487,123 @@ check('depKind: registry 版本号', depKind('^0.4.6') === 'registry' && depKind
   }
 }
 
+
+// ---------- 18. home 级挂载点：模型配置不能只躺在 ~/.dsh 里（v0.5.4 新增） ----------
+//
+// 事故背景：用户的自定义大模型配置有一部分不在 ~/.dsh 下 —— 模型价表散在 ~/.dsh-freetap、
+// ~/.dsh-opencode-free、~/.opencode2dsh，provider 切换器在 ~/.cc-switch，Claude 路由在 ~/.claude。
+// 旧实现只采 ~/.dsh + __appdata__，这些文件既不进备份、恢复时也补不回来。
+// 同时 ~/.dsh/cache/dsh-claude-style/peakrate.json（模型分时费率表）被 cache* 规则误杀。
+
+// 18a. cache 白名单：只放行配置性质的那一条，别的 cache* 照旧排除
+check('home: cache 白名单放行模型费率表', !isExcluded('cache/dsh-claude-style/peakrate.json'))
+check('home: 白名单路径不再被报成排除项', exclusionReasonForTest('cache/dsh-claude-style/peakrate.json') === undefined)
+check('home: 普通 cache* 仍被排除且仍报原因',
+  isExcluded('cache/foo/a.json') && exclusionReasonForTest('cache/foo/a.json') === '临时/缓存')
+
+// 18b. homeAbsPath：只认白名单挂载点，路径穿越一律拒绝
+{
+  __setHomeRootForTest(join(tmpdir(), 'dsh-sync-home-abs'))
+  check('home: 白名单挂载点解析为绝对路径', typeof homeAbsPath('__home__/.dsh-freetap/a.json') === 'string')
+  check('home: 非白名单挂载点返回 null（不许借 __home__ 写到任意目录）', homeAbsPath('__home__/.ssh/id_rsa') === null)
+  check('home: 路径穿越返回 null', homeAbsPath('__home__/.dsh-freetap/../../etc/passwd') === null)
+  check('home: 无前缀返回 null', homeAbsPath('.dsh-freetap/a.json') === null)
+  check('home: 挂载点表含模型价表与 provider 切换器目录',
+    homeMounts().some((m) => m.name === '.dsh-freetap') && homeMounts().some((m) => m.name === '.cc-switch'))
+  __setHomeRootForTest(null)
+}
+
+// 18c. collectHomeFiles：include/exclude 与「可重建产物绝不进备份」
+{
+  const hRoot = join(tmpdir(), 'dsh-sync-home-collect-' + Date.now())
+  const home = join(hRoot, 'home')
+  const root2 = join(hRoot, 'dshroot')
+  try {
+    const put = (rel, body) => { const p = join(home, rel); mkdirSync(dirname(p), { recursive: true }); writeFileSync(p, body) }
+    put('.dsh-freetap/agent-config.json.models.dev.json', '{"prices":[]}')
+    put('.cc-switch/settings.json', '{"provider":"x"}')
+    put('.cc-switch/cc-switch.db', 'SQLITE')
+    put('.cc-switch/backups/db_backup_1.db', 'BACKUP')
+    put('.cc-switch/logs/cc-switch.log', 'LOG')
+    put('.cc-switch/crash.log', 'CRASH')
+    put('.claude/settings.json', '{"env":{}}')
+    put('.claude/skills/foo/SKILL.md', '# skill')
+    put('.claude/.runtime/venv/pyvenv.cfg', 'venv')
+    put('.claude/plugins/marketplaces/official/.git/config', 'git')
+    put('.claude/plugins/known_marketplaces.json', '{"m":1}')
+    put('.dsh-wallpaper-engine/config.json', '{"a":1}')
+    put('.dsh-wallpaper-engine/diag/http.jsonl', 'DIAG')
+    __setHomeRootForTest(home)
+    const got = collectHomeFiles()
+    const has = (p) => got.includes(p)
+    check('home: 模型价表被收集（~/.dsh-freetap）', has('__home__/.dsh-freetap/agent-config.json.models.dev.json'))
+    check('home: provider 切换器配置与 db 被收集（~/.cc-switch）',
+      has('__home__/.cc-switch/settings.json') && has('__home__/.cc-switch/cc-switch.db'))
+    check('home: 排除可再生的 backups/ 与 logs/',
+      !got.some((p) => p.includes('/backups/')) && !got.some((p) => p.includes('/logs/')))
+    check('home: 排除显式黑名单文件 crash.log', !has('__home__/.cc-switch/crash.log'))
+    check('home: include 白名单收集 ~/.claude 的 settings 与 skills',
+      has('__home__/.claude/settings.json') && has('__home__/.claude/skills/foo/SKILL.md'))
+    check('home: include 允许穿过中间目录取 plugins/known_marketplaces.json',
+      has('__home__/.claude/plugins/known_marketplaces.json'))
+    check('home: 不收 .runtime/venv（可重建）', !got.some((p) => p.includes('.runtime')))
+    check('home: 不收 .git 仓库元数据', !got.some((p) => p.includes('/.git/')))
+    check('home: 不收 diag 诊断产物', !got.some((p) => p.includes('/diag/')))
+    check('home: 全部路径带 __home__ 前缀且可解析回绝对路径',
+      got.every((p) => p.startsWith('__home__/') && typeof homeAbsPath(p) === 'string'))
+
+    mkdirSync(root2, { recursive: true })
+    writeFileSync(join(root2, 'settings.yaml'), 'root-config')
+    const payload = buildPayload(root2, ['settings.yaml'], null, [], got)
+    const bundle = encryptBundle(payload, 'pw')
+    const back = decryptBundle(bundle, 'pw')
+    const applied = applyPayloadMirror(back, root2, { pruneAppData: false })
+    check('home: 加密往返后 home 条目全部落盘并校验通过',
+      applied.count === got.length + 1 && applied.mismatches.length === 0,
+      JSON.stringify({ count: applied.count, expect: got.length, mm: applied.mismatches.slice(0, 3) }))
+
+    // 只留一份 home 配置的备份 → mirror 必须把本机多出来的 home 配置删掉
+    const partial = buildPayload(root2, ['settings.yaml'], null, [], ['__home__/.dsh-freetap/agent-config.json.models.dev.json'])
+    applyPayloadMirror(partial, root2, { pruneAppData: false })
+    check('home: mirror 删掉备份里没有的 home 配置',
+      !existsSync(join(home, '.cc-switch/settings.json')) && !existsSync(join(home, '.dsh-wallpaper-engine/config.json')) &&
+      existsSync(join(home, '.dsh-freetap/agent-config.json.models.dev.json')))
+    check('home: mirror 不碰排除项（backups / diag 仍在）',
+      existsSync(join(home, '.cc-switch/backups/db_backup_1.db')) && existsSync(join(home, '.dsh-wallpaper-engine/diag/http.jsonl')))
+    check('home: mirror 不碰未收集的 home 内容（venv 仍在）',
+      existsSync(join(home, '.claude/.runtime/venv/pyvenv.cfg')))
+
+    const legacy = Buffer.from(JSON.stringify({ files: [{ path: 'settings.yaml', sha256: createHash('sha256').update('a').digest('hex'), data: Buffer.from('a').toString('base64') }] }), 'utf8')
+    const before = collectHomeFiles().length
+    applyPayloadMirror(legacy, root2, { pruneAppData: false })
+    check('home: 旧备份不删本机 home 配置（fail-safe）',
+      collectHomeFiles().length === before &&
+      existsSync(join(home, '.dsh-freetap/agent-config.json.models.dev.json')), 'before=' + before)
+
+    const scope = summarizePackedScope(['profiles/desktop/a.json'], [], got)
+    check('home: summarizePackedScope 报出 homeFiles 与 homeMounts',
+      scope.homeFiles === got.length && scope.homeMounts.some((m) => m.name === '__home__/.cc-switch'))
+    const cov = describeScope(root2)
+    check('home: describeScope 的 included 里出现 __home__ 行',
+      cov.included.some((r) => r.name.startsWith('__home__/')), JSON.stringify(cov.included.map((r) => r.name)))
+  } finally {
+    __setHomeRootForTest(null)
+    try { rmSync(hRoot, { recursive: true, force: true }) } catch (e) { /* ignore */ }
+  }
+}
+
+// 18d. 自测隔离：createTestHarness 默认把 home 指向测试 root 内部，绝不碰真实 home
+{
+  const isoRoot2 = join(tmpdir(), 'dsh-sync-iso-home-' + Date.now())
+  try {
+    mkdirSync(isoRoot2, { recursive: true })
+    createTestHarness({ root: isoRoot2, profile: 'web' })
+    check('home: 隔离 home 目录不存在时收集为空（既有断言不受影响）', collectHomeFiles().length === 0)
+    check('home: 隔离 home 落在测试 root 内，不指向真实 home',
+      collectHomeFiles().every((p) => !p.startsWith('__home__/.cc-switch')))
+  } finally {
+    try { rmSync(isoRoot2, { recursive: true, force: true }) } catch (e) { /* ignore */ }
+  }
+}
 console.log('\n==== ' + pass + ' passed, ' + fail + ' failed ====')
 process.exit(fail ? 1 : 0)

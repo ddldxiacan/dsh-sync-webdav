@@ -218,7 +218,7 @@ git push origin main --tags
 
 ## 同步范围与排除规则
 
-**策略：`~/.dsh` 下除「工作区聊天数据」和「可重建产物」之外，全部同步。**
+**策略：`~/.dsh` 下除「工作区聊天数据」和「可重建产物」之外，全部同步；home 根下承载模型配置的几个目录按白名单一并同步（`__home__/` 挂载点）。**
 
 | 类别 | 内容 | 实测体积 |
 |---|---|---|
@@ -228,6 +228,7 @@ git push origin main --tags
 | ❌ 可重建 | `dsh-runtimes/`（DSH 运行时，架构相关）、`node_modules/`（插件依赖） | 257.2 MB + 991.7 MB |
 | ❌ 日志缓存 | `logs/`、`npm-cache/`、`tmp*/`、`cache*/`、单个 >50MB 的文件 | — |
 | ✅ **同步** | 其余一切：凭据、插件配置、profile、agent-presets、task-board、skins、local-packages、用量、会话归档… | **约 12.7 MB** |
+| ✅ **例外** | `cache/dsh-claude-style/`（模型分时费率表）—— `cache*/` 规则会误伤配置，故按前缀白名单放行 | 19 KB |
 
 排除清单是**白名单式的显式四类**：新出现的目录默认进备份，不会被静默漏掉。
 
@@ -239,6 +240,24 @@ git push origin main --tags
 **恢复/回滚时的对齐删除只作用于「配置范围」**，被排除的 `sessions/`、`attachments/` 等一律不动——
 换机恢复不会误删目标机上已有的聊天记录。
 
+**v0.5.4 起额外同步 home 级模型配置**：自定义大模型配置并不总在 `~/.dsh` 下。
+模型目录、价表与 provider 切换器散落在 home 根，旧实现只采 `~/.dsh` + `__appdata__`，
+这些文件既不进备份、恢复时也补不回来。现在按**显式白名单**采集，同样以 `__home__/` 前缀并入同一 payload，恢复/回滚时写回 home 原位：
+
+| 挂载点 | 采集内容 | 不收 |
+|---|---|---|
+| `~/.dsh-freetap/` | 全部（模型价表、adapter 状态） | — |
+| `~/.dsh-opencode-free/` | 全部 | — |
+| `~/.opencode2dsh/` | 全部 | — |
+| `~/.dsh-wallpaper-engine/` | `config.json`、`build-stamp.json`、`fontsets/`、`mascot/` | `diag/`、`cache/`、`thumbs/`、`uploads/`、`avatars/`、`ffmpeg/` |
+| `~/.cc-switch/` | `settings.json`、`cc-switch.db`、`live-state.json`、`model-pricing.json`、`codex-*`、`skills/` | `backups/`、`logs/`、`crash.log` |
+| `~/.claude/` | `settings.json`、`settings.local.json`、`skills/`、`cc-haha/`、`plugins/known_marketplaces.json` | `.runtime/`、`cache/`、`projects/`、`sessions/`、`.git/` |
+
+> 任何挂载点内的 `node_modules/`、`.git/`、`.runtime/`、`cache*/`、`logs/`、`tmp*/` 与 >8MB 的文件一律不收 —— 白名单只覆盖「配置」，绝不把可重建产物拖进备份。
+
+> 与 `__appdata__/` 一样是 **fail-safe**：旧备份若完全没有 `__home__/` 条目、也没有 `meta.homeIncluded`，恢复时不会据此清空本机 home 配置（否则用一份旧备份「完全覆盖」就会把本机的模型配置全删掉）。
+
+> 自测隔离：`createTestHarness` 默认把 home 指向测试 root 内部，绝不读/删用户真实的 `~/.cc-switch`、`~/.claude`。
 **v0.3.0 起额外同步 Electron 应用级设置**：`%APPDATA%\@deepseek-ai\dsh-desktop\desktop\settings.json` 等用户配置文件，以 `__appdata__/` 前缀并入同一加密备份，恢复/回滚时自动写回原位（Chromium 缓存类目录与 >2MB 文件仍排除，不撑大备份）。
 
 设置页的「备份」卡片里有一行「**本次同步范围**」，展开即可看到会同步哪些顶层项、排除了哪些以及排除原因；
@@ -416,7 +435,7 @@ dsh-sync-webdav/
 |---|---|---|
 | `GET /dsh-sync/status` | — | `{ configured, config: { url, username, password: '', remoteDir, hasPassword, hasPassphrase } \| null, coverage: { included[], excluded[], totals }, remote: { reachable, backups: [{name,size,modified}], latest? }, lastLocalSnapshot? }`（**不含明文密码**） |
 | `POST /dsh-sync/config` | `{ url, username, password, remoteDir }` | `{ ok: true }`（先做连通性测试，失败不保存；密码留空=沿用已保存的） |
-| `POST /dsh-sync/backup` | `{ passphrase }` | `{ ok: true, name, size, fileCount, scope, coverage, pruned }`（`coverage` 给出已同步/已排除的顶层清单） |
+| `POST /dsh-sync/backup` | `{ passphrase }` | `{ ok: true, name, size, fileCount, homeCount, scope, coverage, pruned }`（`coverage` 给出已同步/已排除的顶层清单，`scope.homeMounts` 给出 `__home__/` 各挂载点计数） |
 | `POST /dsh-sync/restore` | `{ name?, passphrase, mode? }` | `{ ok: true, restored, verified, removedCount, snapshot, portability?, meta?, profileRemap?, remapped? }`（`profileRemap` 形如 `{ from:'desktop', to:'web', count }`，跨平台恢复才有） |
 | `POST /dsh-sync/delete` | `{ name }` 或 `{ names: [] }` | `{ ok: true, deleted }`（只接受 `dsh-sync-YYYYMMDD-HHMMSS.bundle`） |
 | `POST /dsh-sync/rollback` | `{ snapshot }` | `{ ok: true, restored, removedCount }` |

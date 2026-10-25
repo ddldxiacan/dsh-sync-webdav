@@ -644,11 +644,14 @@ window.__ModuleLoader__.load({
           const tops = (d.scope && Array.isArray(d.scope.topLevel) && d.scope.topLevel.length)
             ? '；范围 ' + d.scope.topLevel.map((t) => t.name + '×' + t.files).join('、')
             : '';
+          const homeNote = (d.scope && Array.isArray(d.scope.homeMounts) && d.scope.homeMounts.length)
+            ? '；home 配置 ' + d.scope.homeMounts.map((m) => m.name.replace('__home__/', '') + '×' + m.files).join('、')
+            : '';
           const prunedNote = (Array.isArray(d.pruned) && d.pruned.length) ? '；已清理 ' + d.pruned.length + ' 份旧备份' : '';
           const skipNote = (d.coverage && d.coverage.totals && d.coverage.totals.excludedFiles)
             ? '；按策略跳过 ' + d.coverage.totals.excludedFiles + ' 个聊天/可重建文件'
             : '';
-          setMsg({ kind: 'ok', text: '备份成功：' + (d.name || '') + '（' + formatSize(d.size) + '，' + (d.fileCount || 0) + ' 个文件' + tops + skipNote + prunedNote + '）' });
+          setMsg({ kind: 'ok', text: '备份成功：' + (d.name || '') + '（' + formatSize(d.size) + '，' + (d.fileCount || 0) + ' 个文件' + tops + homeNote + skipNote + prunedNote + '）' });
         }
         await refresh({ silent: true });
       };
